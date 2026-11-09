@@ -1,0 +1,11 @@
+mod = [
+	"Ping Compensation"
+]
+
+package = [
+	"resource_packages/Ping Compensation/Ping Compensation"
+]
+
+lua = [
+	"scripts/mods/Ping Compensation/*"
+]
