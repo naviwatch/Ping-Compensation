@@ -2,6 +2,7 @@ local mod = get_mod("Ping Compensation")
 
 mod:dofile("scripts/mods/Ping Compensation/Geometry")
 mod:dofile("scripts/mods/Ping Compensation/Main")
+mod:dofile("scripts/mods/Ping Compensation/Version")
 
 local recording = false
 local samples = {}
@@ -163,19 +164,22 @@ end)
 
 -- discard fucking everything when the mod is disabled
 mod.on_disabled = function ()
+	mod.ping_compensation_version.clear()
 	mod.ping_compensation_melee.clear(true)
 	recording = false
 	mod.ping_compensation_melee.set_probe_recording(false)
 	samples = {}
 end
 
-mod.update = function ()
+mod.update = function (dt)
 	mod.ping_compensation_melee.update()
+	mod.ping_compensation_version.update(dt)
 end
 
 -- prevent state from leaking between runs
 mod.on_game_state_changed = function (status, state_name)
 	if status == "exit" and state_name == "StateIngame" then
+		mod.ping_compensation_version.clear()
 		mod.ping_compensation_melee.clear(true)
 		recording = false
 		mod.ping_compensation_melee.set_probe_recording(false)

@@ -908,6 +908,7 @@ end)
 
 mod.ping_compensation_melee = {
 	supports_area_attack = valid_area_attack_action,
+	host_peer = host_peer,
 	set_probe_recording = function (enabled)
 		probe_recording = enabled
 	end,

@@ -17,8 +17,24 @@ if not exist "..\..\vmb.exe" (
 
 > "build_log.txt" echo Ping Compensation build started %date% %time%
 
+rem Game Lua can't run git, so the commit and branch are written into the build here.
+rem /pingcomp version reads them. "-dirty" means the build has uncommitted changes.
+set "stamp=scripts\mods\Ping Compensation\BuildInfo.lua"
+set "commit=unknown"
+set "branch=unknown"
+set "dirty="
+for /f "delims=" %%A in ('git rev-parse --short HEAD 2^>nul') do set "commit=%%A"
+for /f "delims=" %%A in ('git rev-parse --abbrev-ref HEAD 2^>nul') do set "branch=%%A"
+for /f "delims=" %%A in ('git status --porcelain 2^>nul') do set "dirty=-dirty"
+> "%stamp%" echo return { commit = "%commit%%dirty%", branch = "%branch%" }
+echo Build stamp: "%commit%%dirty%" on "%branch%"
+>> "build_log.txt" echo Build stamp: "%commit%%dirty%" on "%branch%"
+
 powershell -NoProfile -Command "& '..\..\vmb.exe' build 'Ping Compensation' -f .. 2>&1 | ForEach-Object { $line = $_.ToString(); $line; Add-Content -LiteralPath 'build_log.txt' -Value $line -Encoding UTF8 }; exit $LASTEXITCODE"
 set "exit_code=%errorlevel%"
+
+rem Remove the stamp so a build made without this script reports "unknown", not an old commit.
+del "%stamp%"
 
 >> "build_log.txt" echo VMB exit code: %exit_code%
 
