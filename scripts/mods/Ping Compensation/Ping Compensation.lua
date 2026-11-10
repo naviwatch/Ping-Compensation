@@ -2,17 +2,88 @@ local mod = get_mod("Ping Compensation")
 
 mod:dofile("scripts/mods/Ping Compensation/Geometry")
 mod:dofile("scripts/mods/Ping Compensation/Main")
+mod:dofile("scripts/mods/Ping Compensation/Specials")
 mod:dofile("scripts/mods/Ping Compensation/Version")
 
 local recording = false
 local samples = {}
 local sample_limit = 50
+local leap_sample_times = {}
 local callbacks = {
 	anim_cb_damage = true,
 	anim_cb_direct_damage = true,
 	anim_cb_special_damage = true,
 	anim_cb_frenzy_damage = true,
 }
+
+local function add_sample(sample)
+	if #samples == sample_limit then
+		table.remove(samples, 1)
+	end
+
+	samples[#samples + 1] = sample
+end
+
+local function special_sample(kind, unit, target, detail)
+	local network = Managers.state and Managers.state.network
+
+	if not network or not target or not Unit.alive(unit) or not Unit.alive(target) then
+		return
+	end
+
+	local attacker_position = Unit.world_position(unit, 0)
+	local target_position = Unit.world_position(target, 0)
+	local forward = Quaternion.forward(Unit.local_rotation(unit, 0))
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local owner = Managers.player:unit_owner(target)
+	local ping = owner and owner.remote and network:ping_by_peer(owner.peer_id)
+
+	add_sample(string.format(
+		"host t=%.3f special=%s attacker=%s target=%s dodge=%s invisible=%s ping_ms=%s relative=(%.3f,%.3f,%.3f) forward=(%.3f,%.3f) %s",
+		Managers.time:time("game"), kind, tostring(network:unit_game_object_id(unit)),
+		tostring(network:unit_game_object_id(target)),
+		status and tostring(status:get_is_dodging()) or "unavailable",
+		status and tostring(status:is_invisible()) or "unavailable",
+		type(ping) == "number" and string.format("%.0f", ping * 1000) or "n/a",
+		target_position.x - attacker_position.x, target_position.y - attacker_position.y,
+		target_position.z - attacker_position.z, forward.x, forward.y, detail))
+end
+
+mod:hook_safe("BTPackMasterAttackAction", "attack_success", function (self, unit, blackboard)
+	if recording and Managers.player and Managers.player.is_server and Managers.time then
+		local action = blackboard.action
+
+		special_sample("packmaster_hook", unit, blackboard.target_unit, string.format(
+			"result=%s dodge_angle=%s dodge_distance=%s",
+			tostring(blackboard.attack_success), tostring(action and action.dodge_angle),
+			tostring(action and action.dodge_distance)))
+	end
+end)
+
+mod:hook("BTCrazyJumpAction", "run", function (func, self, unit, blackboard, t, dt)
+	local data = blackboard.jump_data
+	local previous_state = data and data.state
+	local result = func(self, unit, blackboard, t, dt)
+
+	if recording and Managers.player and Managers.player.is_server and Managers.time and data then
+		local current_state = data.state
+		local airborne = previous_state == "in_air" or previous_state == "in_air_no_target" or previous_state == "snapping"
+			or current_state == "in_air" or current_state == "in_air_no_target" or current_state == "snapping"
+
+		if airborne and (previous_state ~= current_state or result ~= "running"
+			or not leap_sample_times[unit] or t - leap_sample_times[unit] >= 0.15) then
+			local velocity = blackboard.locomotion_extension:current_velocity()
+
+			special_sample("gutter_runner_leap", unit, data.target_unit, string.format(
+				"state=%s next_state=%s result=%s snap_failed=%s velocity=(%.3f,%.3f,%.3f)",
+				tostring(previous_state), tostring(current_state), tostring(result), tostring(data.snap_failed),
+				velocity.x, velocity.y, velocity.z))
+			leap_sample_times[unit] = t
+		end
+	end
+
+	return result
+end)
 
 -- note down relevant animation callbacks after the game handles them and send them into samples
 mod:hook_safe("flow_callback_animation_callback", function (params)
@@ -134,16 +205,13 @@ mod:hook_safe("flow_callback_animation_callback", function (params)
 		geometry_result
 	)
 
-	if #samples == sample_limit then
-		table.remove(samples, 1)
-	end
-
-	samples[#samples + 1] = sample
+	add_sample(sample)
 end)
 
 mod:command("ping_probe", mod:localize("probe_command_description"), function (action)
 	if action == "start" then
 		samples = {}
+		leap_sample_times = {}
 		recording = true
 		mod.ping_compensation_melee.set_probe_recording(true)
 		mod:echo("Starting ping recording")
@@ -164,25 +232,30 @@ end)
 
 -- discard fucking everything when the mod is disabled
 mod.on_disabled = function ()
+	mod.ping_compensation_specials.clear(false)
 	mod.ping_compensation_version.clear()
 	mod.ping_compensation_melee.clear(true)
 	recording = false
 	mod.ping_compensation_melee.set_probe_recording(false)
 	samples = {}
+	leap_sample_times = {}
 end
 
 mod.update = function (dt)
 	mod.ping_compensation_melee.update()
+	mod.ping_compensation_specials.update()
 	mod.ping_compensation_version.update(dt)
 end
 
 -- prevent state from leaking between runs
 mod.on_game_state_changed = function (status, state_name)
 	if status == "exit" and state_name == "StateIngame" then
+		mod.ping_compensation_specials.clear(true)
 		mod.ping_compensation_version.clear()
 		mod.ping_compensation_melee.clear(true)
 		recording = false
 		mod.ping_compensation_melee.set_probe_recording(false)
 		samples = {}
+		leap_sample_times = {}
 	end
 end

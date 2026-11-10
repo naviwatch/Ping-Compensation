@@ -5,11 +5,14 @@ The Ping Compensation mod for Vermintide 2. This folder is its own git repo, clo
 ## Design (keep this current)
 - Goal: Experimental lag compensation for enemy melee against remote players. When an attack reaches its damage moment, the host holds the hit, waits for what the targeted client saw at that moment, then applies or drops the hit based on the client's view. The wait is `ping * 1.5 + 0.05` seconds, clamped to 0.1–0.75. If the client doesn't answer in time, the host's original decision stands. Covers `BTAttackAction`, `BTComboAttackAction` (including frenzy swings) and `BTStormVerminAttackAction` area attacks with no push, catapult or blocked damage.
 - Runs on: both. The host decides and applies damage; the client only reports what it saw. Host and client must have the same `VERSION` (in `Main.lua`). Only remote human players whose client has said hello in the last 8 seconds are compensated. Bots, the host's own player and unmodded clients get vanilla behaviour.
+- Experimental special handling is in `Specials.lua`: host hook candidates wait for the targeted client's dodge state and hook angle/distance; host leap candidates wait for the client's local sphere overlap and, for snapping, the game's neck-position/velocity geometry. Both have bounded waits and host fallback. This only re-evaluates host candidates, not host misses. The client samples on receipt of the host request, not at a synchronized animation or physics timestamp; pounce position and collision timing can diverge from the game. A pending leap temporarily holds the behavior-tree result, not physics movement. Host line of sight remains authoritative for hooks. No exact low-ping equivalence has been verified.
 - Settings: none, only the on/off toggle (`is_togglable`). Chat commands: `/ping_probe start|stop|report` records up to 50 attack samples for debugging, and `/pingcomp version` lists the build each connected player is running.
 - Network messages (bump `VERSION` when any of these change):
   - `pc_melee_hello` — client to host every 2 seconds: `version`.
   - `pc_melee_begin` — host to the targeted client when an attack starts: `version, id, attacker_id, target_id, window_start, window_duration, kind`, plus `range, height, width, offset_up, offset_forward` for area attacks.
   - `pc_melee_observation` — client to host at the damage callback: `version, id, attacker_id, target_id, dx, dy, dz, fx, fy, dodging, locked, area_hit, callback_index`.
+  - `pc_special_request` — host to target: `version, id, kind, attacker_id, target_id, a, b, c`; kind is `hook`, `leap`, or `leap_snap`. The extra values are hook angle/distance or leap velocity.
+  - `pc_special_result` — target to host: `version, id, attacker_id, target_id, result`. Hook result is whether the local dodge geometry permits the grab; leap result is local overlap/snap.
 - Version-report messages (these don't carry `VERSION`, so changing them doesn't need a bump). `/pingcomp version` runs for whoever types it, on host or client, and only they see the list. Anyone who doesn't answer within 3 seconds is listed as `Mod not found.`, which includes players with the mod disabled or on a build older than this command.
   - `pc_version_request` — from the player who typed the command to every other modded player: `request_id`.
   - `pc_version_reply` — back to that player: `request_id, version`.
@@ -34,6 +37,18 @@ Line numbers are from the [decompiled source](https://github.com/Aussiemon/Vermi
 - `BTComboAttackAction.run` — `scripts/entity_system/systems/behaviour/nodes/bt_combo_attack_action.lua:279` — `hook` — Keeps the combo running while a swing's hit is pending, so it can't move on first.
 - `AnimationSystem.animation_callback` — `scripts/entity_system/systems/animation/animation_system.lua:54` — `hook` — The core of the mod. Client: sends its observation. Host: runs the vanilla callback under capture and queues the result.
 - `flow_callback_animation_callback` — `scripts/flow/flow_callbacks.lua:27` — `hook_safe` — Diagnostics only: records samples for `/ping_probe`.
+- `BTPackMasterAttackAction.attack_success` — `scripts/entity_system/systems/behaviour/nodes/bt_pack_master_attack_action.lua` — `hook` and `hook_safe` — Defers eligible hook results; the safe hook records a diagnostic at callback time before the deferred result is resolved.
+- `BTPackMasterAttackAction.run` — `scripts/entity_system/systems/behaviour/nodes/bt_pack_master_attack_action.lua` — `hook` — Holds an eligible hook while waiting and applies the client or captured host decision.
+- `BTCrazyJumpAction.run` — `scripts/entity_system/systems/behaviour/nodes/bt_crazy_jump_action.lua` — `hook` — Defers eligible host pounce candidates and also records sampled leap diagnostics.
+- `BTPackMasterAttackAction.leave`, `BTCrazyJumpAction.leave` — same node files — `hook_safe` — Discard pending special observations when the AI leaves the node.
+
+The probe samples packmaster hook and gutter-runner leap decisions on the host.
+Leap samples are limited to
+one per 150 ms except for state transitions and non-running results, and share
+the probe's 50-sample buffer with animation callbacks. The hook's geometry
+sample is root-to-root; leap collision and snapping use spine nodes and physics
+actors, so the recorded relative position is diagnostic, not a reconstruction
+of the exact collision test.
 
 Not hooked, but a game patch here can break the mod:
 - `AnimationCallbackTemplates.server.anim_cb_damage` — `scripts/entity_system/systems/animation/animation_callback_templates.lua:132` — relied on — The capture depends on its order: distance, facing, block, `damage_target`, `attack_success`.
