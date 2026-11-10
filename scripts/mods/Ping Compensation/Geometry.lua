@@ -2,79 +2,62 @@ local mod = get_mod("Ping Compensation")
 
 local geometry = {}
 
--- our own custom math check to re-evaluate positions
-function geometry.check(snapshot)
-	local dx = snapshot.target_x - snapshot.attacker_x
-	local dy = snapshot.target_y - snapshot.attacker_y
-	local dz = snapshot.target_z - snapshot.attacker_z
+local DEFAULT_CONE = 0.866 -- cosine of 30 degrees
+local DEFAULT_DODGED_CONE = 0.95 -- cosine of about 18 degrees
+local DEFAULT_DODGED_RADIUS = 0.75
+local PLAYER_RADIUS = 1
+
+local function degrees(cosine)
+	return math.deg(math.acos(math.max(-1, math.min(1, cosine))))
+end
+
+-- The reach and facing test for single-target swings (family A), on plain numbers.
+--
+-- It copies DamageUtils.check_distance and DamageUtils.check_infront (scripts/helpers/damage_utils.lua:2626 and
+-- :2666). Those can't run on a client because they read the host's AI blackboard. If a game patch changes them,
+-- change this to match.
+--
+-- dx, dy, dz: the target's position minus the attacker's.
+-- fx, fy: the attacker's forward vector.
+-- frozen: true while a dodge has frozen the attacker's facing, which is when the game tightens the test.
+-- box_up, box_down, box_flat: only used by attacks flagged use_box_range.
+--
+-- Returns in_reach, in_front, distance, reach, angle and cone. The last four are for the debug log, with the angles
+-- in degrees.
+function geometry.single_target(dx, dy, dz, fx, fy, frozen, action, breed, box_up, box_down, box_flat)
 	local flat_length_squared = dx * dx + dy * dy
-	local radius = snapshot.player_radius
-	local in_range
+	local radius = PLAYER_RADIUS
 
-	if snapshot.use_box_range then
-		local flat_range = snapshot.range_flat + radius
-
-		in_range = dz < snapshot.range_up
-			and dz > snapshot.range_down
-			and flat_length_squared < flat_range * flat_range
-	else
-		local distance_squared = flat_length_squared + dz * dz
-		local reach = snapshot.weapon_reach + radius
-
-		in_range = distance_squared <= reach * reach
+	if frozen then
+		radius = radius * (action.player_dodged_radius or breed.player_dodged_radius or DEFAULT_DODGED_RADIUS)
 	end
 
-	local in_front = false
+	local in_reach, distance, reach
+
+	if action.use_box_range then
+		reach = (box_flat or 0) + radius
+		distance = math.sqrt(flat_length_squared)
+		in_reach = dz < (box_up or 0) and dz > (box_down or 0) and flat_length_squared < reach * reach
+	else
+		reach = (action.weapon_reach or breed.weapon_reach or breed.radius or 0) + radius
+		distance = math.sqrt(flat_length_squared + dz * dz)
+		in_reach = distance <= reach
+	end
+
+	local default_cone = DEFAULT_CONE
+
+	if frozen then
+		default_cone = action.player_dodged_cone or breed.player_dodged_cone or DEFAULT_DODGED_CONE
+	end
+
+	local cone_cosine = breed.weapon_reach_cone or default_cone
+	local cosine = 0
 
 	if flat_length_squared > 0 then
-		local dot = (dx * snapshot.forward_x + dy * snapshot.forward_y) / math.sqrt(flat_length_squared)
-
-		in_front = dot > snapshot.reach_cone
+		cosine = (dx * fx + dy * fy) / math.sqrt(flat_length_squared)
 	end
 
-	return in_range, in_front
+	return in_reach, cosine > cone_cosine, distance, reach, degrees(cosine), degrees(cone_cosine)
 end
 
--- copy the attack geometry needed later when client's data arrives
-function geometry.snapshot(attacker_position, target_position, forward, action, blackboard)
-	local breed = blackboard.breed
-	local dodged = blackboard.target_dodged_during_attack
-		or blackboard.set_dodge_rotation_timer
-		or blackboard.locked_attack_rotation
-	local player_radius = dodged and (action.player_dodged_radius or breed.player_dodged_radius or 0.75) or 1
-	local reach_cone = breed.weapon_reach_cone
-		or (dodged and (action.player_dodged_cone or breed.player_dodged_cone or 0.95) or 0.866)
-	local snapshot = {
-		attacker_x = attacker_position.x,
-		attacker_y = attacker_position.y,
-		attacker_z = attacker_position.z,
-		target_x = target_position.x,
-		target_y = target_position.y,
-		target_z = target_position.z,
-		forward_x = forward.x,
-		forward_y = forward.y,
-		player_radius = player_radius,
-		reach_cone = reach_cone,
-		use_box_range = action.use_box_range and true or false,
-	}
-
-	if snapshot.use_box_range then
-		snapshot.range_flat = blackboard.attack_range_flat
-		snapshot.range_up = blackboard.attack_range_up
-		snapshot.range_down = blackboard.attack_range_down
-
-		if not snapshot.range_flat or not snapshot.range_up or not snapshot.range_down then
-			return nil, "missing box range"
-		end
-	else
-		snapshot.weapon_reach = action.weapon_reach or breed.weapon_reach or breed.radius
-
-		if not snapshot.weapon_reach then
-			return nil, "missing weapon reach"
-		end
-	end
-
-	return snapshot
-end
-
-mod.ping_compensation_geometry = geometry
+mod.pc.geometry = geometry

@@ -46,7 +46,7 @@ local function start_request()
 	end
 
 	local my_peer_id = Network.peer_id()
-	local host_peer_id = player_manager.is_server and my_peer_id or mod.ping_compensation_melee.host_peer()
+	local host_peer_id = player_manager.is_server and my_peer_id or mod.pc.host_peer()
 	local players = {}
 	local players_by_peer = {}
 	local waiting = 0
@@ -103,18 +103,9 @@ mod:network_register("pc_version_reply", function (sender, request_id, version)
 	end
 end)
 
-mod:command("pingcomp", mod:localize("pingcomp_command_description"), function (action)
-	if action ~= "version" then
-		mod:echo("Usage: '/pingcomp version'")
-	elseif not mod:is_enabled() then
-		-- VMF still runs commands for a disabled mod but drops its replies, so everyone would look like they don't have it
-		mod:echo("Ping Compensation is disabled.")
-	else
-		start_request()
-	end
-end)
-
-mod.ping_compensation_version = {
+-- /pingcomp version, dispatched from the main script
+mod.pc.version = {
+	start = start_request,
 	update = function (dt)
 		if request then
 			request.time_left = request.time_left - dt

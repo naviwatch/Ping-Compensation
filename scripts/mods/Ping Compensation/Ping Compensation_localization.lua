@@ -1,11 +1,8 @@
 return {
 	mod_description = {
-		en = "Experimental ping compensation. Host and client must use the same mod version.",
+		en = "Enemy melee is judged on each player's own screen instead of the host's, so blocks and dodges count the way you saw them, whatever your ping. Host and client must run the same build.",
 	},
 	pingcomp_command_description = {
-		en = "Show which build of this mod each connected player has: /pingcomp version",
-	},
-	probe_command_description = {
-		en = "Record nearby attack callbacks and host behavior nodes: /ping_probe start|stop|report",
+		en = "Ping Compensation tools: /pingcomp version | debug on|off | stats | facing on|off | mark <note>",
 	},
 }
