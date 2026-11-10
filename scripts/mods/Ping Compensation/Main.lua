@@ -1,7 +1,7 @@
 local mod = get_mod("Ping Compensation")
 local geometry = mod.ping_compensation_geometry
 
-local VERSION = 4
+local VERSION = 5
 local HELLO_INTERVAL = 2
 local PEER_EXPIRY = 8
 local ATTACK_EXPIRY = 5
@@ -100,19 +100,24 @@ end
 local function resolve(entry, use_client)
 	local hit = entry.vanilla_hit
 
-	if use_client and entry.observation and entry.kind == "area_attack" then
-		hit = entry.observation.area_hit
-	elseif use_client and entry.observation then
-		local sample = entry.observation.locked and entry.locked_snapshot or entry.unlocked_snapshot
+	if use_client and entry.observation then
 		local observation = entry.observation
 
-		sample.attacker_x, sample.attacker_y, sample.attacker_z = 0, 0, 0
-		sample.target_x, sample.target_y, sample.target_z = observation.dx, observation.dy, observation.dz
-		sample.forward_x, sample.forward_y = observation.fx, observation.fy
+		if entry.kind == "area_attack" then
+			if observation.dodging then
+				hit = observation.area_hit
+			end
+		else
+			local sample = observation.locked and entry.locked_snapshot or entry.unlocked_snapshot
 
-		local in_range, in_front = geometry.check(sample)
+			sample.attacker_x, sample.attacker_y, sample.attacker_z = 0, 0, 0
+			sample.target_x, sample.target_y, sample.target_z = observation.dx, observation.dy, observation.dz
+			sample.forward_x, sample.forward_y = observation.fx, observation.fy
 
-		hit = in_range and in_front
+			local in_range, in_front = geometry.check(sample)
+
+			hit = in_range and in_front
+		end
 	end
 
 	if entry.kind == "area_attack" then
@@ -489,7 +494,7 @@ local function client_area_attack_hit(attack, unit, target)
 	local half_height = attack.height * 0.5
 	local forward = Quaternion.rotate(rotation, Vector3.forward()) * (attack.offset_forward + half_range)
 	local up = Vector3.up() * (half_height + attack.offset_up)
-	local center = Unit.local_position(unit, 0) + forward + up
+	local center = Unit.world_position(unit, 0) + forward + up
 	local size = Vector3(attack.width * 0.5, half_range, half_height)
 	local hit_actors = PhysicsWorld.immediate_overlap(
 		physics_world,
@@ -907,8 +912,12 @@ mod:hook("AnimationSystem", "animation_callback", function (func, system, unit, 
 end)
 
 mod.ping_compensation_melee = {
+	protocol_version = VERSION,
 	supports_area_attack = valid_area_attack_action,
 	host_peer = host_peer,
+	peer_ready = function (peer)
+		return peer and peers[peer] and now() - peers[peer] <= PEER_EXPIRY
+	end,
 	set_probe_recording = function (enabled)
 		probe_recording = enabled
 	end,
