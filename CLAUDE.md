@@ -3,7 +3,7 @@
 The Ping Compensation mod for Vermintide 2. This folder is its own git repo, cloned into Vermintide Mod Builder's (VMB) `mods` folder as `Ping Compensation`: the folder name must match `Ping Compensation.mod`, or VMB can't build it. If your VMB folder has its own `CLAUDE.md`, two levels up, its rules apply here too: if they aren't in your context, read that file before doing anything else.
 
 ## Design (keep this current)
-The full design, its decisions (D1 to D20), the roadmap and the deferred work are in [Docs/Briefs/client-authoritative-melee.md](Docs/Briefs/client-authoritative-melee.md). Read it before changing anything. The tester handout is [Docs/Briefs/playtest-handout.md](Docs/Briefs/playtest-handout.md); update it whenever a build changes what testers see or should test.
+The full design, its numbered decisions, the roadmap and the deferred work are in [Docs/Briefs/client-authoritative-melee.md](Docs/Briefs/client-authoritative-melee.md). Read it before changing anything. The tester handout is [Docs/Briefs/playtest-handout.md](Docs/Briefs/playtest-handout.md); update it whenever a build changes what testers see or should test. Testers get it as a PDF, so rebuild `Docs/Briefs/playtest-handout.pdf` with `handout_pdf.bat` after every change to it.
 
 - Goal: client-authoritative enemy melee. A swing aimed at a remote player is judged on that player's own screen, on the frame their copy of the enemy fires the damage animation event, from their live position, block and dodge. The host books whatever the client reports and never second-guesses it. It is PvE, so game feel beats fairness.
 - Built so far: roadmap step 1, family A only. That is every attack run by `BTAttackAction` whose damage frame goes through the generic `anim_cb_damage`: slave rats, clan rats, marauders, fanatics, gors, ungors, and the non-frenzy swings of monks and savages. Frenzy combos, elite sweeps, overheads and shoves are vanilla again until their steps land. Monsters and lords (`breed.boss`) are always vanilla for now.
@@ -58,6 +58,7 @@ Not hooked, but a game patch here can break the mod:
 ## Commands
 Run this from this folder.
 - Build: `./build.bat < /dev/null` in Git Bash, or `.\build.bat` in PowerShell. Use this rather than calling `vmb build` directly, because it also writes the commit and branch that `/pingcomp version` reports. The output is saved to `build_log.txt`.
+- Handout PDF: `./handout_pdf.bat < /dev/null` in Git Bash, or `.\handout_pdf.bat` in PowerShell. It turns `Docs/Briefs/playtest-handout.md` into `Docs/Briefs/playtest-handout.pdf` (gitignored) with `Docs/handout_to_html.py` and headless Edge or Chrome. It needs Python 3 and installs nothing. The converter only understands the Markdown the handout uses, so check the PDF after adding anything new to the handout, such as nested lists or images.
 
 ## Playtest logs
 - Lance's own logs are in the game's `console_logs` folder (newest file = last session). Search them for `[PingComp]`.
