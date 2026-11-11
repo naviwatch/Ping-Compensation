@@ -1,7 +1,7 @@
 local mod = get_mod("Ping Compensation")
 
--- Host and client must run the same VERSION. Bump it whenever pc_hello, pc_swing_begin or pc_swing_answer changes.
-local VERSION = 5
+-- Host and client must run the same VERSION. Bump it whenever any message in CLAUDE.md's "Network messages" changes.
+local VERSION = 6
 
 local MAX_ERRORS = 5
 local CHAT_INTERVAL = 0.5
@@ -14,8 +14,42 @@ local pc = {
 	debug = false, -- /pingcomp debug
 	facing = true, -- /pingcomp facing
 	dodgecount = true, -- /pingcomp dodgecount: apply the weapon's dodge count to clients, as the game does for the host
+	attacks = true, -- /pingcomp attacks: this player's hits decide staggers and kills on the enemies below (D26 to D29)
+	recoil = "full", -- /pingcomp recoil off|anim|full: the enemy's recoil after this player's block (D13)
+	predict = true, -- /pingcomp predict: a hit on this player shows its results at once (D11)
+	stagger_timing = "speed", -- /pingcomp stagger speed|end|off, on the host: how a client's stagger is shortened (D32)
+	TELEPORT_LIMIT = 2.5, -- metres the host will move its copy of an enemy to where a client saw it (D27)
+	MAX_STAGGER_SPEEDUP = 1.5, -- fastest the host plays a client's stagger; past this it ends the stagger early
+	-- Enemies whose reactions to a player's hits that player's client decides (D29, D31). Every hit the client
+	-- sends counts: melee, pushes, ranged, career skills. Explosions and area damage are worked out on the host
+	-- and stay there (D33).
+	REACTION_BREEDS = {
+		skaven_slave = true,
+		skaven_clan_rat = true,
+		skaven_clan_rat_with_shield = true,
+		chaos_marauder = true,
+		chaos_marauder_with_shield = true,
+		chaos_fanatic = true,
+		beastmen_gor = true,
+		beastmen_ungor = true,
+	},
 	broken = false, -- set after repeated errors; the mod then leaves everything to vanilla
 	stats = {},
+}
+
+local ok_types, stagger_types = pcall(require, "scripts/utils/stagger_types")
+
+-- Same numbers as scripts/utils/stagger_types.lua, in case require isn't available to mods.
+pc.stagger_types = ok_types and type(stagger_types) == "table" and stagger_types or {
+	none = 0,
+	weak = 1,
+	medium = 2,
+	heavy = 3,
+	ranged_weak = 4,
+	ranged_medium = 5,
+	explosion = 6,
+	weakspot = 8,
+	pulling = 9,
 }
 
 mod.pc = pc
@@ -59,6 +93,29 @@ function pc.host_peer()
 	return lobby and lobby:lobby_host()
 end
 
+-- On a client: the main-clock time of the host's last reply to a hello. Nothing is predicted on this screen unless the
+-- host runs the same build, because only then does the host apply what this client decides.
+local host_heard = nil
+
+function pc.heard_host()
+	host_heard = pc.clock()
+end
+
+function pc.forget_host()
+	host_heard = nil
+end
+
+function pc.host_fresh()
+	return host_heard ~= nil and pc.clock() - host_heard <= pc.PEER_EXPIRY
+end
+
+function pc.local_player_unit()
+	local player = Managers.player and Managers.player:local_player()
+	local unit = player and player.player_unit
+
+	return unit and Unit.alive(unit) and unit or nil
+end
+
 local function format_message(format, ...)
 	local ok, message = pcall(string.format, format, ...)
 
@@ -77,14 +134,23 @@ function pc.log(format, ...)
 	end
 end
 
--- Chat line for the local player only. Rate-limited, so a horde can't flood the chat.
+-- Chat line for the local player that also goes to the console log, because some players' VMF settings send echoes
+-- to chat only, and the log is what testers send back.
+function pc.say(format, ...)
+	local message = format_message(format, ...)
+
+	mod:echo("%s", message)
+	print("[PingComp] " .. message)
+end
+
+-- Chat line for the local player only, also logged. Rate-limited, so a horde can't flood the chat.
 function pc.chat(format, ...)
 	local t = pc.clock()
 
 	if t >= next_chat_time then
 		next_chat_time = t + CHAT_INTERVAL
 
-		mod:echo("%s", format_message(format, ...))
+		pc.say(format, ...)
 	end
 end
 

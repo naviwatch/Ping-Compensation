@@ -4,7 +4,9 @@ local pc = mod.pc
 -- Client side. For every swing the host announces at this player, the client:
 --   1. turns its copy of the enemy itself, by the game's own rules, from the player's live position and dodge,
 --   2. judges the swing on the frame its copy of the enemy fires the damage animation event,
---   3. plays its own block at once if it blocked, and sends the result to the host.
+--   3. plays its own block at once if it blocked, and sends the result to the host,
+--   4. shows the result at once: the enemy's recoil after a block (Reactions.lua) and, for a hit, the feedback,
+--      knockback and HP estimate (HitResults.lua).
 -- A swing the host never announced is none of this file's business, so vanilla handles it.
 
 local client = {}
@@ -24,12 +26,7 @@ local by_go_id = {} -- enemy network id -> the same record
 local recently_cut = {} -- enemy unit -> { id, by, t } for swings cut in the last CUT_MEMORY seconds
 local hello_timer = 0
 
-local function local_player_unit()
-	local player = Managers.player:local_player()
-	local unit = player and player.player_unit
-
-	return unit and Unit.alive(unit) and unit or nil
-end
+local local_player_unit = pc.local_player_unit
 
 local function position(unit)
 	return POSITION_LOOKUP[unit] or Unit.world_position(unit, 0)
@@ -45,11 +42,20 @@ local function flat_rotation(from, to)
 	return Quaternion.look(Vector3.normalize(direction), Vector3.up())
 end
 
-local function send_answer(swing, frame, result, multiplier, improved, direction, through_block, distance, angle)
+-- recoil_anim, recoil_position and recoil_yaw: the enemy's recoil this client is about to play after a block, and
+-- where its screen shows the enemy (only sent with /pingcomp recoil full).
+local function send_answer(swing, frame, result, multiplier, improved, direction, through_block, distance, angle, recoil_anim, recoil_position, recoil_yaw)
 	local host_peer = pc.host_peer()
 
 	if host_peer then
-		mod:network_send("pc_swing_answer", host_peer, pc.VERSION, swing.id, frame, result, pc.finite(multiplier, 3), improved and true or false, direction or "", through_block and true or false, pc.finite(distance), pc.finite(angle, 1))
+		local x, y, z = 0, 0, 0
+
+		if recoil_position then
+			x, y, z = pc.finite(recoil_position.x, 3), pc.finite(recoil_position.y, 3), pc.finite(recoil_position.z, 3)
+		end
+
+		mod:network_send("pc_swing_answer", host_peer, pc.VERSION, swing.id, frame, result, pc.finite(multiplier, 3), improved and true or false, direction or "", through_block and true or false, pc.finite(distance), pc.finite(angle, 1),
+			recoil_anim or "", recoil_position ~= nil, x, y, z, pc.finite(recoil_yaw or 0, 4))
 	end
 end
 
@@ -293,11 +299,32 @@ function client.damage_frame(unit)
 	pc.count("client_judged")
 	pc.count(result == "miss" and "client_miss_" .. reason or "client_" .. result)
 
+	local reactions = pc.reactions
+	local recoil_anim, recoil_position, recoil_yaw
+
+	if result == "blocked" then
+		local ok
+
+		ok, recoil_anim, recoil_position, recoil_yaw = pc.guard("client recoil choice", reactions.choose_recoil, swing, unit)
+
+		if not ok then
+			recoil_anim, recoil_position, recoil_yaw = nil, nil, nil
+		end
+	end
+
 	-- The answer goes out before the local effects, so a problem in those can't leave the host without one.
-	send_answer(swing, frame, result, multiplier, improved, direction, through_block, distance, angle)
+	send_answer(swing, frame, result, multiplier, improved, direction, through_block, distance, angle, recoil_anim, recoil_position, recoil_yaw)
 
 	if result == "blocked" then
 		play_block(swing, unit, status, multiplier, improved, direction)
+
+		if recoil_anim then
+			pc.guard("client recoil", reactions.play_recoil, swing, unit, recoil_anim)
+		end
+
+		pc.guard("client blocked push", pc.hit_results.blocked, swing, unit, target)
+	elseif result == "hit" then
+		pc.guard("client hit results", pc.hit_results.hit, swing, unit, target)
 	end
 
 	if result == "hit" and swing.dodge_over_count then
@@ -308,9 +335,10 @@ function client.damage_frame(unit)
 		local dodging_now = status ~= nil and status.is_dodging == true
 		local effective_now = status ~= nil and status:get_is_dodging() and true or false
 
-		pc.log("client swing=%d enemy=%s attack=%s frame=%d verdict=%s reason=%s distance=%.2f reach=%.2f angle=%.1f cone=%.1f frozen=%s facing=%s since_begin=%.3fs dodging=%s effective=%s dodges=%s/%s dodged_in_swing=%s over_count_in_swing=%s dodgecount=%s",
+		pc.log("client swing=%d enemy=%s attack=%s frame=%d verdict=%s reason=%s distance=%.2f reach=%.2f angle=%.1f cone=%.1f frozen=%s facing=%s since_begin=%.3fs dodging=%s effective=%s dodges=%s/%s dodged_in_swing=%s over_count_in_swing=%s dodgecount=%s recoil=%s",
 			swing.id, breed.name, swing.action_name, frame, result, reason, distance, reach, angle, cone, tostring(swing.frozen), use_our_facing and "client" or "host", t - swing.begin_t,
-			tostring(dodging_now), tostring(effective_now), tostring(status and status.dodge_cooldown), tostring(status and status.dodge_count), tostring(swing.dodged == true), tostring(swing.dodge_over_count == true), pc.dodgecount and "on" or "off")
+			tostring(dodging_now), tostring(effective_now), tostring(status and status.dodge_cooldown), tostring(status and status.dodge_count), tostring(swing.dodged == true), tostring(swing.dodge_over_count == true), pc.dodgecount and "on" or "off",
+			tostring(recoil_anim or "host"))
 	end
 end
 
@@ -340,7 +368,8 @@ end
 
 -- This player's own push landed on an enemy that is swinging at them. On their screen the swing is over, as it will
 -- be on the host once the push arrives and staggers the enemy, so it is cut now instead of a ping later (decision
--- D23). A push taken on the enemy's shield may not stagger it, so that swing goes on.
+-- D23). A push taken on the enemy's shield may not stagger it, so that swing goes on. Not called for a push whose
+-- result this client decided itself (Reactions.lua): that one cuts the swing only if it staggered the enemy.
 function client.pushed(attacker_go_id, hit_go_id, shield_blocked)
 	local swing = by_go_id[hit_go_id]
 
@@ -364,7 +393,16 @@ function client.pushed(attacker_go_id, hit_go_id, shield_blocked)
 	cut(swing, "pushed")
 end
 
-mod:network_register("pc_swing_begin", function (sender, version, id, attacker_go_id, family, set_name, action_name, attack_anim, box_up, box_down, box_flat)
+-- This player's hit staggered or killed the enemy on their screen (Reactions.lua), so a swing it had started is over.
+function client.reaction_started(unit, reason)
+	local swing = by_unit[unit]
+
+	if swing and not swing.past_damage then
+		cut(swing, reason)
+	end
+end
+
+mod:network_register("pc_swing_begin", function (sender, version, id, attacker_go_id, family, set_name, action_name, attack_anim, box_up, box_down, box_flat, damage_scale)
 	if pc.broken or pc.is_server() or not pc.in_game() or sender ~= pc.host_peer() or version ~= pc.VERSION then
 		return
 	end
@@ -387,6 +425,19 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 		pc.count("client_unjudged")
 		pc.print("client swing=%d can't be judged: enemy=%s target=%s action=%s/%s", id, tostring(breed and breed.name), tostring(target ~= nil), set_name, action_name)
 		send_answer({ id = id }, 1, "unjudged")
+
+		return
+	end
+
+	-- The host started this swing before it heard of the stagger, kill or recoil this screen is already showing, and
+	-- that reaction will cancel it there too.
+	local busy = pc.reactions.busy(unit)
+
+	if busy then
+		pc.count("client_cut")
+		pc.count("client_cut_by_reaction")
+		pc.log("client swing=%d enemy=%s attack=%s cut at once: %s on this screen", id, breed.name, action_name, busy)
+		send_answer({ id = id }, 1, "cut")
 
 		return
 	end
@@ -418,7 +469,9 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 		target = target,
 		action = action,
 		action_name = action_name,
+		set_name = set_name,
 		breed = breed,
+		damage_scale = type(damage_scale) == "number" and damage_scale == damage_scale and damage_scale or 1,
 		attack_anim = attack_anim,
 		begin_t = t,
 		expires = t + pc.SWING_LIFETIME,
@@ -442,29 +495,44 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 end)
 
 mod:hook_safe("LocomotionSystem", "update", function (self, context, t)
-	if self.is_server or pc.broken or next(by_unit) == nil then
+	if self.is_server or pc.broken then
 		return
 	end
 
-	client.after_locomotion(t, context.dt)
-end)
+	if next(by_unit) ~= nil then
+		client.after_locomotion(t, context.dt)
+	end
 
-mod:hook_safe("AnimationSystem", "rpc_anim_event", function (self, channel_id, anim_id, go_id)
-	if not self.is_server and next(by_go_id) ~= nil then
-		client.animation_changed(go_id, anim_id)
+	if pc.reactions.active() then
+		pc.guard("client reactions", pc.reactions.after_locomotion, t, context.dt)
 	end
 end)
 
-mod:hook_safe("AnimationSystem", "rpc_anim_event_variable_float", function (self, channel_id, anim_id, go_id)
-	if not self.is_server and next(by_go_id) ~= nil then
-		client.animation_changed(go_id, anim_id)
-	end
-end)
+-- The host's animation messages are hooked in Reactions.lua, which passes the ones it doesn't hold back to here.
+function client.has_open_swings()
+	return next(by_go_id) ~= nil
+end
 
--- Runs on this player's machine for every push and melee hit they land, as the game sends it to the host. A push is
--- the only hit sent with can_damage false and can_stagger true (action_push_stagger.lua:288).
+-- Whether this enemy is in the middle of a swing at this player, which is the nearest this client gets to the host's
+-- "this enemy holds an attack token" (Reactions.lua).
+function client.swinging(unit)
+	local swing = by_unit[unit]
+
+	return swing ~= nil and not swing.past_damage
+end
+
+-- Runs on this player's machine for every hit they land, as the game sends it to the host. Reactions.lua works out
+-- what it does to the enemy. A push is the only hit sent with can_damage false and can_stagger true
+-- (action_push_stagger.lua:288).
 mod:hook_safe("WeaponSystem", "send_rpc_attack_hit", function (self, damage_source_id, attacker_unit_id, hit_unit_id, hit_zone_id, hit_position, attack_direction, damage_profile_id, ...)
-	if self.is_server or pc.broken or next(by_go_id) == nil then
+	if self.is_server or pc.broken then
+		return
+	end
+
+	local ok, decided = pc.guard("client attack hit", pc.reactions.attack_hit, damage_source_id, attacker_unit_id, hit_unit_id, hit_zone_id, hit_position, attack_direction, damage_profile_id, ...)
+
+	-- A hit Reactions.lua decided has already cut the swing if it staggered or killed the enemy.
+	if ok and decided or next(by_go_id) == nil then
 		return
 	end
 
@@ -487,12 +555,26 @@ mod:hook_safe("WeaponSystem", "send_rpc_attack_hit", function (self, damage_sour
 	end
 end)
 
--- Tells the host this client runs the mod and which version. Without a recent hello the host judges this player as
--- vanilla.
+mod:network_register("pc_hello_reply", function (sender, version)
+	if not pc.is_server() and version == pc.VERSION and sender == pc.host_peer() then
+		pc.heard_host()
+	end
+end)
+
+-- The next update sends a hello at once, so the host hears about a changed /pingcomp attacks switch straight away.
+function client.hello_now()
+	hello_timer = 0
+end
+
+-- Tells the host this client runs the mod, which version, and whether its attacks switch is on. Without a recent
+-- hello the host judges this player as vanilla.
 function client.update(dt)
 	if pc.broken or pc.is_server() or not pc.in_game() then
 		return
 	end
+
+	pc.guard("client reactions upkeep", pc.reactions.update, dt)
+	pc.guard("client hit results upkeep", pc.hit_results.update)
 
 	if next(recently_cut) ~= nil then
 		local t = pc.now()
@@ -512,7 +594,7 @@ function client.update(dt)
 		local host_peer = pc.host_peer()
 
 		if host_peer then
-			mod:network_send("pc_hello", host_peer, pc.VERSION)
+			mod:network_send("pc_hello", host_peer, pc.VERSION, pc.attacks and true or false)
 		end
 	end
 end
@@ -523,6 +605,10 @@ function client.clear()
 	by_go_id = {}
 	recently_cut = {}
 	hello_timer = 0
+
+	pc.forget_host()
+	pc.reactions.clear()
+	pc.hit_results.clear()
 end
 
 function client.open_swing_count()

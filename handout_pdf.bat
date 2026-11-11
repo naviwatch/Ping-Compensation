@@ -49,6 +49,20 @@ if errorlevel 1 (
 rem --no-pdf-header-footer drops the browser's own header and footer, so the page's footer is the only one.
 "%browser%" --headless=new --disable-gpu --no-first-run --no-default-browser-check --disable-extensions --no-pdf-header-footer --user-data-dir="%work%\browser-profile" --print-to-pdf="%work%\handout.pdf" "%work%\handout.html" > "%work%\browser.log" 2>&1
 
+rem The browser can return before it has finished printing, so wait up to 30 seconds for the file, then 2 more
+rem so it is fully written. ping is the pause because timeout refuses to run when input is redirected.
+set /a waited=0
+
+:wait_for_pdf
+if exist "%work%\handout.pdf" goto pdf_written
+if %waited% geq 30 goto pdf_written
+ping -n 2 127.0.0.1 >nul
+set /a waited+=1
+goto wait_for_pdf
+
+:pdf_written
+if exist "%work%\handout.pdf" ping -n 3 127.0.0.1 >nul
+
 if not exist "%work%\handout.pdf" (
 	echo The browser did not write a PDF. Its output:
 	type "%work%\browser.log"

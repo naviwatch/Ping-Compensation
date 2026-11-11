@@ -32,7 +32,7 @@ local function print_report()
 		local player = players[i]
 		local version = player.version and "[" .. player.version .. "]" or "Mod not found."
 
-		mod:echo("[%s] [%s] %s", player.name, mod_name, version)
+		mod.pc.say("[%s] [%s] %s", player.name, mod_name, version)
 	end
 end
 
@@ -41,7 +41,7 @@ local function start_request()
 	local human_players = player_manager and player_manager:human_players()
 
 	if not human_players or not next(human_players) then
-		mod:echo("No players found yet. Try again from the keep or a mission.")
+		mod.pc.say("No players found yet. Try again from the keep or a mission.")
 		return
 	end
 

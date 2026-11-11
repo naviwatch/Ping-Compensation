@@ -15,6 +15,7 @@ pc.host = host
 
 local MAX_FRAMES = 8
 local MAX_DIRECTION_LENGTH = 16
+local MAX_ANIMATION_LENGTH = 64
 local RESULTS = {
 	hit = true,
 	blocked = true,
@@ -23,7 +24,7 @@ local RESULTS = {
 	unjudged = true,
 }
 
-local peers = {} -- peer id -> main-clock time of that client's last hello
+local peers = {} -- peer id -> { t = main-clock time of that client's last hello, attacks = its /pingcomp attacks switch }
 local mismatched = {} -- peer id -> true once we've said their build differs
 local swings = {} -- swing id -> record
 local by_attacker = {} -- enemy unit -> its newest record
@@ -31,9 +32,31 @@ local action_sets = {} -- action table -> name of the BreedActions set it lives 
 local next_id = 0
 
 local function peer_is_fresh(peer)
-	local last = peers[peer]
+	local record = peers[peer]
 
-	return last ~= nil and pc.clock() - last <= pc.PEER_EXPIRY
+	return record ~= nil and pc.clock() - record.t <= pc.PEER_EXPIRY
+end
+
+-- Whether that player's client decides what their hits do to the enemies in pc.REACTION_BREEDS (D26 to D29). Their
+-- client makes the same check from the host's replies, so both sides agree on who decides.
+function host.peer_decides_attacks(peer)
+	return peer_is_fresh(peer) and peers[peer].attacks == true
+end
+
+-- The enemy's damage against this target is scaled down by how many enemies surround the target. Only the host has
+-- the slot data, so the client gets the number for its HP estimate (D11).
+local function damage_scale(action, target)
+	local diminishing = action.diminishing_damage
+	local slot_extension = ScriptUnit.has_extension(target, "ai_slot_system")
+
+	if not diminishing or not slot_extension or not slot_extension.has_slots_attached then
+		return 1
+	end
+
+	local slots = slot_extension.delayed_num_occupied_slots
+	local entry = slots and slots > 0 and diminishing[math.min(slots, 9)]
+
+	return entry and entry.damage or 1
 end
 
 -- An enemy's attack table doesn't always live under its own breed name: a stormvermin commander, for one, uses the
@@ -125,8 +148,10 @@ local function announce(unit, blackboard)
 		box_flat = blackboard.attack_range_flat or 0
 	end
 
+	local ok, scale = pcall(damage_scale, action, target)
+
 	pc.count("host_announced")
-	mod:network_send("pc_swing_begin", peer, pc.VERSION, swing.id, attacker_go_id, "A", set_name, action.name, blackboard.attack_anim, box_up, box_down, box_flat)
+	mod:network_send("pc_swing_begin", peer, pc.VERSION, swing.id, attacker_go_id, "A", set_name, action.name, blackboard.attack_anim, box_up, box_down, box_flat, pc.finite(ok and scale or 1, 3))
 end
 
 -- What vanilla would have decided at this frame. Nothing here has side effects.
@@ -265,18 +290,24 @@ local function book_hit(swing, through_block)
 	return "booked without attacker"
 end
 
-local function book_block(swing, multiplier, improved, direction)
+-- recoil: what the client played for the enemy's recoil, or nil if it left the recoil to the host (D13).
+local function book_block(swing, multiplier, improved, direction, recoil)
 	local target = swing.target
 	local attacker = swing.attacker
 	local action = swing.action
+	local reactions = pc.host_reactions
 
 	if not Unit.alive(target) then
+		reactions.recoil_refused(swing, recoil, "target gone")
+
 		return "target gone"
 	end
 
 	local network = pc.network()
 
 	if not Unit.alive(attacker) or network:unit_game_object_id(attacker) ~= swing.attacker_go_id then
+		reactions.recoil_refused(swing, recoil, "attacker gone")
+
 		return "attacker gone"
 	end
 
@@ -302,6 +333,7 @@ local function book_block(swing, multiplier, improved, direction)
 	end
 
 	local blackboard = BLACKBOARDS[attacker]
+	local recoil_outcome = "no recoil"
 
 	if blackboard and blackboard == swing.blackboard and HEALTH_ALIVE[attacker] then
 		if blackboard.active_node == BTAttackAction and blackboard.action == action and blackboard.attacking_target == target then
@@ -309,44 +341,56 @@ local function book_block(swing, multiplier, improved, direction)
 		end
 
 		-- The enemy's recoil. If it has already started another swing, this cancels that swing (decision D13).
-		if not action.no_block_stagger and not blackboard.stagger then
+		-- One that is already recoiling or staggered gets no new recoil, here or in vanilla.
+		if not action.no_block_stagger and not blackboard.stagger and not blackboard.blocked then
 			blackboard.blocked = true
+			recoil_outcome = reactions.recoil_booked(swing, blackboard, recoil)
+		else
+			reactions.recoil_refused(swing, recoil, "already recoiling or staggered")
 		end
+	else
+		reactions.recoil_refused(swing, recoil, "enemy dead or recycled")
 	end
 
-	return "booked"
+	return "booked, " .. recoil_outcome
 end
 
-local function valid_answer(id, frame, result, multiplier, improved, direction, through_block, distance, angle)
+local function valid_answer(id, frame, result, multiplier, improved, direction, through_block, distance, angle, recoil_anim, has_position, x, y, z, yaw)
 	return type(id) == "number" and type(frame) == "number" and frame >= 1 and frame <= MAX_FRAMES and frame == math.floor(frame)
 		and RESULTS[result] == true and type(multiplier) == "number" and multiplier == multiplier and multiplier >= 0 and multiplier <= 100
 		and type(improved) == "boolean" and type(direction) == "string" and #direction <= MAX_DIRECTION_LENGTH
 		and type(through_block) == "boolean" and type(distance) == "number" and type(angle) == "number"
+		and type(recoil_anim) == "string" and #recoil_anim <= MAX_ANIMATION_LENGTH and type(has_position) == "boolean"
+		and type(x) == "number" and type(y) == "number" and type(z) == "number" and type(yaw) == "number"
+		and x == x and y == y and z == z and yaw == yaw
 end
 
-mod:network_register("pc_hello", function (sender, version)
+mod:network_register("pc_hello", function (sender, version, attacks)
 	if not pc.is_server() then
 		return
 	end
 
 	if version == pc.VERSION then
-		peers[sender] = pc.clock()
+		peers[sender] = { t = pc.clock(), attacks = attacks == true }
+
+		-- The client predicts nothing until it hears this: only a host with the same build applies what it decides.
+		mod:network_send("pc_hello_reply", sender, pc.VERSION)
 	elseif not mismatched[sender] then
 		mismatched[sender] = true
 
 		local player = Managers.player and Managers.player:player_from_peer_id(sender)
 		local name = player and player:name() or tostring(sender)
 
-		mod:echo("%s runs a different build of Ping Compensation, so the game judges them as vanilla. Compare builds with /pingcomp version.", name)
+		pc.say("%s runs a different build of Ping Compensation, so the game judges them as vanilla. Compare builds with /pingcomp version.", name)
 	end
 end)
 
-mod:network_register("pc_swing_answer", function (sender, version, id, frame, result, multiplier, improved, direction, through_block, distance, angle)
+mod:network_register("pc_swing_answer", function (sender, version, id, frame, result, multiplier, improved, direction, through_block, distance, angle, recoil_anim, has_position, x, y, z, yaw)
 	if not pc.is_server() or not pc.in_game() or version ~= pc.VERSION then
 		return
 	end
 
-	if not valid_answer(id, frame, result, multiplier, improved, direction, through_block, distance, angle) then
+	if not valid_answer(id, frame, result, multiplier, improved, direction, through_block, distance, angle, recoil_anim, has_position, x, y, z, yaw) then
 		pc.count("host_rejected")
 		pc.print("host rejected a malformed answer from %s", tostring(sender))
 
@@ -370,7 +414,14 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 	if result == "hit" then
 		outcome = book_hit(swing, through_block)
 	elseif result == "blocked" then
-		outcome = book_block(swing, multiplier, improved, direction)
+		local recoil = recoil_anim ~= "" and {
+			anim = recoil_anim,
+			position = has_position and Vector3(x, y, z) or nil,
+			yaw = yaw,
+			frame_t = swing.frame_t[frame],
+		} or nil
+
+		outcome = book_block(swing, multiplier, improved, direction, recoil)
 	end
 
 	local t = pc.now()
@@ -432,6 +483,8 @@ function host.update()
 		return
 	end
 
+	pc.guard("host reactions update", pc.host_reactions.update)
+
 	local t = pc.now()
 
 	for id, swing in pairs(swings) do
@@ -462,6 +515,8 @@ function host.clear()
 	swings = {}
 	by_attacker = {}
 	host.suppress = nil
+
+	pc.host_reactions.clear()
 end
 
 function host.modded_peer_count()
