@@ -6,8 +6,8 @@ Design agreed with Lance on 2026-11-10 in a `/grill` session.
 
 | Roadmap step | State |
 |---|---|
-| 1. Family A, the core | Built on 2026-11-10. It compiles; it has not been run in game yet. Waiting for Lance's first playtest. |
-| 2. Instant results on A | Not started. Starts after step 1 has been playtested. |
+| 1. Family A, the core | Built on 2026-11-10 and playtested twice by testers the same day (see "Playtest results"). It works. A fix build (step 1.1: D22 to D25) was made on 2026-11-11 and compiles; it has not been run in game yet. |
+| 2. Instant results on A | Not started. Starts after step 1.1 has been playtested. |
 | 3 to 5. Families B, C, D | Not started. Until they land, those attacks are vanilla. |
 
 Lance chose to playtest step 1 on its own before step 2 goes on top.
@@ -105,6 +105,10 @@ Later, each in its own session: leading the enemy's position (T1), predicting kn
 - **D19. Records.** Decisions, TODOs and open questions live in this brief. `CLAUDE.md`'s Design and Hooks sections are rewritten only when the new code lands.
 - **D20. Team handout.** When implementation begins, a separate brief is written for the other developer and for playtesters. It summarises what changed, the debug tools and options, and what to test, and it is updated with every step. It also tells testers on other computers which files, logs and details to send back to Lance, and where to find them.
 - **D21. Step 1 is playtested on its own.** Lance: "If you think it's better to test step one separately from step two rather than implementing both into a build straight away then do that." It is, because prediction would hide judging mistakes.
+- **D22. A stagger that reaches your screen first cuts the swing.** If the host's change of the enemy's animation (almost always a stagger) reaches the client before the swing's damage moment, the swing is cut at once. This replaces the step 1 behaviour of keeping it judgeable for 2 more seconds, which the playtests showed was wrong: the damage moment can still fire during the blend into the stagger, and 5 of 20 such swings were booked as hits on enemies already staggering on the player's screen. On the host a staggered enemy's damage moment does nothing. A swing that lands on your screen before you hear about the stagger still counts (D5).
+- **D23. Your own push cancels the swing aimed at you, at once.** The push is detected on your machine; the client cuts the swing straight away instead of waiting a ping for the host's stagger. Lance: "This sounds good, you may implement this as well." Only your own pushes, only against swings aimed at you, and not when the enemy takes the push on its shield. The enemy still visibly staggers a ping later (T6).
+- **D24. The player's attacks will be client-authoritative too.** Lance: "We want the game to be client authoritative and that includes the player's attacks as well, not just their defensive actions. We just started with the defensive actions since they have the most impact, but the end game is to make everything the client does feel as responsive as possible." Lance was happy to do it now or later; it is later (T6), because predicting an attack's kill or stagger means copying the host's damage and stagger maths onto the client, which needs its own test, and it pairs with showing the enemy's reaction at once in step 2.
+- **D25. Clients get the weapon's dodge count by default.** Lance: "I think it would be fine to have this enabled by default so there's more parity between what a connected client experiences and a host." In vanilla the host's copy of a remote player never counts dodges, so every dodge a client makes is effective; the client judge now applies the count, as the game always has for the host's own hero. `/pingcomp dodgecount off` restores the vanilla client behaviour for comparison.
 
 ## Assumptions
 
@@ -124,6 +128,7 @@ Confirmed with the decision list.
 - **T3. Family E:** monsters and lords.
 - **T4. Family F:** disablers. Feasible with the same split, since the packmaster's hook and the assassin's pounce are both judged on the host against where it thinks the player is. It needs its own grill because the grab sequences are multi-step.
 - **T5.** Draw the reach and cone on the ground for debugging, only if the text log is not enough.
+- **T6. Make the player's own attacks and pushes land on their screen (D24).** Planned for step 2, alongside the block recoil: an attack that kills or staggers an enemy mid-swing at you cancels the swing at once, and the enemy visibly staggers or dies on your screen without waiting a ping. Facts so far: the game only predicts kills on the client for projectiles (`GenericHealthExtension.apply_client_predicted_damage`, used only by `player_projectile_unit_extension.lua`), so melee needs its own prediction of damage and stagger. Family A enemies mid-swing can't resist a stagger, because their stagger immunity only applies while they are already heavily staggered (`stagger_modifier_function` in their breed files). Testers on 2026-11-10 noticed that "pushes and attacks are still delayed" once blocks and dodges became instant.
 - **Not planned:** guessing the enemy's next action on the client. The host's AI picks it from random rolls, cooldowns and slot positions the client does not have, and a wrong guess looks worse than a short idle.
 
 ## Open questions
@@ -135,7 +140,12 @@ None block implementation. These can only be settled in play:
 - Does trailing make retreating too easy? At 150–340 ms a player covers 0.45–1.0 m backpedalling or 0.6–1.4 m running in the one extra ping they now get. (D16, T1)
 - Does the facing override twitch as it eases back? (D10)
 - Does the grudge-mark "crushing blow" buff reach clients? (Assumptions)
-- Does the client ever see a swing as "cut short" when it wasn't? The debug log names the animation that interrupted it. (Step 1 notes)
+- Does the weapon's dodge count feel fair for clients, now that they have it (D25)? The step 1.1 log shows each swing's dodge state, and `/pingcomp dodgecount off` gives the vanilla client behaviour to compare.
+- Does a push now stop the swings it should, and is a swing that still visibly connects after your push (until the stagger arrives) confusing? (D23, T6)
+
+Answered by the 2026-11-10 playtests:
+
+- *Does the client ever see a swing as "cut short" when it wasn't?* No. 150 of 319 swings were cut short (45 because the enemy died, 105 because it was staggered), and the host's own copy never reached its damage moment in any of them.
 
 One design question came up while building step 1 and is not decided:
 
@@ -159,13 +169,34 @@ The exact fields are listed in `CLAUDE.md`. Any change to them bumps `VERSION`, 
 Things settled while building step 1 that the grill did not cover. None of them changes a decision.
 
 - **Two extra results.** Besides hit, blocked and miss, a client can answer `cut` (the swing never reached its damage frame on its screen) and `unjudged` (it could not find the enemy or the attack in its own data). Neither books anything. Both show up in the host's stats, so a client that can't judge is visible instead of silently immune.
-- **When "cut short" is sent.** At once if the enemy dies or starts a new swing. If the host changes the enemy's animation before the damage frame, the client hands the facing back to the host straight away but keeps the swing judgeable for 2 more seconds, in case the damage event still fires. Only then does it report `cut`.
+- **When "cut short" is sent.** At once if the enemy dies, starts a new swing, has its animation changed by the host (D22), or is pushed by the player (D23). In step 1 an animation change kept the swing judgeable for 2 more seconds; the playtests showed that was wrong, and step 1.1 removed it. A damage event that still fires within 2 seconds of a cut is logged and counted, not judged.
 - **A client that goes quiet mid-swing.** If the target's hello has expired by the time the host's copy reaches the damage frame, the host judges that one swing itself and ignores a late answer for it. This is the only case where the host judges a swing it announced.
 - **A hit whose attacker is gone.** The host uses the real attacker while it still has the network id it started the swing with, which covers an enemy that has just died. After that it books the damage with the victim standing in as the attacker unit and the enemy's type as the damage source, which is what the game does for damage whose attacker has gone.
 - **Finding the attack on the client.** An enemy's attack table does not always live under its own breed name (a stormvermin commander uses the plain stormvermin's set), so the host sends the name of the set as well as the name of the attack.
 - **Safety net.** Both `mod:hook` handlers run through a guard that catches errors. After 5 errors in one place the mod switches itself off until the next mission: clients stop saying hello, the host stops announcing, and vanilla rules apply.
 - **`/pingcomp mark <note>`** was added so a tester can drop a line into their log at the moment something looked wrong.
 - **Box-range attacks.** The game code supports attacks with a box-shaped reach test (`use_box_range`), but no attack in the current data uses it. The maths is copied anyway.
+
+## Playtest results
+
+### Step 1, 2026-11-10
+
+Two sessions run by testers without Lance, on The Screaming Bell at Cataclysm 3 with Onslaught-style difficulty mods. The same host both times: one client in session 1, two in session 2. Logs are in `TestLogs/2026-11-10-testers/` and `TestLogs/2026-11-10-testers-2/` (gitignored).
+
+- **Plumbing.** 319 swings were announced and every one was answered, in 0.21–0.24 s on average, matching pings of 213–247 ms. No errors from the mod, no rejected or ignored answers, and the host never had to judge a swing itself.
+- **Judging.** On the 138 swings both sides judged with the client's facing on, the host's own judgement (vanilla) would have hit the players 48 times; they took 25. Of vanilla's 48: 11 were blocked late on the player's screen, 11 were dodged on it, and 7 missed because the player was further away or off to the side on their own screen. The players took 6 hits vanilla wouldn't have: 3 after dropping their block on their screen while the host still saw it up, 3 where they were closer than the host thought. Every disagreement had an explanation of that kind.
+- **Data.** The reach values the clients used match the unmodded game data (slave rat 3.0, clan rat 3.1, marauder 3.5, fanatic 3.25), so the different difficulty mods on each machine didn't change them.
+- **Cut short.** See the answered open question. Most of the 105 staggers were the testers' own pushes and hits.
+- **Judged after a stagger.** 20 swings were judged after the client had already received the stagger; 5 were booked as hits. Fixed by D22.
+- **`/pingcomp facing off`.** With it off for 30 s, all 7 swings missed, 5 of which the host would have landed. Off is far more forgiving than vanilla, not "the normal game".
+- **Commands.** Two testers got the usage message three times. Step 1.1 accepts any capitalisation, names an unknown word and logs every command.
+
+Tester feedback (session 2):
+
+- "Everything defensive related is way more responsive, block and dodges, whilst pushes and attack are still delayed." (GK, Bretonnian longsword, 220 ms)
+- "You can for sure dodge and block attacks you normally couldnt on trash enemies." (Mercenary, mace and shield, 230 ms)
+- "When you push attack it seemed the trash enemies would still hit your guard even after a push. You would still get guard broken when pushing attacking." Two causes: the D22 bug, and a push in the last ping before a swing lands can't stop it in time. That deadline is the same as vanilla's, but it stands out next to instant blocks. D23 addresses it.
+- "Possibly back dodges on trash enemies not working." The client judge applied the weapon's dodge count, which vanilla never applies to clients (D25). 6 of that tester's 14 hits landed within 0.25 m of the enemy's maximum reach, the margin an effective dodge buys. The step 1 log couldn't show whether they were dodging; step 1.1 logs it.
 
 ## Game facts the design rests on
 

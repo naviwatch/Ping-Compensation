@@ -15,12 +15,13 @@ local DODGE_DISTANCE = 4 -- DEFAULT_DODGE_DISTANCE_THRESHOLD in bt_attack_action
 local DEFAULT_DODGE_ROTATION_TIME = 1.5 -- also from bt_attack_action.lua
 local ROTATION_SPEED = 10 -- DEFAULT_ROTATION_SPEED in ai_locomotion_extension.lua
 local FACING_HOLD = 1 -- seconds the facing stays ours after the damage frame, unless the enemy moves on first
-local INTERRUPTED_GRACE = 2 -- seconds an interrupted swing may still fire its damage event before it counts as cut short
+local CUT_MEMORY = 2 -- seconds a cut swing is remembered, only so that a damage event that still fires gets logged
 local MAX_FRAMES = 8
 
 local swings = {} -- swing id -> record, kept for the stats and the debug log
 local by_unit = {} -- enemy unit -> its newest record
 local by_go_id = {} -- enemy network id -> the same record
+local recently_cut = {} -- enemy unit -> { id, by, t } for swings cut in the last CUT_MEMORY seconds
 local hello_timer = 0
 
 local function local_player_unit()
@@ -64,16 +65,50 @@ local function forget(swing)
 	end
 end
 
--- The swing is over on this screen. If it never reached its damage frame, say so, so the host's stats can tell a
--- swing that was cut short from a client that stayed silent.
-local function finish(swing, reason)
-	if swing.frames == 0 then
-		pc.count("client_cut")
-		pc.log("client swing=%d enemy=%s attack=%s cut short (%s)", swing.id, swing.breed.name, swing.action_name, tostring(swing.interrupted_by or reason))
-		send_answer(swing, 1, "cut")
+-- The swing ended on this screen before its damage frame: the enemy died, was staggered, was pushed by this player or
+-- started another swing. It did not land here, so it never counts (decision D5). The host hears "cut" and books
+-- nothing, and the facing goes back to the host. The swing is remembered for a moment so that a damage event that
+-- still fires during the blend into the stagger is logged instead of judged.
+local function cut(swing, by)
+	local t = pc.now()
+
+	pc.count("client_cut")
+
+	if by == "pushed" then
+		pc.count("client_cut_pushed")
 	end
 
+	pc.log("client swing=%d enemy=%s attack=%s cut short (%s) %.3fs after it began", swing.id, swing.breed.name, swing.action_name, tostring(by), t - swing.begin_t)
+	send_answer(swing, 1, "cut")
+
+	recently_cut[swing.unit] = { id = swing.id, by = tostring(by), t = t }
+
 	forget(swing)
+end
+
+-- The swing is over on this screen. One that never reached its damage frame was cut short.
+local function finish(swing, reason)
+	if swing.frames == 0 then
+		cut(swing, reason)
+	else
+		forget(swing)
+	end
+end
+
+-- Whether the enemy should lose track of this player, which is what BTAttackAction asks the host's copy of them.
+-- The weapon's dodge count only exists on the dodging player's own machine (player_character_state_helper.lua:188),
+-- so in vanilla the host treats every dodge a client makes as effective. /pingcomp dodgecount on, the default, applies
+-- the count as the game always has for the host's own hero (decision D25). Off gives clients the vanilla behaviour.
+local function is_dodging(status)
+	if status:is_invisible() then
+		return true
+	end
+
+	if pc.dodgecount then
+		return status:get_is_dodging() and true or false
+	end
+
+	return status.is_dodging == true
 end
 
 -- Copy of BTAttackAction._handle_movement (bt_attack_action.lua:390), fed from this player's live state.
@@ -85,8 +120,17 @@ local function update_facing(swing, unit, target, t, dt)
 	local distance = Vector3.distance(attacker_position, target_position)
 	local status = ScriptUnit.has_extension(target, "status_system")
 
+	-- For the debug log: did the player dodge during this swing, and was any of those dodges over the dodge count?
+	if status and not swing.past_damage and status.is_dodging then
+		swing.dodged = true
+
+		if not status:get_is_dodging() then
+			swing.dodge_over_count = true
+		end
+	end
+
 	if status and not swing.past_damage and t > swing.window_start then
-		local dodging = status:get_is_dodging() or status:is_invisible()
+		local dodging = is_dodging(status)
 
 		if not dodging and t > swing.lock_timer then
 			local rotation = flat_rotation(attacker_position, target_position)
@@ -111,7 +155,7 @@ local function update_facing(swing, unit, target, t, dt)
 
 	swing.current:store(rotation)
 
-	if pc.facing and not swing.interrupted_by then
+	if pc.facing then
 		Unit.set_local_rotation(unit, 0, rotation)
 	end
 end
@@ -185,7 +229,24 @@ end
 function client.damage_frame(unit)
 	local swing = by_unit[unit]
 
-	if not swing or swing.frames >= MAX_FRAMES then
+	if not swing then
+		local cut_record = recently_cut[unit]
+
+		if cut_record then
+			recently_cut[unit] = nil
+
+			local since = pc.now() - cut_record.t
+
+			if since <= CUT_MEMORY then
+				pc.count("client_damage_after_cut")
+				pc.log("client swing=%d fired its damage event %.3fs after it was cut short (%s); not judged", cut_record.id, since, cut_record.by)
+			end
+		end
+
+		return
+	end
+
+	if swing.frames >= MAX_FRAMES then
 		return
 	end
 
@@ -204,7 +265,7 @@ function client.damage_frame(unit)
 
 	local action = swing.action
 	local breed = swing.breed
-	local use_our_facing = pc.facing and not swing.interrupted_by
+	local use_our_facing = pc.facing
 	local rotation = use_our_facing and swing.current:unbox() or Unit.local_rotation(unit, 0)
 	local forward = Quaternion.forward(rotation)
 	local offset = position(target) - position(unit)
@@ -239,13 +300,24 @@ function client.damage_frame(unit)
 		play_block(swing, unit, status, multiplier, improved, direction)
 	end
 
-	pc.log("client swing=%d enemy=%s attack=%s frame=%d verdict=%s reason=%s distance=%.2f reach=%.2f angle=%.1f cone=%.1f frozen=%s facing=%s since_begin=%.3fs", swing.id, breed.name, swing.action_name, frame, result, reason, distance, reach, angle, cone,
-		tostring(swing.frozen), use_our_facing and "client" or "host", t - swing.begin_t)
+	if result == "hit" and swing.dodge_over_count then
+		pc.count("client_hit_over_dodge_count")
+	end
+
+	if pc.debug then
+		local dodging_now = status ~= nil and status.is_dodging == true
+		local effective_now = status ~= nil and status:get_is_dodging() and true or false
+
+		pc.log("client swing=%d enemy=%s attack=%s frame=%d verdict=%s reason=%s distance=%.2f reach=%.2f angle=%.1f cone=%.1f frozen=%s facing=%s since_begin=%.3fs dodging=%s effective=%s dodges=%s/%s dodged_in_swing=%s over_count_in_swing=%s dodgecount=%s",
+			swing.id, breed.name, swing.action_name, frame, result, reason, distance, reach, angle, cone, tostring(swing.frozen), use_our_facing and "client" or "host", t - swing.begin_t,
+			tostring(dodging_now), tostring(effective_now), tostring(status and status.dodge_cooldown), tostring(status and status.dodge_count), tostring(swing.dodged == true), tostring(swing.dodge_over_count == true), pc.dodgecount and "on" or "off")
+	end
 end
 
--- The host changed this enemy's animation. Before the damage frame that most likely means the swing was
--- interrupted, so the facing goes back to the host. The swing itself stays judgeable: if its damage event still
--- fires, it landed on this screen after all.
+-- The host changed this enemy's animation. Before the damage frame that means the swing was interrupted, almost
+-- always by a stagger, and the player now sees the enemy stop swinging. On the host a staggered enemy's damage event
+-- does nothing, so here the swing is cut at once (decision D22). The first playtests showed the damage event can still
+-- fire during the blend into the stagger; damage_frame logs that instead of judging it.
 function client.animation_changed(go_id, anim_id)
 	local swing = by_go_id[go_id]
 
@@ -261,12 +333,35 @@ function client.animation_changed(go_id, anim_id)
 
 	if swing.past_damage then
 		forget(swing)
-	elseif not swing.interrupted_by then
-		swing.interrupted_by = tostring(event)
-
-		-- Don't wait out the full lifetime: the host should hear "cut short" while it still remembers the swing.
-		swing.expires = math.min(swing.expires, pc.now() + INTERRUPTED_GRACE)
+	else
+		cut(swing, tostring(event))
 	end
+end
+
+-- This player's own push landed on an enemy that is swinging at them. On their screen the swing is over, as it will
+-- be on the host once the push arrives and staggers the enemy, so it is cut now instead of a ping later (decision
+-- D23). A push taken on the enemy's shield may not stagger it, so that swing goes on.
+function client.pushed(attacker_go_id, hit_go_id, shield_blocked)
+	local swing = by_go_id[hit_go_id]
+
+	if not swing or swing.past_damage then
+		return
+	end
+
+	local target = local_player_unit()
+
+	if not target or target ~= swing.target or pc.network():unit_game_object_id(target) ~= attacker_go_id then
+		return
+	end
+
+	if shield_blocked then
+		pc.count("client_push_on_shield")
+		pc.log("client swing=%d enemy=%s took the push on its shield; the swing goes on", swing.id, swing.breed.name)
+
+		return
+	end
+
+	cut(swing, "pushed")
 end
 
 mod:network_register("pc_swing_begin", function (sender, version, id, attacker_go_id, family, set_name, action_name, attack_anim, box_up, box_down, box_flat)
@@ -366,11 +461,47 @@ mod:hook_safe("AnimationSystem", "rpc_anim_event_variable_float", function (self
 	end
 end)
 
+-- Runs on this player's machine for every push and melee hit they land, as the game sends it to the host. A push is
+-- the only hit sent with can_damage false and can_stagger true (action_push_stagger.lua:288).
+mod:hook_safe("WeaponSystem", "send_rpc_attack_hit", function (self, damage_source_id, attacker_unit_id, hit_unit_id, hit_zone_id, hit_position, attack_direction, damage_profile_id, ...)
+	if self.is_server or pc.broken or next(by_go_id) == nil then
+		return
+	end
+
+	local can_damage, can_stagger, blocking = true, true, false
+
+	for i = 1, select("#", ...) - 1, 2 do
+		local name, value = select(i, ...)
+
+		if name == "can_damage" then
+			can_damage = value
+		elseif name == "can_stagger" then
+			can_stagger = value
+		elseif name == "blocking" then
+			blocking = value
+		end
+	end
+
+	if can_damage == false and can_stagger == true then
+		client.pushed(attacker_unit_id, hit_unit_id, blocking == true)
+	end
+end)
+
 -- Tells the host this client runs the mod and which version. Without a recent hello the host judges this player as
 -- vanilla.
 function client.update(dt)
 	if pc.broken or pc.is_server() or not pc.in_game() then
 		return
+	end
+
+	if next(recently_cut) ~= nil then
+		local t = pc.now()
+
+		for unit, record in pairs(recently_cut) do
+			if t - record.t > CUT_MEMORY then
+				recently_cut[unit] = nil
+			end
+		end
 	end
 
 	hello_timer = hello_timer - dt
@@ -390,6 +521,7 @@ function client.clear()
 	swings = {}
 	by_unit = {}
 	by_go_id = {}
+	recently_cut = {}
 	hello_timer = 0
 end
 

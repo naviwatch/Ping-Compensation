@@ -1,10 +1,10 @@
 # Ping Compensation: playtest handout
 
-For the other developer on the mod and for anyone playtesting it. This describes **build step 1**, made on 2026-11-10. It is updated whenever a new build changes what you see or what to test.
+For the other developer on the mod and for anyone playtesting it. This describes **build step 1.1**, made on 2026-11-11. It is updated whenever a new build changes what you see or what to test.
 
 The full design is in [client-authoritative-melee.md](client-authoritative-melee.md). You don't need it to test.
 
-## What the mod does now
+## What the mod does
 
 In the normal game the host decides whether an enemy's swing hits you, using a picture of you that is out of date by your ping. That is why a block or dodge that looked fine on your screen can still fail.
 
@@ -12,14 +12,15 @@ This mod moves that decision to your own game. When an enemy's swing lands **on 
 
 On your own screen the mod also turns the enemy that is swinging at you, using the game's normal turning rules but your real position. Dodging still makes it lose track of you, as in the normal game.
 
-## What changed from the previous version
+## What changed in this build
 
-The old version was "lag compensation": the host held each hit, asked your game what it saw, and still made the final call. All of that is gone.
+Thank you for the first two sessions. This build fixes what they turned up.
 
-- Your game now decides, and the host never overrules it.
-- If your game sends no answer, the swing does nothing. There is no fallback to the host's opinion.
-- `/ping_probe` is removed. The debug tools are now under `/pingcomp` (see below).
-- Host and clients must run the same build. A different build is treated as "no mod".
+- **A swing that is already staggering on your screen no longer hits you.** Before, a few enemies that had visibly started to stagger still landed their swing, or hit your guard and cost you stamina.
+- **Your own push stops a swing aimed at you the moment it lands**, instead of a ping later. The swing may still visibly reach you, because the enemy's stagger takes a ping to arrive, but it does nothing.
+- **Your weapon's dodge count now applies to you.** If you chain quick dodges, the ones past your weapon's dodge count no longer make enemies lose track of you or shrink their reach. The host has always played with this rule. In the normal game a client never had it, because the host doesn't know how many times a client has dodged. `/pingcomp dodgecount off` switches back to the old behaviour so you can compare.
+- **`/pingcomp facing off` was described wrongly last time.** It is not the normal game. It makes you much harder to hit, because the enemy's facing on your screen trails behind you. Leave it on unless you are comparing.
+- **`/pingcomp` accepts any capitalisation** and tells you which word it didn't understand.
 
 ## What is covered in this build
 
@@ -38,8 +39,11 @@ Not covered yet. These behave exactly like the normal game:
 ## What to expect
 
 - **Blocks and dodges count the way you saw them.** If your block was up when the swing landed on your screen, it is a block. If the swing missed you on your screen, it is a miss.
-- **A landed hit is felt a moment late.** When a swing does hit you, the health loss, the grunt and the knockback arrive about one ping after the swing connects. This is known and intended for this build. The next build removes the delay. Your block's spark, sound and stamina cost are already instant.
-- **The enemy's recoil after your block is also a moment late**, for the same reason.
+- **Your push stops a swing aimed at you at once.** It doesn't work if the enemy takes the push on its shield.
+- **Your attacks don't do that yet.** If you kill or stagger an enemy with an attack in the last moment before its swing lands, the swing can still land, just as in the normal game. This is planned for the next build.
+- **Chained dodges wear out.** After as many quick dodges as your weapon allows (2 for most shields, 3 for many other weapons, up to 6 for a few fast ones), further dodges in the chain no longer shake the enemy off.
+- **A landed hit is felt a moment late.** When a swing does hit you, the health loss, the grunt and the knockback arrive about one ping after the swing connects. This is known for this build. Your block's spark, sound and stamina cost are already instant.
+- **The enemy's recoil after your block, and its stagger after your push, are also a moment late**, for the same reason.
 - **Other players see your results a moment late.** On their screens a swing may pass through you and your health drops a beat later, or a swing that looked like a hit does nothing.
 - **Backing away from a swing is easier than in the normal game**, more so with a high ping. We want to know whether it feels too easy.
 
@@ -57,8 +61,9 @@ All of them are typed into the game's chat.
 |---|---|
 | `/pingcomp version` | Lists the build each connected player is running. Only you see the list. |
 | `/pingcomp debug on` or `off` | Writes one line per judged swing into your console log. On the host it also shows a chat line when the host would have judged a swing differently, or when a client never answered. |
-| `/pingcomp stats` | Shows totals since the mission started: swings judged, hits, blocks, misses and so on. |
-| `/pingcomp facing on` or `off` | Clients only. Off makes the enemy turn the way the host says, as in the normal game, so you can compare. It starts on. |
+| `/pingcomp stats` | Shows totals since the mission started: swings judged, hits, blocks, misses, swings your push stopped, and so on. |
+| `/pingcomp dodgecount on` or `off` | Clients only. On, the default, applies your weapon's dodge count, as the game always has for the host. Off ignores it, as the normal game does for clients. |
+| `/pingcomp facing on` or `off` | Clients only. Leave it on. Off is only for comparing and makes you much harder to hit than in the normal game. |
 | `/pingcomp mark <note>` | Writes a marker into your console log, for example `/pingcomp mark that rat hit me through my block`. |
 
 ## What to test
@@ -69,28 +74,30 @@ Any difficulty works. Champion or higher is best, because enemies track and comm
 
 1. **Late block.** Let a single clan rat or marauder swing at you and raise your block as late as you dare. If the block was up when the swing landed on your screen, it should always count.
 2. **Dodge.** Dodge sideways or backwards just before a swing lands. If it missed you on your screen, you should take no damage.
-3. **Take a hit on purpose.** Stand still. You should lose the usual amount of health, a moment after the swing connects.
-4. **Parry.** Block within half a second of raising your guard. You should hear the parry sound, and anything on your build that triggers on a parry should trigger.
-5. **Block from the side and behind.** A swing from outside your weapon's block arc should still be blocked but cost more stamina, as in the normal game.
-6. **Interrupt the swing.** Push or stagger an enemy during its wind-up. That swing should do nothing.
-7. **Walk backwards out of swings.** Tell us how easy it is compared with the normal game.
-8. **Facing.** Watch how the enemy turns towards you during a swing, and whether it twitches when the swing ends. Then try a few fights with `/pingcomp facing off` and tell us which looks and plays better.
-9. **A long horde fight.** Play normally for a few minutes. Look for hits that feel wrong in either direction, enemies that stop attacking, or anything that seems stuck.
+3. **Late push.** Push an enemy just before its swing lands, and try push-attacks into a crowd. A swing at you from the enemy you pushed should do nothing and cost no block stamina, even if it still visibly reaches you.
+4. **Chained back dodges.** Dodge backwards several times in a row away from a swinging enemy. Note how many dodges into the chain it starts catching you. Then type `/pingcomp dodgecount off`, try the same, and tell us which felt right. Turn it back on afterwards.
+5. **Stagger with attacks.** Stagger an enemy with an attack during its wind-up. If you see it stagger before its swing lands, the swing should do nothing.
+6. **Take a hit on purpose.** Stand still. You should lose the usual amount of health, a moment after the swing connects.
+7. **Parry.** Block within half a second of raising your guard. You should hear the parry sound, and anything on your build that triggers on a parry should trigger.
+8. **Block from the side.** A swing from outside your weapon's block arc should still be blocked but cost more stamina, as in the normal game.
+9. **Walk backwards out of swings.** Tell us how easy it is compared with the normal game.
+10. **Facing.** Watch how the enemy turns towards you during a swing, and whether it twitches when the swing ends.
+11. **A long horde fight.** Play normally for a few minutes. Look for hits that feel wrong in either direction, enemies that stop attacking, or anything that seems stuck.
 
 **As the host**
 
-10. **Watch a client being attacked.** Their blocks should show the block reaction, the enemy should recoil, and their health should only drop for hits. Each result appears about one ping late.
-11. **Your own fights** should feel exactly like the normal game.
-12. **A bot or a player without the mod** in the lobby should play exactly like the normal game.
+12. **Watch a client being attacked.** Their blocks should show the block reaction, the enemy should recoil, and their health should only drop for hits. Each result appears about one ping late.
+13. **Your own fights** should feel exactly like the normal game.
+14. **A bot or a player without the mod** in the lobby should play exactly like the normal game.
 
 **Everyone**
 
-13. At the end of the mission, before you leave, type `/pingcomp stats`.
-14. Anything that crashes, freezes or throws a red error message in chat is important. Note what you were doing.
+15. At the end of the mission, before you leave, type `/pingcomp stats`.
+16. Anything that crashes, freezes or throws a red error message in chat is important. Note what you were doing.
 
 ## When something looks wrong
 
-Type `/pingcomp mark` and a few words straight away, for example `/pingcomp mark blocked but took damage`. It puts a line in your log at that moment, which makes the problem much faster to find.
+Type `/pingcomp mark` and a few words straight away, for example `/pingcomp mark pushed but still lost stamina`. It puts a line in your log at that moment, which makes the problem much faster to find.
 
 ## What to send back to Lance
 
@@ -117,6 +124,7 @@ Mission and difficulty:
 Career and melee weapon:
 Was /pingcomp debug on for the whole session? (yes/no)
 What /pingcomp version showed for each player:
+Did you try /pingcomp dodgecount off? Which felt right?
 What felt wrong, and roughly when (or the text of your /pingcomp mark notes):
 What felt better than the normal game:
 ```
@@ -129,7 +137,8 @@ A note on privacy: the console log contains your Steam name and ID, your PC's ha
 
 ## Known limits of this build
 
-- A landed hit's results and the enemy's recoil arrive about one ping late (see "What to expect").
+- A landed hit's results, the enemy's recoil after your block and its stagger after your push arrive about one ping late (see "What to expect").
+- Your attacks don't stop a swing early yet, and neither does a teammate's push.
 - Only the enemies listed under "What is covered" are judged on your screen.
 - If your game freezes or your connection stalls for more than 4 seconds, the host treats you as having no mod until you are back.
 - A few enemy types (ungor archers in melee) normally can't hit you without a clear line of sight. That rule is not applied to swings judged on your screen.
@@ -137,8 +146,8 @@ A note on privacy: the console log contains your Steam name and ID, your PC's ha
 
 ## For the developer
 
-- The code lives in `scripts/mods/Ping Compensation/`: `Shared.lua` (constants, helpers, the error guard), `Geometry.lua` (the reach and facing maths), `Host.lua`, `Client.lua`, `Version.lua`, and `Ping Compensation.lua` (the shared damage-frame hook, the commands and the lifecycle).
+- The code lives in `scripts/mods/Ping Compensation/`: `Shared.lua` (constants, switches, helpers, the error guard), `Geometry.lua` (the reach and facing maths), `Host.lua`, `Client.lua`, `Version.lua`, and `Ping Compensation.lua` (the shared damage-frame hook, the commands and the lifecycle).
 - `CLAUDE.md` lists every hook with its file and line in the decompiled source, the network messages, and the rules for this repo.
-- The message version is `VERSION = 5` in `Shared.lua`. Bump it whenever `pc_hello`, `pc_swing_begin` or `pc_swing_answer` changes.
+- The message version is `VERSION = 5` in `Shared.lua`. Bump it whenever `pc_hello`, `pc_swing_begin` or `pc_swing_answer` changes. This build didn't change them.
 - Build with `./build.bat < /dev/null` in Git Bash, or `.\build.bat` in PowerShell.
-- Debug lines in the log start with `[PingComp]`. A client line reads `client swing=… verdict=… reason=… distance=… reach=… angle=… cone=… frozen=… facing=…`. A host line reads `host swing=… answer=… host_would=… outcome=… answer_after=… ping=…`.
+- Debug lines in the log start with `[PingComp]`. A client line reads `client swing=… verdict=… reason=… distance=… reach=… angle=… cone=… frozen=… facing=… dodging=… effective=… dodges=used/allowed …`. A cut swing reads `client swing=… cut short (pushed)` or names the animation that interrupted it. A host line reads `host swing=… answer=… host_would=… outcome=… answer_after=… ping=…`. Every `/pingcomp` command typed is logged as `[PingComp] command …`.

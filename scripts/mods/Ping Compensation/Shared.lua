@@ -13,6 +13,7 @@ local pc = {
 	SWING_LIFETIME = 5, -- seconds a swing is remembered, on both machines
 	debug = false, -- /pingcomp debug
 	facing = true, -- /pingcomp facing
+	dodgecount = true, -- /pingcomp dodgecount: apply the weapon's dodge count to clients, as the game does for the host
 	broken = false, -- set after repeated errors; the mod then leaves everything to vanilla
 	stats = {},
 }

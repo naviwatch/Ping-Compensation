@@ -47,18 +47,49 @@ local function role()
 	return pc.is_server() and "host" or "client"
 end
 
-local function switch(name, value)
-	if value == "on" then
-		pc[name] = true
-	elseif value == "off" then
-		pc[name] = false
-	elseif value ~= nil then
-		mod:echo("Usage: /pingcomp %s on|off", name)
+local USAGE = "Usage: /pingcomp version | debug on|off | stats | facing on|off | dodgecount on|off | mark <note>"
 
-		return
+local SWITCH_VALUES = {
+	on = true,
+	["true"] = true,
+	["1"] = true,
+	off = false,
+	["false"] = false,
+	["0"] = false,
+}
+
+-- What a switch means, said when someone changes it, so nobody mistakes a comparison mode for the normal game.
+local SWITCH_NOTES = {
+	facing = {
+		[false] = "Off is only for comparing. The enemy's facing on your screen then trails behind you, which makes you much harder to hit than in the normal game.",
+	},
+	dodgecount = {
+		[true] = "Your weapon's dodge count applies to you, as it always has for the host.",
+		[false] = "Off ignores your weapon's dodge count, as the normal game does for players who aren't hosting.",
+	},
+}
+
+local function switch(name, value)
+	if value ~= nil then
+		local wanted = SWITCH_VALUES[value]
+
+		if wanted == nil then
+			mod:echo("Usage: /pingcomp %s on|off", name)
+
+			return
+		end
+
+		pc[name] = wanted
 	end
 
 	mod:echo("Ping Compensation %s is %s.", name, pc[name] and "on" or "off")
+
+	local note = value ~= nil and SWITCH_NOTES[name] and SWITCH_NOTES[name][pc[name]]
+
+	if note then
+		mod:echo("%s", note)
+	end
+
 	pc.print("switch %s=%s role=%s", name, tostring(pc[name]), role())
 end
 
@@ -86,13 +117,32 @@ local function print_stats()
 		end
 	else
 		mod:echo("Swings announced %d, judged %d: hit %d, blocked %d, out of reach %d, outside the cone %d.", stat("client_announced"), stat("client_judged"), stat("client_hit"), stat("client_blocked"), stat("client_miss_reach"), stat("client_miss_cone"))
-		mod:echo("Cut short %d. Could not judge %d. Open right now %d.", stat("client_cut"), stat("client_unjudged"), pc.client.open_swing_count())
+		mod:echo("Cut short %d, %d of them by your own push. Pushes taken on a shield %d. Damage events after a cut %d.", stat("client_cut"), stat("client_cut_pushed"), stat("client_push_on_shield"), stat("client_damage_after_cut"))
+		mod:echo("Hits during a swing where a dodge was over your dodge count %d. Could not judge %d. Open right now %d.", stat("client_hit_over_dodge_count"), stat("client_unjudged"), pc.client.open_swing_count())
 	end
 
-	mod:echo("Switches: debug %s, facing %s.%s", pc.debug and "on" or "off", pc.facing and "on" or "off", pc.broken and " The mod has switched itself off after errors." or "")
+	mod:echo("Switches: debug %s, facing %s, dodgecount %s.%s", pc.debug and "on" or "off", pc.facing and "on" or "off", pc.dodgecount and "on" or "off", pc.broken and " The mod has switched itself off after errors." or "")
 end
 
-mod:command("pingcomp", mod:localize("pingcomp_command_description"), function (action, ...)
+local SWITCHES = {
+	debug = true,
+	facing = true,
+	dodgecount = true,
+}
+
+mod:command("pingcomp", mod:localize("pingcomp_command_description"), function (...)
+	local args = {}
+
+	for i = 1, select("#", ...) do
+		args[i] = tostring((select(i, ...)))
+	end
+
+	local action = args[1] and string.lower(args[1])
+	local value = args[2] and string.lower(args[2])
+
+	-- Nothing else in the log shows what someone typed, and testers' typos are worth seeing.
+	pc.print("command /pingcomp %s role=%s", table.concat(args, " "), role())
+
 	if action == "version" then
 		if not mod:is_enabled() then
 			-- VMF still runs commands for a disabled mod but drops its replies, so everyone would look like they
@@ -101,20 +151,22 @@ mod:command("pingcomp", mod:localize("pingcomp_command_description"), function (
 		else
 			pc.version.start()
 		end
-	elseif action == "debug" then
-		switch("debug", ...)
-	elseif action == "facing" then
-		switch("facing", ...)
+	elseif SWITCHES[action] then
+		switch(action, value)
 	elseif action == "stats" then
 		print_stats()
 	elseif action == "mark" then
 		-- A line testers can drop into their log at the moment something looked wrong.
-		local note = table.concat({ ... }, " ")
+		local note = table.concat(args, " ", 2)
 
 		pc.print("MARK role=%s game_time=%.3f note=%s", role(), pc.now(), note)
 		mod:echo("Marked in the console log: %s", note ~= "" and note or "(no note)")
 	else
-		mod:echo("Usage: /pingcomp version | debug on|off | stats | facing on|off | mark <note>")
+		if action then
+			mod:echo("Ping Compensation doesn't know '%s'.", args[1])
+		end
+
+		mod:echo("%s", USAGE)
 	end
 end)
 
