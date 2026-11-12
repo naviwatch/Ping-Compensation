@@ -29,30 +29,33 @@ CSS = """
 @page {
 	size: A4;
 	margin: 17mm 17mm 19mm 17mm;
+	background: #16181d;
 
 	@bottom-left {
 		content: "Ping Compensation \\00B7  playtest handout";
 		font-family: "Segoe UI", Arial, sans-serif;
 		font-size: 8pt;
-		color: #8a8f98;
+		color: #7d838d;
 	}
 
 	@bottom-right {
 		content: "Page " counter(page) " of " counter(pages);
 		font-family: "Segoe UI", Arial, sans-serif;
 		font-size: 8pt;
-		color: #8a8f98;
+		color: #7d838d;
 	}
 }
 
 html {
 	-webkit-print-color-adjust: exact;
 	print-color-adjust: exact;
+	background: #16181d;
 }
 
 body {
 	margin: 0;
-	color: #1f2328;
+	background: #16181d;
+	color: #d5d8de;
 	font-family: "Segoe UI", Arial, sans-serif;
 	font-size: 10.5pt;
 	line-height: 1.45;
@@ -60,7 +63,7 @@ body {
 
 h1 {
 	margin: 0 0 8pt;
-	color: #111418;
+	color: #f1f3f6;
 	font-size: 21pt;
 	font-weight: 700;
 	line-height: 1.2;
@@ -70,8 +73,8 @@ h1 {
 h2 {
 	margin: 18pt 0 6pt;
 	padding-bottom: 3pt;
-	border-bottom: 1px solid #e6d5d1;
-	color: #8b2a1d;
+	border-bottom: 1px solid #4a3532;
+	color: #f09a8a;
 	font-size: 13.5pt;
 	font-weight: 600;
 	line-height: 1.25;
@@ -80,6 +83,7 @@ h2 {
 
 h3 {
 	margin: 12pt 0 4pt;
+	color: #eceef2;
 	font-size: 11.5pt;
 	font-weight: 600;
 	break-after: avoid;
@@ -102,8 +106,12 @@ p:has(+ ol) {
 	break-after: avoid;
 }
 
+a {
+	color: #8fb8ff;
+}
+
 strong {
-	color: #111418;
+	color: #f1f3f6;
 	font-weight: 600;
 }
 
@@ -121,9 +129,10 @@ li {
 
 code {
 	padding: 0 3px;
-	border: 1px solid #e3e5e8;
+	border: 1px solid #353a44;
 	border-radius: 3px;
-	background: #f2f3f5;
+	background: #22262e;
+	color: #e7e9ed;
 	font-family: Consolas, "Cascadia Mono", monospace;
 	font-size: 9.2pt;
 	white-space: nowrap;
@@ -138,9 +147,10 @@ code.long {
 pre {
 	margin: 4pt 0 10pt;
 	padding: 8pt 10pt;
-	border: 1px solid #d6dae0;
+	border: 1px solid #353a44;
 	border-radius: 4px;
-	background: #f7f8fa;
+	background: #1e2128;
+	color: #e7e9ed;
 	font-family: Consolas, "Cascadia Mono", monospace;
 	font-size: 9.3pt;
 	line-height: 1.5;
@@ -158,13 +168,14 @@ table {
 th,
 td {
 	padding: 5pt 7pt;
-	border: 1px solid #d6dae0;
+	border: 1px solid #353a44;
 	text-align: left;
 	vertical-align: top;
 }
 
 th {
-	background: #f2f3f5;
+	background: #22262e;
+	color: #f1f3f6;
 	font-weight: 600;
 }
 

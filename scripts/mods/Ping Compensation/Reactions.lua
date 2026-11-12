@@ -33,6 +33,9 @@ local predictions = {} -- enemy unit -> the reaction this screen is showing
 local by_key = {} -- "stagger:<id>" or "recoil:<swing id>" -> the same record, for the host's acknowledgement
 local dead = {} -- enemy unit -> { health = its health extension, t } for enemies killed on this screen
 local stagger_lookup = {} -- breed name -> { [animation] = stagger type }
+local recoil_lookup = {} -- breed name -> { [animation] = true } for its recoil animations
+local measuring = {} -- enemy unit -> the stagger or recoil animation its copy here is playing, until its cue (Timings.lua)
+local MEASURE_LIMIT = 10 -- seconds an animation is watched for its cue
 local next_id = 0
 local sweep_timer = 0
 local inside_projectile = false -- true while the game's projectile code is sending a hit (see the hook at the bottom)
@@ -57,17 +60,60 @@ end
 -- Whether this client decides what this player's hits do to this enemy. The host makes the same check from this
 -- client's hello (host.peer_decides_attacks), so both sides agree on who decides.
 function reactions.decides(unit)
-	return pc.attacks and not pc.broken and pc.host_fresh() and unit ~= nil and covered_breed(unit) ~= nil
+	return pc.attacks and not pc.broken and pc.host_fresh() and pc.compat.matches() and unit ~= nil and covered_breed(unit) ~= nil
 end
 
 function reactions.active()
 	return next(predictions) ~= nil
 end
 
-local function stagger_action(breed)
-	local set = BreedActions[breed.name]
+local breed_actions = {} -- breed name -> { stagger = action, blocked = action } as the breed's behaviour tree uses them
 
-	return set and set.stagger
+local function find_node_action(node, class_name, depth)
+	if type(node) ~= "table" or depth > 30 then
+		return nil
+	end
+
+	if node[1] == class_name and type(node.action_data) == "table" then
+		return node.action_data
+	end
+
+	for i = 2, #node do
+		local found = find_node_action(node[i], class_name, depth + 1)
+
+		if found then
+			return found
+		end
+	end
+
+	return nil
+end
+
+-- The stagger and recoil actions this breed's behaviour tree runs. A breed's actions aren't always filed under its
+-- own name: slave rats (skaven_slave) keep theirs under BreedActions.skaven_slave_rat. The behaviour tree
+-- (BreedBehaviors[breed.behavior]) points at the right tables, so it is asked first.
+local function actions_of(breed)
+	local cached = breed_actions[breed.name]
+
+	if cached then
+		return cached
+	end
+
+	local behaviors = rawget(_G, "BreedBehaviors")
+	local tree = behaviors and breed.behavior and behaviors[breed.behavior]
+	local own = BreedActions[breed.name]
+
+	cached = {
+		stagger = find_node_action(tree, "BTStaggerAction", 0) or own and own.stagger,
+		blocked = find_node_action(tree, "BTBlockedAction", 0) or own and own.blocked,
+	}
+	breed_actions[breed.name] = cached
+
+	return cached
+end
+
+local function stagger_action(breed)
+	return actions_of(breed).stagger
 end
 
 local function add_stagger_anims(lookup, anims_by_type)
@@ -99,6 +145,9 @@ local function stagger_type_of(breed, anim)
 		if action then
 			add_stagger_anims(lookup, action.stagger_anims)
 			add_stagger_anims(lookup, action.standard_stagger_anims)
+			add_stagger_anims(lookup, action.shield_block_anims)
+			add_stagger_anims(lookup, action.shield_stagger_anims)
+			add_stagger_anims(lookup, action.shield_break_anims)
 		end
 
 		stagger_lookup[breed.name] = lookup
@@ -107,17 +156,109 @@ local function stagger_type_of(breed, anim)
 	return lookup[anim]
 end
 
+-- The game reuses a dead enemy's unit for a new enemy of the same breed (BreedFreezer), with a new network id, so
+-- everything kept per unit here is checked against the id it was made for.
+local function is_recoil_anim(breed, anim)
+	local lookup = recoil_lookup[breed.name]
+
+	if not lookup then
+		local action = actions_of(breed).blocked
+		local anims = action and action.blocked_anims
+
+		lookup = {}
+
+		if type(anims) == "table" then
+			for i = 1, #anims do
+				lookup[anims[i]] = true
+			end
+		end
+
+		recoil_lookup[breed.name] = lookup
+	end
+
+	return lookup[anim] == true
+end
+
+-- Times a stagger or recoil animation on this client's copy of an enemy, from its start to its cue (see
+-- reactions.animation_callback), for the shared timings the host uses to end a client's stagger or recoil on time.
+-- scale is the speed it plays at, so a stagger's length is kept at normal speed.
+local function measure_start(unit, kind, anim, scale, breed)
+	measuring[unit] = {
+		kind = kind,
+		anim = anim,
+		scale = scale and scale > 0 and scale or 1,
+		t = pc.now(),
+		breed_name = breed.name,
+		go_id = Managers.state.unit_storage:go_id(unit),
+	}
+end
+
+local function measure_host_animation(unit, anim, variable_id, variable_value)
+	local breed = Unit.get_data(unit, "breed")
+
+	if type(breed) ~= "table" or not breed.name or breed.is_player or breed.is_hero then
+		return
+	end
+
+	if stagger_type_of(breed, anim) then
+		local scale = 1
+
+		if variable_id and NetworkLookup.anims[variable_id] == "stagger_scale" and type(variable_value) == "number" then
+			scale = variable_value
+		end
+
+		measure_start(unit, "length", anim, scale, breed)
+	elseif is_recoil_anim(breed, anim) then
+		measure_start(unit, "cue", anim, 1, breed)
+	end
+end
+
 local function fake_for(unit, breed)
 	local fake = fakes[unit]
+	local go_id = Managers.state.unit_storage:go_id(unit)
 
-	if not fake or fake.breed ~= breed then
+	if not fake or fake.breed ~= breed or fake.go_id ~= go_id then
 		fake = {
 			breed = breed,
+			go_id = go_id,
 		}
 		fakes[unit] = fake
 	end
 
 	return fake
+end
+
+-- Whether this unit is an enemy killed on this screen, whose host messages are ignored. Only while the unit is still
+-- that dead enemy: the same network id, and not alive again.
+local function dead_here(unit)
+	local record = dead[unit]
+
+	if not record then
+		return false
+	end
+
+	if HEALTH_ALIVE[unit] or Managers.state.unit_storage:go_id(unit) ~= record.go_id then
+		dead[unit] = nil
+
+		return false
+	end
+
+	return true
+end
+
+-- How far the enemy is from where the host has it, for the debug log when this screen hands it back.
+local function offset_from_host(unit)
+	local network = pc.network()
+	local game = network and network:game()
+	local go_id = Managers.state.unit_storage:go_id(unit)
+
+	if not game or not go_id or not Unit.alive(unit) then
+		return nil
+	end
+
+	local host_position = GameSession.game_object_field(game, go_id, "position")
+
+	return host_position and Vector3.distance(Unit.local_position(unit, 0), host_position) or nil
 end
 
 -- The shield on this client's copy of a shielded enemy (AIShieldUserHuskExtension) has neither the host's
@@ -271,6 +412,18 @@ end
 -- Animation cues seen on this client's copy of an enemy, which the host's blackboard records the same way
 -- (animation_callback_templates.lua:31 and :857).
 function reactions.animation_callback(unit, callback_name)
+	local measure = measuring[unit]
+
+	if measure and (callback_name == "anim_cb_push_finished" and measure.kind == "length" or callback_name == "anim_cb_blocked_cooldown" and measure.kind == "cue") then
+		measuring[unit] = nil
+
+		if Managers.state.unit_storage:go_id(unit) == measure.go_id then
+			local elapsed = pc.now() - measure.t
+
+			pc.timings.learn(measure.kind, measure.breed_name, measure.anim, measure.kind == "length" and elapsed * measure.scale or elapsed)
+		end
+	end
+
 	local fake = fakes[unit]
 
 	if not fake then
@@ -368,7 +521,10 @@ local function finish_prediction(prediction, reason, catch_up)
 		pc.count("client_held_replayed")
 	end
 
-	pc.log("client %s=%s enemy=%s ended: %s, echo=%s, held=%s, moved=%.2fm, lasted=%.3fs", prediction.kind, tostring(prediction.id), prediction.breed_name, reason, tostring(prediction.echo_seen), tostring(held ~= nil), prediction.moved, pc.now() - prediction.started_t)
+	local offset = pc.debug and offset_from_host(prediction.unit)
+
+	pc.log("client %s=%s enemy=%s ended: %s, echo=%s, held=%s, moved=%.2fm, from_host=%s, lasted=%.3fs", prediction.kind, tostring(prediction.id), prediction.breed_name, reason, tostring(prediction.echo_seen), tostring(held ~= nil), prediction.moved,
+		offset and string.format("%.2fm", offset) or "n/a", pc.now() - prediction.started_t)
 end
 
 local function start_prediction(kind, id, unit, breed, echo, moves, scale, hold, t)
@@ -406,7 +562,7 @@ end
 
 -- Called for each new swing the host announces. Returns why it can't land on this screen, or nil.
 function reactions.busy(unit)
-	if dead[unit] then
+	if dead_here(unit) then
 		return "killed by you"
 	end
 
@@ -526,7 +682,7 @@ local function work_out_stagger(unit, breed, fake, attacker, damage_profile, tar
 	local attack_template = target_settings and DamageUtils.get_attack_template(target_settings.attack_template)
 
 	if not attack_template then
-		return nil
+		return nil, "no attack template"
 	end
 
 	expire_timers(fake, t)
@@ -538,8 +694,12 @@ local function work_out_stagger(unit, breed, fake, attacker, damage_profile, tar
 	local power_level = hit.can_stagger and hit.power_level or 0
 	local stagger_type, duration, length, stagger_value = with_stand_ins(unit, fake, DamageUtils.calculate_stagger_player, ImpactTypeOutput, unit, attacker, hit_zone_name, power_level, hit.boost_curve_multiplier, hit.is_critical_strike, damage_profile, target_index, hit.blocking, damage_source)
 
-	if type(stagger_type) ~= "number" or stagger_type <= stagger_types.none or action_ignores_stagger(fake, attack_template, stagger_type) then
-		return nil
+	if type(stagger_type) ~= "number" or stagger_type <= stagger_types.none then
+		return nil, "too weak to stagger"
+	end
+
+	if action_ignores_stagger(fake, attack_template, stagger_type) then
+		return nil, fake.anim_cb_stagger_immune and "stagger immune (animation cue)" or "its action ignores this stagger"
 	end
 
 	local is_push = damage_profile.is_push and true or false
@@ -547,11 +707,11 @@ local function work_out_stagger(unit, breed, fake, attacker, damage_profile, tar
 
 	-- AiUtils.stagger refuses these (ai_utils.lua:1110).
 	if not always_stagger and not is_push and fake.stagger and fake.stagger_type == stagger_types.explosion and stagger_type ~= stagger_types.explosion then
-		return nil
+		return nil, "already blown back"
 	end
 
 	if breed.boss_staggers and stagger_type < stagger_types.explosion then
-		return nil
+		return nil, "boss"
 	end
 
 	local direction = attack_direction
@@ -700,6 +860,7 @@ local function stagger(unit, breed, attacker, damage_profile, profile_name, targ
 
 	if not stagger_type then
 		pc.count("client_hit_no_stagger")
+		pc.log("client hit enemy=%s profile=%s no stagger: %s", breed.name, tostring(profile_name), tostring(duration))
 
 		return
 	end
@@ -709,6 +870,7 @@ local function stagger(unit, breed, attacker, damage_profile, profile_name, targ
 	if not anim then
 		stagger_over(fake)
 		pc.count("client_hit_no_stagger_animation")
+		pc.print("client hit enemy=%s type=%d: no stagger animation found for this breed, so nothing was staggered", breed.name, stagger_type)
 
 		return
 	end
@@ -744,6 +906,8 @@ local function stagger(unit, breed, attacker, damage_profile, profile_name, targ
 
 	prediction.opening_event = breed.shield_opening_event
 
+	measure_start(unit, "length", anim, variable_scale or 1, breed)
+
 	pc.count("client_stagger")
 	pc.log("client stagger=%d enemy=%s type=%d duration=%.2f length=%.2f anim=%s push=%s accumulated=%.2f", id, breed.name, stagger_type, duration, length, anim, tostring(is_push), fake.stagger or 0)
 end
@@ -760,7 +924,7 @@ local function kill(unit, breed, attacker, health, damage, damage_profile, targe
 	send("pc_kill", id, pc.network():unit_game_object_id(unit), hit_zone_name, damage_type, pc.finite(attack_direction.x, 3), pc.finite(attack_direction.y, 3), pc.finite(attack_direction.z, 3), damage_source_name)
 
 	dead[unit] = {
-		health = health,
+		go_id = pc.network():unit_game_object_id(unit),
 		t = t,
 	}
 
@@ -879,7 +1043,7 @@ function reactions.attack_hit(damage_source_id, attacker_unit_id, hit_unit_id, h
 	local unit_storage = Managers.state.unit_storage
 	local unit = unit_storage:unit(hit_unit_id)
 
-	if not unit or not Unit.alive(unit) or not HEALTH_ALIVE[unit] or dead[unit] or not reactions.decides(unit) then
+	if not unit or not Unit.alive(unit) or not HEALTH_ALIVE[unit] or dead_here(unit) or not reactions.decides(unit) then
 		return
 	end
 
@@ -934,9 +1098,8 @@ end
 
 local function blocked_action(swing)
 	local set = swing.set_name and BreedActions[swing.set_name]
-	local own = BreedActions[swing.breed.name]
 
-	return set and set.blocked or own and own.blocked
+	return set and set.blocked or actions_of(swing.breed).blocked
 end
 
 -- Called by Client.lua at a damage frame judged "blocked", before the answer goes out. Returns the recoil animation
@@ -950,7 +1113,7 @@ function reactions.choose_recoil(swing, unit)
 	local action = swing.action
 
 	-- No recoil here either way: the attack has none, or the enemy is already staggered or recoiling (book_block).
-	if action.no_block_stagger or predictions[unit] or dead[unit] or not Unit.alive(unit) or not HEALTH_ALIVE[unit] then
+	if action.no_block_stagger or predictions[unit] or dead_here(unit) or not Unit.alive(unit) or not HEALTH_ALIVE[unit] then
 		return nil
 	end
 
@@ -976,6 +1139,7 @@ end
 -- Plays the recoil chosen above, now. The host's copy comes back a ping later and is dropped.
 function reactions.play_recoil(swing, unit, anim)
 	animation_system():anim_event(unit, anim, true)
+	measure_start(unit, "cue", anim, 1, swing.breed)
 	start_prediction("recoil", swing.id, unit, swing.breed, { anim }, pc.recoil == "full", 1, RECOIL_HOLD, pc.now())
 	pc.count("client_recoil")
 end
@@ -988,16 +1152,10 @@ function reactions.host_animation(go_id, anim_id, variable_id, variable_value)
 		return false
 	end
 
-	local dead_record = dead[unit]
+	if dead_here(unit) then
+		pc.count("client_dropped_after_kill")
 
-	if dead_record then
-		if ScriptUnit.has_extension(unit, "health_system") == dead_record.health then
-			pc.count("client_dropped_after_kill")
-
-			return true
-		end
-
-		dead[unit] = nil
+		return true
 	end
 
 	local anim = NetworkLookup.anims[anim_id]
@@ -1047,6 +1205,7 @@ function reactions.host_animation(go_id, anim_id, variable_id, variable_value)
 		finish_prediction(prediction, "the host moved on (" .. tostring(anim) .. ")")
 	end
 
+	measure_host_animation(unit, anim, variable_id, variable_value)
 	track_host_animation(unit, anim)
 
 	return false
@@ -1062,9 +1221,7 @@ function reactions.movement_message(unit_storage, game_object_id, animation_driv
 		return false
 	end
 
-	local dead_record = dead[unit]
-
-	if dead_record and ScriptUnit.has_extension(unit, "health_system") == dead_record.health then
+	if dead_here(unit) then
 		return true
 	end
 
@@ -1107,9 +1264,7 @@ function reactions.keeps_position(unit_storage, game_object_id)
 		return false
 	end
 
-	local dead_record = dead[unit]
-
-	if dead_record and ScriptUnit.has_extension(unit, "health_system") == dead_record.health then
+	if dead_here(unit) then
 		return true
 	end
 
@@ -1121,9 +1276,8 @@ end
 -- Returns true to drop the host's damage message for an enemy that is already dead on this screen.
 function reactions.damage_message(victim_go_id)
 	local unit = Managers.state.unit_storage:unit(victim_go_id)
-	local dead_record = unit and dead[unit]
 
-	if dead_record and ScriptUnit.has_extension(unit, "health_system") == dead_record.health then
+	if unit and dead_here(unit) then
 		pc.count("client_damage_after_kill")
 
 		return true
@@ -1175,9 +1329,16 @@ function reactions.update(dt)
 			fakes[unit] = nil
 		end
 	end
+
+	for unit, measure in pairs(measuring) do
+		if t - measure.t > MEASURE_LIMIT or not Unit.alive(unit) then
+			measuring[unit] = nil
+		end
+	end
 end
 
 function reactions.clear()
+	measuring = {}
 	fakes = {}
 	predictions = {}
 	by_key = {}

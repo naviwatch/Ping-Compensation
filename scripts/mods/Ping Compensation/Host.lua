@@ -40,7 +40,7 @@ end
 -- Whether that player's client decides what their hits do to the enemies in pc.REACTION_BREEDS (D26 to D29). Their
 -- client makes the same check from the host's replies, so both sides agree on who decides.
 function host.peer_decides_attacks(peer)
-	return peer_is_fresh(peer) and peers[peer].attacks == true
+	return peer_is_fresh(peer) and peers[peer].attacks == true and peers[peer].matched == true
 end
 
 -- The enemy's damage against this target is scaled down by how many enemies surround the target. Only the host has
@@ -365,16 +365,38 @@ local function valid_answer(id, frame, result, multiplier, improved, direction, 
 		and x == x and y == y and z == z and yaw == yaw
 end
 
-mod:network_register("pc_hello", function (sender, version, attacks)
+local function player_name(peer)
+	local player = Managers.player and Managers.player:player_from_peer_id(peer)
+
+	return player and player:name() or tostring(peer)
+end
+
+-- fingerprint: the client's fingerprint of its enemy data (Compat.lua). Only a client whose enemy data is the host's
+-- decides its own hits (D34); the host and that player are told when that changes.
+mod:network_register("pc_hello", function (sender, version, attacks, fingerprint)
 	if not pc.is_server() then
 		return
 	end
 
 	if version == pc.VERSION then
-		peers[sender] = { t = pc.clock(), attacks = attacks == true }
+		local own = pc.compat.fingerprint()
+		local matched = type(fingerprint) == "string" and fingerprint == own
+		local record = peers[sender] or {}
+
+		if not matched and record.matched ~= false then
+			pc.say("%s's enemy data differs from yours (%s), for example a difficulty mod that one of you doesn't run. Their hits are decided here until it matches.", player_name(sender), pc.compat.differences(own, fingerprint))
+		elseif matched and record.matched == false then
+			pc.say("%s's enemy data matches yours again. Their hits are decided on their screen.", player_name(sender))
+		end
+
+		record.t = pc.clock()
+		record.attacks = attacks == true
+		record.matched = matched
+		peers[sender] = record
 
 		-- The client predicts nothing until it hears this: only a host with the same build applies what it decides.
-		mod:network_send("pc_hello_reply", sender, pc.VERSION)
+		-- It also learns the host's fingerprint and difficulty mods, and whether its own fingerprint matched.
+		mod:network_send("pc_hello_reply", sender, pc.VERSION, own, pc.compat.active_toggles(), matched)
 	elseif not mismatched[sender] then
 		mismatched[sender] = true
 
@@ -392,7 +414,7 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 
 	if not valid_answer(id, frame, result, multiplier, improved, direction, through_block, distance, angle, recoil_anim, has_position, x, y, z, yaw) then
 		pc.count("host_rejected")
-		pc.print("host rejected a malformed answer from %s", tostring(sender))
+		pc.print("host rejected a malformed answer from %s", player_name(sender))
 
 		return
 	end
@@ -450,9 +472,10 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 		pc.log("host swing=%d enemy=%s attack=%s frame=%d answer=%s host_would=%s outcome=%s answer_after=%s ping=%s client_distance=%.2f client_angle=%.1f", swing.id, swing.breed_name, tostring(swing.action.name), frame, result, would, outcome,
 			frame_t and string.format("%.3fs", t - frame_t) or "n/a", type(ping) == "number" and string.format("%.0fms", ping * 1000) or "n/a", distance, angle)
 
-		if disagree then
-			pc.chat("swing %d (%s): client says %s, host would have said %s", swing.id, swing.breed_name, result, would)
-		end
+	end
+
+	if disagree and pc.echo then
+		pc.chat("swing %d (%s): client says %s, host would have said %s", swing.id, swing.breed_name, result, would)
 	end
 end)
 
@@ -495,7 +518,7 @@ function host.update()
 				pc.count("host_unanswered_" .. swing.breed_name)
 				pc.log("host swing=%d enemy=%s attack=%s was never answered", swing.id, swing.breed_name, tostring(swing.action.name))
 
-				if pc.debug then
+				if pc.echo then
 					pc.chat("swing %d (%s) was never answered by the client", swing.id, swing.breed_name)
 				end
 			end
@@ -520,13 +543,17 @@ function host.clear()
 end
 
 function host.modded_peer_count()
-	local count = 0
+	local count, matching = 0, 0
 
-	for peer in pairs(peers) do
+	for peer, record in pairs(peers) do
 		if peer_is_fresh(peer) then
 			count = count + 1
+
+			if record.matched then
+				matching = matching + 1
+			end
 		end
 	end
 
-	return count
+	return count, matching
 end

@@ -1,7 +1,11 @@
 local mod = get_mod("Ping Compensation")
 
 -- Host and client must run the same VERSION. Bump it whenever any message in CLAUDE.md's "Network messages" changes.
-local VERSION = 6
+local VERSION = 7
+
+-- Playtest builds write the debug log by default, so testers don't have to remember /pingcomp debug on. Set this to
+-- false for a public release: players who want the log can still switch it on, and their choice is remembered.
+local PLAYTEST_BUILD = true
 
 local MAX_ERRORS = 5
 local CHAT_INTERVAL = 0.5
@@ -11,7 +15,8 @@ local pc = {
 	HELLO_INTERVAL = 1, -- seconds between a client's hellos
 	PEER_EXPIRY = 4, -- seconds without a hello before the host judges that player as vanilla
 	SWING_LIFETIME = 5, -- seconds a swing is remembered, on both machines
-	debug = false, -- /pingcomp debug
+	debug = PLAYTEST_BUILD, -- /pingcomp debug, remembered once a player sets it
+	echo = false, -- /pingcomp echo, on the host: disagreements and unanswered swings also show in chat
 	facing = true, -- /pingcomp facing
 	dodgecount = true, -- /pingcomp dodgecount: apply the weapon's dodge count to clients, as the game does for the host
 	attacks = true, -- /pingcomp attacks: this player's hits decide staggers and kills on the enemies below (D26 to D29)
@@ -53,6 +58,12 @@ pc.stagger_types = ok_types and type(stagger_types) == "table" and stagger_types
 }
 
 mod.pc = pc
+
+local saved_debug = mod:get("debug")
+
+if type(saved_debug) == "boolean" then
+	pc.debug = saved_debug
+end
 
 local error_counts = {}
 local next_chat_time = 0

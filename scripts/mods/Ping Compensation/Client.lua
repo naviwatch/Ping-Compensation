@@ -555,9 +555,12 @@ mod:hook_safe("WeaponSystem", "send_rpc_attack_hit", function (self, damage_sour
 	end
 end)
 
-mod:network_register("pc_hello_reply", function (sender, version)
+-- fingerprint and toggles: the host's enemy data fingerprint and difficulty mods; matched: whether the fingerprint this
+-- client sent last was the host's (Compat.lua).
+mod:network_register("pc_hello_reply", function (sender, version, fingerprint, toggles, matched)
 	if not pc.is_server() and version == pc.VERSION and sender == pc.host_peer() then
 		pc.heard_host()
+		pc.guard("client difficulty mods", pc.compat.on_host_reply, fingerprint, toggles, matched)
 	end
 end)
 
@@ -594,7 +597,7 @@ function client.update(dt)
 		local host_peer = pc.host_peer()
 
 		if host_peer then
-			mod:network_send("pc_hello", host_peer, pc.VERSION, pc.attacks and true or false)
+			mod:network_send("pc_hello", host_peer, pc.VERSION, pc.attacks and true or false, pc.compat.fingerprint())
 		end
 	end
 end

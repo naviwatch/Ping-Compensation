@@ -31,8 +31,16 @@ local function print_report()
 	for i = 1, #players do
 		local player = players[i]
 		local version = player.version and "[" .. player.version .. "]" or "Mod not found."
+		local data = ""
 
-		mod.pc.say("[%s] [%s] %s", player.name, mod_name, version)
+		-- Builds from step 2.1 on also send their enemy data fingerprint (Compat.lua).
+		if type(player.fingerprint) == "string" then
+			local own = mod.pc.compat.fingerprint()
+
+			data = player.fingerprint == own and " Enemy data matches yours." or " Enemy data differs from yours: " .. mod.pc.compat.differences(own, player.fingerprint) .. "."
+		end
+
+		mod.pc.say("[%s] [%s] %s%s", player.name, mod_name, version, data)
 	end
 end
 
@@ -84,11 +92,11 @@ end
 
 mod:network_register("pc_version_request", function (sender, request_id)
 	if type(request_id) == "number" then
-		mod:network_send("pc_version_reply", sender, request_id, local_version)
+		mod:network_send("pc_version_reply", sender, request_id, local_version, mod.pc.compat.fingerprint())
 	end
 end)
 
-mod:network_register("pc_version_reply", function (sender, request_id, version)
+mod:network_register("pc_version_reply", function (sender, request_id, version, fingerprint)
 	local player = request and request_id == request.id and request.players_by_peer[sender]
 
 	if not player or player.version or type(version) ~= "string" or #version > MAX_VERSION_LENGTH then
@@ -96,6 +104,7 @@ mod:network_register("pc_version_reply", function (sender, request_id, version)
 	end
 
 	player.version = version
+	player.fingerprint = type(fingerprint) == "string" and #fingerprint <= MAX_VERSION_LENGTH and fingerprint or nil
 	request.waiting = request.waiting - 1
 
 	if request.waiting == 0 then

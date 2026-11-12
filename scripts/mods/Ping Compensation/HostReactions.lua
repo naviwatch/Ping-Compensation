@@ -11,7 +11,9 @@ local host = pc.host
 --   * A kill the client saw (pc_kill): if the hit left the enemy alive here, the host finishes it off, credited to
 --     that player.
 --   * A recoil the client played after a block: the host plays the same animation from where the client saw the
---     enemy, and ends it one ping early (D14), so the enemy's next move reaches the blocker as their recoil ends.
+--     enemy, and ends it one ping early (D14), so the enemy's next move reaches the blocker as their recoil ends. Like
+--     vanilla, it waits for both the recoil's timer and its animation's cue, each counted from the blocker's moment;
+--     the cue's time into the animation is measured on the host and learned (recoil_cue).
 -- Every stagger and recoil a client predicted is acknowledged (pc_reaction_ack), so a refused one never leaves that
 -- client's copy of the enemy out of step for long.
 
@@ -25,10 +27,7 @@ local TIMED_RECOIL_LIMIT = 3 -- seconds a recoil whose end was brought forward i
 local MAX_DIRECTION_SQUARED = 64
 local MAX_STRING_LENGTH = 64
 local MAX_HEIGHT_DIFFERENCE = 1
-local LENGTHS_SETTING = "stagger_lengths" -- where the learned stagger lengths are kept between sessions (mod:set)
-local MIN_LENGTH = 0.1
-local MAX_LENGTH = 6
-local LEARN_WEIGHT = 0.3 -- how far a new measurement moves a learned length
+local CUE_WATCH_LIMIT = 5 -- seconds a recoil animation is watched for its cue
 local MIN_HOST_STAGGER = 0.1 -- shortest the host makes a client's stagger
 local TIMING_LIMIT = 10 -- seconds a stagger animation is watched for its end cue
 local STAGGER_ANIM_TABLES = {
@@ -45,52 +44,9 @@ local staggers = {} -- enemy unit -> client stagger waiting for BTStaggerAction.
 local recoils = {} -- enemy unit -> client recoil waiting for BTBlockedAction.enter
 local timed_recoils = {} -- enemy unit -> running recoil whose end was brought forward (D14)
 local kills = {} -- enemy unit -> client kill waiting to be finished off
-local timings = {} -- enemy unit -> the stagger animation the host is playing for it, until its end cue
-local lengths = {} -- breed name -> { [animation] = seconds at normal speed }, learned from the host's own staggers
-local lengths_dirty = false
+local stagger_watch = {} -- enemy unit -> the stagger animation the host is playing for it, until its end cue
 local playable = {} -- stagger action table -> set of every animation it can play
-
-local function load_lengths()
-	local saved = mod:get(LENGTHS_SETTING)
-
-	lengths = {}
-
-	if type(saved) ~= "table" then
-		return
-	end
-
-	for breed_name, by_anim in pairs(saved) do
-		if type(breed_name) == "string" and type(by_anim) == "table" then
-			local clean = {}
-
-			for anim, length in pairs(by_anim) do
-				if type(anim) == "string" and type(length) == "number" and length >= MIN_LENGTH and length <= MAX_LENGTH then
-					clean[anim] = length
-				end
-			end
-
-			lengths[breed_name] = clean
-		end
-	end
-end
-
-local ok_lengths, lengths_error = pcall(load_lengths)
-
-if not ok_lengths then
-	pc.print("host could not read the saved stagger lengths: %s", tostring(lengths_error))
-end
-
-function host_reactions.learned_count()
-	local count = 0
-
-	for _, by_anim in pairs(lengths) do
-		for _ in pairs(by_anim) do
-			count = count + 1
-		end
-	end
-
-	return count
-end
+local cue_watch = {} -- enemy unit -> the recoil animation the host is playing for it, until its cue
 
 local function ack(peer, kind, id, result)
 	mod:network_send("pc_reaction_ack", peer, pc.VERSION, kind, id, result)
@@ -239,8 +195,7 @@ local function plan_timing(node, blackboard, record, t)
 	local action = node._tree_node and node._tree_node.action_data
 	local scalable = action ~= nil and action.scale_animation_speeds and not action.stagger_animation_scale
 	local base_scale = blackboard.stagger_animation_scale or 1
-	local by_anim = lengths[record.breed_name]
-	local length = by_anim and by_anim[record.anim]
+	local length = pc.timings.get("length", record.breed_name, record.anim)
 
 	record.rtt = rtt
 	record.lead = lead
@@ -272,6 +227,13 @@ local function plan_timing(node, blackboard, record, t)
 		record.timing = "ended early"
 		record.end_at = t + wanted
 	end
+end
+
+-- The player's name, for the log. Their peer id is their Steam id, which the log doesn't need.
+local function name_of(peer)
+	local player = Managers.player and Managers.player:player_from_peer_id(peer)
+
+	return player and player:name() or tostring(peer)
 end
 
 local function player_unit(peer)
@@ -327,7 +289,7 @@ end
 local function apply_stagger(sender, id, go_id, stagger_type, duration, length, dx, dy, dz, anim_scale, stagger_value, always_stagger, is_push, anim, yaw, x, y, z, has_position, profile_name, target_index, damage_source)
 	local function refuse(reason)
 		pc.count("host_stagger_refused")
-		pc.log("host stagger=%d from=%s refused: %s", id, tostring(sender), reason)
+		pc.log("host stagger=%d from=%s refused: %s", id, name_of(sender), reason)
 		ack(sender, "stagger", id, "rejected")
 	end
 
@@ -389,7 +351,7 @@ mod:network_register("pc_stagger", function (sender, version, id, go_id, stagger
 
 	if not valid_stagger(id, go_id, stagger_type, duration, length, dx, dy, dz, anim_scale, stagger_value, always_stagger, is_push, anim, yaw, x, y, z, has_position, profile_name, target_index, damage_source) then
 		pc.count("host_rejected")
-		pc.print("host rejected a malformed stagger from %s", tostring(sender))
+		pc.print("host rejected a malformed stagger from %s", name_of(sender))
 
 		if type(id) == "number" then
 			ack(sender, "stagger", id, "rejected")
@@ -475,7 +437,7 @@ function host_reactions.stagger_entered(node, unit, blackboard, t)
 
 	local scale = action.scale_animation_speeds and (action.stagger_animation_scale or blackboard.stagger_animation_scale or 1) or 1
 
-	timings[unit] = {
+	stagger_watch[unit] = {
 		anim = anim,
 		scale = scale > 0 and scale or 1,
 		t = t,
@@ -486,33 +448,15 @@ end
 -- The host's anim_cb_push_finished: the stagger animation has reached the cue BTStaggerAction waits for. Its length,
 -- at normal speed, is what plan_timing uses next time.
 function host_reactions.push_finished(unit)
-	local timing = timings[unit]
+	local timing = stagger_watch[unit]
 
 	if not timing then
 		return
 	end
 
-	timings[unit] = nil
+	stagger_watch[unit] = nil
 
-	local length = (pc.now() - timing.t) * timing.scale
-
-	if length < MIN_LENGTH or length > MAX_LENGTH then
-		return
-	end
-
-	local by_anim = lengths[timing.breed_name]
-
-	if not by_anim then
-		by_anim = {}
-		lengths[timing.breed_name] = by_anim
-	end
-
-	local old = by_anim[timing.anim]
-
-	by_anim[timing.anim] = old and old + (length - old) * LEARN_WEIGHT or length
-	lengths_dirty = true
-
-	pc.count("host_stagger_lengths_measured")
+	pc.timings.learn("length", timing.breed_name, timing.anim, (pc.now() - timing.t) * timing.scale)
 end
 
 function host_reactions.after_stagger_enter(unit, blackboard, t, record)
@@ -558,7 +502,7 @@ function host_reactions.after_stagger_enter(unit, blackboard, t, record)
 		pc.count("host_teleport_distance_sum", record.moved)
 	end
 
-	pc.log("host stagger=%d from=%s enemy=%s anim=%s applied=%s moved=%s timing=%s speed=%.2f lead=%.3fs length=%s", record.id, tostring(record.peer), record.breed_name, record.anim, tostring(applied), format_distance(record.moved),
+	pc.log("host stagger=%d from=%s enemy=%s anim=%s applied=%s moved=%s timing=%s speed=%.2f lead=%.3fs length=%s", record.id, name_of(record.peer), record.breed_name, record.anim, tostring(applied), format_distance(record.moved),
 		tostring(record.timing), record.speed or 1, record.lead or 0, record.duration and string.format("%.2fs", record.duration) or "unknown")
 	ack(record.peer, "stagger", record.id, applied and "applied" or "rejected")
 end
@@ -591,7 +535,7 @@ function host_reactions.recoil_booked(swing, blackboard, recoil)
 		frame_t = recoil.frame_t,
 		t = pc.now(),
 		blackboard = blackboard,
-		breed_name = swing.breed_name,
+		breed_name = blackboard.breed and blackboard.breed.name or swing.breed_name,
 	}
 
 	return "recoil " .. recoil.anim
@@ -608,17 +552,33 @@ function host_reactions.recoil_refused(swing, recoil, reason)
 	ack(swing.peer, "recoil", swing.id, "rejected")
 end
 
--- Called before BTBlockedAction.enter. Returns the client recoil it is entering, if any.
+-- Called before BTBlockedAction.enter. Returns the client recoil it is entering, or for a covered enemy's other
+-- recoils a record that only watches for the animation's cue. Vanilla picks a random animation inside enter; for
+-- those, the same random pick is made here and handed to enter through blackboard.blocked_anim, so it is known.
 function host_reactions.before_recoil_enter(node, unit, blackboard)
 	local record = recoils[unit]
+	local action = node._tree_node and node._tree_node.action_data
 
 	if not record then
-		return nil
+		local breed = blackboard.breed
+		local anims = action and action.blocked_anims
+
+		if not breed or not pc.REACTION_BREEDS[breed.name] then
+			return nil
+		end
+
+		if not blackboard.blocked_anim and type(anims) == "table" and #anims > 0 then
+			blackboard.blocked_anim = anims[Math.random(1, #anims)]
+		end
+
+		return blackboard.blocked_anim and {
+			watch_only = true,
+			anim = blackboard.blocked_anim,
+			breed_name = breed.name,
+		} or nil
 	end
 
 	recoils[unit] = nil
-
-	local action = node._tree_node and node._tree_node.action_data
 
 	if record.anim ~= record.attack_anim and not contains(action and action.blocked_anims, record.anim) then
 		-- Not an animation this enemy's recoil can play here, so vanilla picks one.
@@ -636,6 +596,19 @@ function host_reactions.before_recoil_enter(node, unit, blackboard)
 end
 
 function host_reactions.after_recoil_enter(unit, blackboard, t, record)
+	-- A refused client recoil played vanilla's random pick, which isn't known, so it isn't measured.
+	if not record.refused then
+		cue_watch[unit] = {
+			anim = record.anim,
+			breed_name = record.breed_name,
+			t = t,
+		}
+	end
+
+	if record.watch_only then
+		return
+	end
+
 	if record.refused then
 		pc.count("host_recoil_own_animation")
 		ack(record.peer, "recoil", record.id, "rejected")
@@ -654,6 +627,9 @@ function host_reactions.after_recoil_enter(unit, blackboard, t, record)
 	timed_recoils[unit] = {
 		blackboard = blackboard,
 		t = t,
+		frame_t = record.frame_t or t,
+		anim = record.anim,
+		breed_name = record.breed_name,
 	}
 
 	pc.count("host_recoil_applied")
@@ -667,8 +643,10 @@ function host_reactions.after_recoil_enter(unit, blackboard, t, record)
 	ack(record.peer, "recoil", record.id, "applied")
 end
 
--- Called before BTBlockedAction.run for a recoil whose end was brought forward. Vanilla also waits for a cue in the
--- recoil animation (anim_cb_blocked_cooldown), which on the host plays a ping late, so the time alone decides here.
+-- Called before BTBlockedAction.run for a recoil whose end was brought forward. Vanilla ends a recoil once its timer
+-- has run out and its animation has reached its cue (anim_cb_blocked_cooldown). The timer was already moved to the
+-- blocker's moment; the cue is too, once its time into the animation is known (recoil_cue). Until then the host's own
+-- cue decides, which can leave the blocker a ping of extra recoil but never cuts it short.
 function host_reactions.before_recoil_run(unit, blackboard, t)
 	local record = timed_recoils[unit]
 
@@ -682,15 +660,44 @@ function host_reactions.before_recoil_run(unit, blackboard, t)
 		return
 	end
 
-	if blackboard.leave_blocked_at_t and t > blackboard.leave_blocked_at_t then
-		if not blackboard.anim_cb_blocked_cooldown then
-			blackboard.anim_cb_blocked_cooldown = true
+	if blackboard.anim_cb_blocked_cooldown then
+		timed_recoils[unit] = nil
 
-			pc.count("host_recoil_ended_before_cue")
+		return
+	end
+
+	local cue = pc.timings.get("cue", record.breed_name, record.anim)
+
+	if cue and blackboard.leave_blocked_at_t and t > blackboard.leave_blocked_at_t and t > record.frame_t + cue then
+		blackboard.anim_cb_blocked_cooldown = true
+		timed_recoils[unit] = nil
+
+		local watch = cue_watch[unit]
+
+		if watch then
+			watch.forced = true
 		end
 
-		timed_recoils[unit] = nil
+		pc.count("host_recoil_cue_brought_forward")
 	end
+end
+
+-- The host's anim_cb_blocked_cooldown: the recoil animation reached its cue. Its time into the animation is what
+-- before_recoil_run uses next time. A recoil the host already ended itself isn't measured.
+function host_reactions.recoil_cue(unit)
+	local watch = cue_watch[unit]
+
+	if not watch then
+		return
+	end
+
+	cue_watch[unit] = nil
+
+	if watch.forced or not watch.breed_name then
+		return
+	end
+
+	pc.timings.learn("cue", watch.breed_name, watch.anim, pc.now() - watch.t)
 end
 
 function host_reactions.has_timed_recoil(unit)
@@ -728,7 +735,7 @@ mod:network_register("pc_kill", function (sender, version, id, go_id, hit_zone, 
 
 	if type(id) ~= "number" or type(go_id) ~= "number" or type(dx) ~= "number" or type(dy) ~= "number" or type(dz) ~= "number" or dx ~= dx or dy ~= dy or dz ~= dz then
 		pc.count("host_rejected")
-		pc.print("host rejected a malformed kill from %s", tostring(sender))
+		pc.print("host rejected a malformed kill from %s", name_of(sender))
 
 		return
 	end
@@ -740,7 +747,7 @@ end)
 local function finish_kill(unit, record)
 	if not Unit.alive(unit) or not HEALTH_ALIVE[unit] or Managers.state.unit_storage:go_id(unit) ~= record.go_id then
 		pc.count("host_kill_already_dead")
-		pc.log("host kill=%d from=%s: the hit had already killed it here", record.id, tostring(record.peer))
+		pc.log("host kill=%d from=%s: the hit had already killed it here", record.id, name_of(record.peer))
 
 		return
 	end
@@ -749,7 +756,7 @@ local function finish_kill(unit, record)
 
 	AiUtils.kill_unit(unit, attacker, record.hit_zone, record.damage_type, record.direction:unbox(), record.damage_source)
 	pc.count("host_kill_finished")
-	pc.log("host kill=%d from=%s: finished off an enemy the hit left alive here", record.id, tostring(record.peer))
+	pc.log("host kill=%d from=%s: finished off an enemy the hit left alive here", record.id, name_of(record.peer))
 end
 
 function host_reactions.update()
@@ -791,9 +798,15 @@ function host_reactions.update()
 		end
 	end
 
-	for unit, timing in pairs(timings) do
+	for unit, timing in pairs(stagger_watch) do
 		if t - timing.t > TIMING_LIMIT or not Unit.alive(unit) then
-			timings[unit] = nil
+			stagger_watch[unit] = nil
+		end
+	end
+
+	for unit, watch in pairs(cue_watch) do
+		if t - watch.t > CUE_WATCH_LIMIT or not Unit.alive(unit) then
+			cue_watch[unit] = nil
 		end
 	end
 end
@@ -805,17 +818,10 @@ function host_reactions.clear()
 	recoils = {}
 	timed_recoils = {}
 	kills = {}
-	timings = {}
+	stagger_watch = {}
+	cue_watch = {}
 
-	if lengths_dirty then
-		lengths_dirty = false
-
-		local ok, message = pcall(mod.set, mod, LENGTHS_SETTING, lengths)
-
-		if not ok then
-			pc.print("host could not save the stagger lengths: %s", tostring(message))
-		end
-	end
+	pc.timings.save()
 end
 
 -- The skipped stagger maths leaves one thing behind on the enemy: a shield records that it blocked the hit
