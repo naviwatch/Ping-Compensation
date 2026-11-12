@@ -382,14 +382,28 @@ mod:network_register("pc_hello", function (sender, version, attacks, fingerprint
 		local own = pc.compat.fingerprint()
 		local matched = type(fingerprint) == "string" and fingerprint == own
 		local record = peers[sender] or {}
+		local now = pc.clock()
 
-		if not matched and record.matched ~= false then
-			pc.say("%s's enemy data differs from yours (%s), for example a difficulty mod that one of you doesn't run. Their hits are decided here until it matches.", player_name(sender), pc.compat.differences(own, fingerprint))
-		elseif matched and record.matched == false then
-			pc.say("%s's enemy data matches yours again. Their hits are decided on their screen.", player_name(sender))
+		-- Their hits are decided here from the first hello that differs. The warning waits, because a difficulty mod
+		-- switched here takes a hello or two to be switched on their side as well.
+		if matched then
+			if record.warned then
+				pc.say("%s's enemy data matches yours again. Their hits are decided on their screen.", player_name(sender))
+			end
+
+			record.differs_since = nil
+			record.warned = nil
+		else
+			record.differs_since = record.differs_since or now
+
+			if not record.warned and now - record.differs_since >= pc.compat.WARN_AFTER then
+				record.warned = true
+
+				pc.say("%s's enemy data differs from yours (%s), for example a difficulty mod that one of you doesn't run. Their hits are decided here until it matches.", player_name(sender), pc.compat.differences(own, fingerprint))
+			end
 		end
 
-		record.t = pc.clock()
+		record.t = now
 		record.attacks = attacks == true
 		record.matched = matched
 		peers[sender] = record

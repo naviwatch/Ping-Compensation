@@ -137,8 +137,13 @@ local CHECK_INTERVAL = 1
 local fingerprint = nil -- this machine's, until something may have changed it
 local started = {} -- toggle key -> true while this client has a toggle on to match its host
 local data_state = nil -- client: "matches", "pending" (same data, the host hasn't confirmed yet) or "differs"
+local differs_since = nil -- client: when the data last started to differ from the host's
+local warned = false -- client: whether the player has been told it differs
 local last_toggles = nil
 local check_timer = 0
+
+-- Seconds enemy data must differ before either side says so in chat (the hits move to the host at once).
+compat.WARN_AFTER = 3
 
 local function toggle_state(toggle)
 	local other = get_mod(toggle.mod_name)
@@ -330,6 +335,15 @@ local SECTION_FEEDERS = {
 
 -- This machine's fingerprint of the enemy data: one 8-character hash per section, joined with "-".
 function compat.fingerprint()
+	-- A difficulty mod switched on or off here changes the data. The host's reply carries its toggles and its
+	-- fingerprint together, so they must agree (2026-11-12: a reply with Deathwish on still had the old fingerprint).
+	local toggles = compat.active_toggles()
+
+	if toggles ~= last_toggles then
+		last_toggles = toggles
+		fingerprint = nil
+	end
+
 	if fingerprint then
 		return fingerprint
 	end
@@ -450,15 +464,18 @@ function compat.on_host_reply(host_fingerprint, host_toggles, matched)
 		state = "pending"
 	end
 
+	local now = pc.clock()
+
 	if state ~= data_state then
 		if state == "differs" then
-			pc.say("Your enemy data differs from the host's (%s). Your hits are decided on the host until it matches.", compat.differences(own, host_fingerprint))
-
-			for i = 1, #missing do
-				pc.say("The host plays with %s. Install and enable \"%s\" to match it.", missing[i].label, missing[i].workshop_name)
+			differs_since = differs_since or now
+		elseif state == "matches" then
+			if warned then
+				pc.say("Your enemy data matches the host's again. Your hits are decided on your screen.")
 			end
-		elseif state == "matches" and data_state == "differs" then
-			pc.say("Your enemy data matches the host's again. Your hits are decided on your screen.")
+
+			differs_since = nil
+			warned = false
 		end
 
 		pc.print("enemy data %s (own %s, host %s)", state, own, tostring(host_fingerprint))
@@ -469,6 +486,18 @@ function compat.on_host_reply(host_fingerprint, host_toggles, matched)
 		end
 
 		data_state = state
+	end
+
+	-- The hits are decided on the host from the first reply that differs. The warning waits, because a difficulty
+	-- mod the host has just switched takes a hello or two to be switched here as well.
+	if state == "differs" and not warned and differs_since and now - differs_since >= compat.WARN_AFTER then
+		warned = true
+
+		pc.say("Your enemy data differs from the host's (%s). Your hits are decided on the host until it matches.", compat.differences(own, host_fingerprint))
+
+		for i = 1, #missing do
+			pc.say("The host plays with %s. Install and enable \"%s\" to match it.", missing[i].label, missing[i].workshop_name)
+		end
 	end
 end
 
@@ -527,4 +556,6 @@ function compat.clear()
 	compat.invalidate()
 
 	data_state = nil
+	differs_since = nil
+	warned = false
 end

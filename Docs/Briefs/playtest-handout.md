@@ -1,6 +1,6 @@
 # Ping Compensation: playtest handout
 
-For the mod's developers and playtesters. This describes **build step 2.1**, made on 2026-11-12. It is updated with every build that changes what you see or what to test.
+For the mod's developers and playtesters. This describes **build step 2.2**, made on 2026-11-12. It is updated with every build that changes what you see or what to test.
 
 The full design is in [client-authoritative-melee.md](client-authoritative-melee.md). It is not needed for testing.
 
@@ -14,16 +14,12 @@ On your own screen the mod also turns the enemy that is swinging at you, using t
 
 ## What changed in this build
 
-Changes since the step 2 playtest:
+Changes since the step 2.1 playtest:
 
-- **Deathwish works.** If the host plays with Deathwish, your game switches its own Deathwish on to match and says so in chat, so your hits follow Deathwish's stagger rules. Every player needs "Cata 3 & Deathwish" installed and enabled for this (see "Before you play").
-- **Enemy data check.** Your game and the host's compare the enemy data your hits are worked out with. If they differ, for example because of a difficulty mod one of you doesn't run, both of you get a warning in chat, and your staggers and kills are left to the host, a moment late, until they match. `/pingcomp version` also shows, for each player, whether their enemy data matches yours.
-- **Timings ship with the mod.** The stagger timings measured in the last playtest are built in, so staggers you cause run to the right length from the first fight. Every game keeps measuring, and `/pingcomp timings` writes what it has measured to the console log (see "What to send back").
-- **The debug log is on by default**, and the mod remembers if you switch it off. Stats and timings are also written to the log when a mission ends, as a fallback for the commands.
-- **Slave rats stagger from your hits.** In step 2, your pushes and attacks did nothing to them.
-- **After you block, the enemy recoils for as long as it would in the normal game.** In step 2 it came straight back at you. Recoil timings aren't built in yet, so until a recoil animation has been measured, its recoil may last slightly longer than normal.
-- **Enemies that spawn just after you killed others react to your hits.** The game recycles dead enemies into new ones, and in step 2 a recycled enemy could ignore your hits for a few seconds.
-- `/pingcomp attack` is accepted for `/pingcomp attacks`, and a switch typed on the side where it does nothing (for example `stagger` on a client) says so.
+- **Recoils last their full length every time.** In 2.1 the enemy sometimes came back at you about half a second after your block, most often a marauder after a few blocks in a row. The host was ending its recoil early on a timing cue left over from the enemy's previous recoil.
+- **Timings rebuilt from the last playtest.** Stagger lengths for slave rats, clan rats (with or without shields), marauders and fanatics, and recoil timings for slave rats, clan rats and marauders, are built in. Some timings measured in 2.1 were wrong and are corrected, and the timings each game measured with earlier builds are discarded.
+- **No false enemy-data warning when the host switches Deathwish on.** In 2.1 clients briefly saw "enemy data differs" and then "matches again". A warning now appears only if the data still differs after 3 seconds. Your hits still move to the host at once while it differs.
+- The summary written to the log when the game closes no longer repeats the one written at the end of the mission.
 
 ## What is covered in this build
 
@@ -49,7 +45,7 @@ Still exactly like the normal game, so a moment late when you aren't the host:
 ## What to expect
 
 - **Blocks and dodges count the way you saw them.**
-- **An enemy you stagger reels back the instant your hit lands**, and its next move follows straight on. The host learns each stagger animation's length as you play and remembers it between sessions, so in your first games some staggers may still be followed by a pause of about a ping.
+- **An enemy you stagger reels back the instant your hit lands**, and its next move follows straight on. Gors, ungors and shielded marauders are the exception at first: their stagger lengths aren't built in yet, so until the host has measured them, a pause of about a ping can follow their staggers.
 - **An enemy you kill drops the instant your hit lands.**
 - **The enemy recoils the instant you block**, for as long as it would in the normal game.
 - **A hit on you is felt at once.** The health bar shows an estimate straight away and settles on the host's exact number a moment later. A small jump in the bar when that happens is expected.
@@ -93,13 +89,13 @@ Any difficulty works. Champion or higher is best, because enemies track and comm
 
 1. **Push.** Push single slave rats, clan rats, marauders and gors. Do they reel back the moment your push lands? Does their movement look right, and is there any jump when the host's version catches up?
 2. **Attack.** Hit single trash enemies with light and heavy attacks. Same questions as for the push.
-3. **After the stagger.** Watch what the enemy does once its stagger ends. Does it carry straight on, or stand still for a moment first? It may pause in your first few fights with this build while the host learns the animations; report it if it still does after that.
+3. **After the stagger.** Watch what the enemy does once its stagger ends. Does it carry straight on, or stand still for a moment first? Only gors, ungors and shielded marauders should pause, and only in your first fights.
 4. **Interrupt a swing.** Stagger an enemy with a push or an attack during its wind-up. The swing should stop on your screen and do nothing.
 5. **Kill.** Kill trash with your melee weapon, including headshots and kills through a crowd. Do they drop at once? Does any enemy you saw die keep fighting, get back up, or die twice?
 6. **Ranged and career skills.** Shoot trash with your ranged weapon, and use a career skill that charges, dashes or shoots through them. Their staggers and kills should show at once too.
 7. **Shields.** Push and hit shielded clan rats and marauders, from the front and from behind. A hit taken on the shield should knock them back but do no damage. Break a shield with a heavy attack and check the enemy fights on without it.
 8. **Horde.** Push-attack and cleave through a horde for a few minutes. Look for enemies that freeze, slide, jump back to an earlier spot, or play a stagger twice.
-9. **Block recoil.** Block single swings, from every trash enemy you meet. The enemy should recoil the instant you block, and stay in its recoil as long as it would in the normal game before it swings again. Then compare `/pingcomp recoil anim` and `/pingcomp recoil off`, and report which felt best. Go back to `full` afterwards.
+9. **Block recoil.** Block single swings, from every trash enemy you meet. The enemy should recoil the instant you block, and stay in its recoil as long as it would in the normal game before it swings again. Block a marauder ten or more times in a row: no recoil should end early. If one does, type `/pingcomp mark` at once. Then compare `/pingcomp recoil anim` and `/pingcomp recoil off`, and report which one setting felt best. Go back to `full` afterwards.
 10. **After the recoil.** Watch how long the enemy pauses after its recoil before it swings again. Tell us if it feels too long or too short.
 11. **Take a hit on purpose.** Stand still and let a swing land. You should lose health, flinch and feel the knockback at once. Then try `/pingcomp predict off` to compare, and turn it back on afterwards.
 12. **Late block and dodge**, as in step 1.1. If your block was up or you were out of reach when the swing landed on your screen, it should never count as a hit.
@@ -150,10 +146,11 @@ Career and melee weapon:
 Was /pingcomp debug on for the whole session? (yes/no)
 What /pingcomp version showed for each player:
 Did your staggers and kills feel instant? Anything odd about them?
-Did enemies pause after your staggers? Did that go away after a while?
+Did enemies pause after your staggers or recoils? Which enemies?
 Did ranged hits, career skills and shielded enemies feel the same as melee?
 Host only: which stagger setting looked best (speed, end, off)?
-Which recoil setting felt best (full, anim, off)?
+Did any recoil end early, so the enemy came straight back at you?
+Which one recoil setting felt best (full, anim or off)?
 Did predict on feel better than off?
 Did you try dodgecount off with a shield? Which felt right?
 What felt wrong, and roughly when (or the text of your /pingcomp mark notes):
@@ -168,7 +165,8 @@ A note on privacy: the console log contains your Steam name and ID, your PC's ha
 
 ## Known limits of this build
 
-- After a recoil you caused, the enemy can pause briefly before its next move reaches your screen. After a stagger you caused, it can pause in your first few games with this build, until the host has learned the stagger animations.
+- After a stagger you caused on a gor, ungor or shielded marauder, the enemy can pause briefly in your first fights, until the host has measured those stagger animations.
+- After you block a fanatic, gor, ungor, plague monk or savage, the enemy can stay in its recoil a little longer than normal, until the host has measured that recoil animation.
 - Elites, specials, monsters and lords, explosions, area damage and damage over time still work as in the normal game (see "What is covered").
 - Your game's damage reckoning doesn't include every damage bonus the host knows about. When it falls short, a kill shows a moment late, as in the normal game. When it overshoots, the enemy dies anyway: the host finishes it off and credits you.
 - How hard an enemy is already staggered by other players' hits is only partly known to your game, so your stagger can come out slightly different from what the host would have chosen. Yours is the one that counts.
@@ -181,8 +179,8 @@ A note on privacy: the console log contains your Steam name and ID, your PC's ha
 ## For developers
 
 - The code lives in `scripts/mods/Ping Compensation/`: `Shared.lua` (constants, switches, helpers, the error guard), `Geometry.lua` (the reach and facing maths), `Host.lua` (announcing and booking swings), `HostReactions.lua` (applying a client's staggers, kills and recoils, and shortening a client's stagger), `Client.lua` (judging swings), `Reactions.lua` (the client's own staggers, kills and recoils, and the host's echo), `HitResults.lua` (instant results of a hit on you), `Version.lua`, and `Ping Compensation.lua` (the shared animation-event hook, the commands and the lifecycle).
-- The host keeps the stagger animation lengths it has measured in the mod's saved settings, under `stagger_lengths`.
+- Each game keeps the stagger lengths and recoil timings it has measured in the mod's saved settings, under `stagger_lengths_2` and `recoil_cues_2`, and uses them before the built-in ones in `Timings.lua`. Builds before 2.2 used `stagger_lengths` and `recoil_cues`, which are no longer read.
 - `CLAUDE.md` lists every hook with its file and line in the decompiled source, the network messages, and the rules for this repo.
-- The message version is `VERSION = 6` in `Shared.lua`. This build changed `pc_hello`, `pc_swing_begin` and `pc_swing_answer` and added `pc_hello_reply`, `pc_stagger`, `pc_kill` and `pc_reaction_ack`, so a step 1.1 build can't play with this one.
+- The message version is `VERSION = 7` in `Shared.lua`. Build 2.1 added the enemy-data fingerprint to `pc_hello` and `pc_hello_reply`, so a step 2 build can't play with this one. Build 2.2 changed no messages, so it can play with 2.1, but its recoil fix only works on a 2.2 host.
 - Build with `./build.bat < /dev/null` in Git Bash, or `.\build.bat` in PowerShell.
-- Debug lines in the log start with `[PingComp]`. On a client: `client swing=… verdict=…` per judged swing (now ending `recoil=` with the recoil it played), `client stagger=… type=… anim=…` and `client kill=…` for the player's own hits, `client stagger=…` or `client recoil=… ended: …` when the screen hands the enemy back to the host, with whether the host's echo arrived, and `client swing=… hit shown at once: estimate=…`. On the host: `host swing=… answer=… outcome=…` per answer, `host stagger=… applied=… moved=… timing=… speed=… lead=… length=…`, `host swing=… recoil=… moved=… ends_early_by=…`, and `host kill=…`. Every `/pingcomp` command typed is logged as `[PingComp] command …`.
+- Debug lines in the log start with `[PingComp]`. On a client: `client swing=… verdict=…` per judged swing (now ending `recoil=` with the recoil it played), `client stagger=… type=… anim=…` and `client kill=…` for the player's own hits, `client stagger=…` or `client recoil=… ended: …` when the screen hands the enemy back to the host, with whether the host's echo arrived, and `client swing=… hit shown at once: estimate=…`. On the host: `host swing=… answer=… outcome=…` per answer, `host stagger=… applied=… moved=… timing=… speed=… lead=… length=…`, `host swing=… recoil=… moved=… ends_early_by=…`, `host recoil=… ignored a cue …` and `host recoil enemy=… cleared a cue left over …` when a stray timing cue was kept from ending a recoil, `host skipped stagger enemy=… no client stagger or kill followed`, and `host kill=…`. On both: `timing length …` and `timing cue …` per measurement, ending `ignored` for a reading taken for a stray cue. Every `/pingcomp` command typed is logged as `[PingComp] command …`.

@@ -75,6 +75,10 @@ local function role()
 	return pc.is_server() and "host" or "client"
 end
 
+-- Whether this machine hosted the last mission. Once the game is closing the network is gone and every machine
+-- looks like a client, so the summary written then uses this.
+local hosted_last = nil
+
 local USAGE = "Usage: /pingcomp version | stats | timings | debug on|off | attacks on|off | recoil off|anim|full | predict on|off | stagger speed|end|off | echo on|off | facing on|off | dodgecount on|off | mark <note>"
 
 local SWITCH_VALUES = {
@@ -213,12 +217,18 @@ end
 
 -- Everything here also goes to the console log (pc.say), because some players' VMF settings send echoes to chat only.
 -- to_chat false writes the same lines to the console log only.
-local function print_stats(to_chat)
+-- as_host: which side's lines to write, if not this machine's role now.
+local function print_stats(to_chat, as_host)
 	local out = to_chat == false and pc.print or pc.say
+	local host = as_host
 
-	out("Ping Compensation stats since the mission started (%s, message version %d):", role(), pc.VERSION)
+	if host == nil then
+		host = pc.is_server()
+	end
 
-	if pc.is_server() then
+	out("Ping Compensation stats since the mission started (%s, message version %d):", host and "host" or "client", pc.VERSION)
+
+	if host then
 		local answer_count = stat("host_answer_time_n")
 		local average = answer_count > 0 and stat("host_answer_time_sum") / answer_count * 1000 or 0
 		local teleports = stat("host_teleports")
@@ -228,9 +238,9 @@ local function print_stats(to_chat)
 		local modded, matching = pc.host.modded_peer_count()
 
 		out("Judged by the host after a client went quiet %d. Answers ignored %d, rejected %d. Modded clients now: %d, %d of them with your enemy data.", stat("host_judged_quiet_client"), stat("host_ignored"), stat("host_rejected"), modded, matching)
-		out("Client staggers received %d, applied %d, own animation %d, overtaken %d, refused %d, never entered %d. Host staggers left to clients %d.", stat("host_stagger_received"), stat("host_stagger_applied"), stat("host_stagger_own_animation"), stat("host_stagger_overtaken"), stat("host_stagger_refused"), stat("host_stagger_not_entered"), stat("host_stagger_left_to_client"))
+		out("Client staggers received %d, applied %d, own animation %d, overtaken %d, refused %d, never entered %d. Host staggers left to clients %d, followed by no client stagger or kill %d.", stat("host_stagger_received"), stat("host_stagger_applied"), stat("host_stagger_own_animation"), stat("host_stagger_overtaken"), stat("host_stagger_refused"), stat("host_stagger_not_entered"), stat("host_stagger_left_to_client"), stat("host_left_to_client_unanswered"))
 		out("Client kills received %d, finished off here %d, already dead here %d.", stat("host_kill_received"), stat("host_kill_finished"), stat("host_kill_already_dead"))
-		out("Client recoils applied %d, own animation %d, refused %d, never entered %d, cue brought forward %d. Moved to the client's spot %d times, average %.2f m.", stat("host_recoil_applied"), stat("host_recoil_own_animation"), stat("host_recoil_refused"), stat("host_recoil_not_entered"), stat("host_recoil_cue_brought_forward"), teleports, teleports > 0 and stat("host_teleport_distance_sum") / teleports or 0)
+		out("Client recoils applied %d, own animation %d, refused %d, never entered %d, cue brought forward %d, early cues ignored %d, leftover cues cleared %d. Moved to the client's spot %d times, average %.2f m.", stat("host_recoil_applied"), stat("host_recoil_own_animation"), stat("host_recoil_refused"), stat("host_recoil_not_entered"), stat("host_recoil_cue_brought_forward"), stat("host_recoil_early_cue_ignored"), stat("host_recoil_stale_cue_cleared"), teleports, teleports > 0 and stat("host_teleport_distance_sum") / teleports or 0)
 
 		local sped_up = stat("host_stagger_sped_up")
 
@@ -257,7 +267,7 @@ local function print_stats(to_chat)
 	local lengths, own_lengths = pc.timings.count("length")
 	local cues, own_cues = pc.timings.count("cue")
 
-	out("Timings known: stagger lengths %d (%d measured here, %d this mission), recoil cues %d (%d measured here, %d this mission). /pingcomp timings writes them to the console log.", lengths, own_lengths, stat("timings_measured_length"), cues, own_cues, stat("timings_measured_cue"))
+	out("Timings known: stagger lengths %d (%d measured here, %d this mission, %d readings ignored), recoil cues %d (%d measured here, %d this mission, %d readings ignored). /pingcomp timings writes them to the console log.", lengths, own_lengths, stat("timings_measured_length"), stat("timings_ignored_length"), cues, own_cues, stat("timings_measured_cue"), stat("timings_ignored_cue"))
 	out("Switches: debug %s, attacks %s, recoil %s, predict %s, stagger %s, echo %s, facing %s, dodgecount %s.%s", pc.debug and "on" or "off", pc.attacks and "on" or "off", pc.recoil, pc.predict and "on" or "off", pc.stagger_timing, pc.echo and "on" or "off", pc.facing and "on" or "off", pc.dodgecount and "on" or "off", pc.broken and " The mod has switched itself off after errors." or "")
 end
 
@@ -374,18 +384,44 @@ mod.update = function (dt)
 	pc.client.update(dt)
 	pc.version.update(dt)
 	pc.guard("difficulty mods", pc.compat.update, dt)
+
+	if pc.in_game() then
+		hosted_last = pc.is_server()
+	end
 end
 
 -- A fallback for players who don't type /pingcomp stats or /pingcomp timings: the same lines go to the console log,
 -- not the chat, when a mission or the keep ends and when the game closes. The commands still work as before. A game
 -- killed with Alt+F4 never gets here, but with the debug log on every event is in the log as it happens.
+local summarised = nil -- the stats as last written, so the game closing right after a mission doesn't repeat them
+
+local function stats_key()
+	local names = {}
+
+	for name, value in pairs(pc.stats) do
+		names[#names + 1] = name .. "=" .. tostring(value)
+	end
+
+	table.sort(names)
+
+	return table.concat(names, ",")
+end
+
 local function write_summary(reason)
 	if next(pc.stats) == nil then
 		return
 	end
 
+	local key = stats_key()
+
+	if key == summarised then
+		return
+	end
+
+	summarised = key
+
 	pc.print("summary written because %s:", reason)
-	print_stats(false)
+	print_stats(false, hosted_last)
 
 	if (pc.stats.timings_measured_length or 0) + (pc.stats.timings_measured_cue or 0) > 0 then
 		pc.timings.dump()
