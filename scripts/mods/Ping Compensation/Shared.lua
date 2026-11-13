@@ -1,7 +1,7 @@
 local mod = get_mod("Ping Compensation")
 
 -- Host and client must run the same VERSION. Bump it whenever any message in CLAUDE.md's "Network messages" changes.
-local VERSION = 9
+local VERSION = 10
 
 -- Playtest builds write the debug log by default, so testers don't have to remember /pingcomp debug on. Set this to
 -- false for a public release: players who want the log can still switch it on, and their choice is remembered.
@@ -52,13 +52,12 @@ local pc = {
 		chaos_fanatic = true,
 		chaos_berzerker = true,
 	},
-	-- Breeds whose recoil cue isn't a fixed property of the recoil animation: the fanatic's one recoil (blocked)
-	-- reached its cue 0.95 to 2.37 s in, depending on the swing that was blocked (build 3 playtest). The host doesn't
-	-- bring their cue forward to a shipped or learned time (D14); it waits for the animation's own cue, which never
-	-- cuts the recoil short and leaves the blocker about a ping of extra recoil. The timing lines name the blocked
-	-- attack's animation, to find out whether the cue follows it.
-	VARIABLE_CUE_BREEDS = {
-		chaos_fanatic = true,
+	-- Build 3.1 diagnostic: the clients decided "too weak to stagger" for hundreds of hits on these. For a client's
+	-- hits on them, the host still works out its own stagger, without applying it, and logs where it disagrees; both
+	-- sides log what their stagger maths used for every hit on them (pc.stagger_inputs, D45).
+	CHECK_BREEDS = {
+		skaven_plague_monk = true,
+		chaos_berzerker = true,
 	},
 	broken = false, -- set after repeated errors; the mod then leaves everything to vanilla
 	stats = {},
@@ -78,6 +77,16 @@ pc.stagger_types = ok_types and type(stagger_types) == "table" and stagger_types
 	weakspot = 8,
 	pulling = 9,
 }
+
+local stagger_names = {}
+
+for name, value in pairs(pc.stagger_types) do
+	stagger_names[value] = name
+end
+
+function pc.stagger_name(stagger_type)
+	return stagger_names[stagger_type] or tostring(stagger_type)
+end
 
 mod.pc = pc
 
@@ -232,6 +241,69 @@ function pc.finite(value, decimals)
 	local scale = 10 ^ (decimals or 2)
 
 	return math.floor(value * scale + 0.5) / scale
+end
+
+local function buffed(extension, stat)
+	if not extension or type(extension.apply_buffs_to_value) ~= "function" then
+		return nil
+	end
+
+	local ok, value = pcall(extension.apply_buffs_to_value, extension, 1, stat)
+
+	return ok and type(value) == "number" and value or nil
+end
+
+local function has_buff(extension, method, name)
+	if not extension or type(extension[method]) ~= "function" then
+		return "?"
+	end
+
+	local ok, value = pcall(extension[method], extension, name)
+
+	return ok and tostring(value == true) or "?"
+end
+
+local function number_text(value)
+	return type(value) == "number" and value == value and string.format("%.2f", value) or "-"
+end
+
+local function action_name(action)
+	return type(action) == "table" and tostring(action.name) or "none"
+end
+
+-- What the game's stagger maths (DamageUtils.calculate_stagger_player and do_stagger_calculation, damage_utils.lua:868
+-- and :574) reads for one hit, besides the game data the enemy-data fingerprint covers: the hit, the attacker's and
+-- the enemy's buffs, and the enemy's stagger state. state is the host's blackboard, or a client's stand-in for it,
+-- whose attack_action holds the attack the enemy is in (the maths itself reads action). Both sides log it for every
+-- hit on pc.CHECK_BREEDS, so their lines for one hit can be compared (D45).
+function pc.stagger_inputs(target_unit, state, attacker_unit, damage_profile, target_index, hit_zone_name, power_level, boost_curve_multiplier, is_critical_strike, blocked, damage_source, t)
+	local attacker_alive = attacker_unit ~= nil and Unit.alive(attacker_unit)
+	local attacker_buffs = attacker_alive and ScriptUnit.has_extension(attacker_unit, "buff_system") or nil
+	local target_buffs = target_unit and Unit.alive(target_unit) and ScriptUnit.has_extension(target_unit, "buff_system") or nil
+	local target_settings = type(damage_profile) == "table" and (damage_profile.targets and damage_profile.targets[target_index] or damage_profile.default_target) or nil
+	local range = nil
+
+	if target_settings and attacker_alive then
+		local ok, value = pcall(ActionUtils.get_range_scalar_multiplier, damage_profile, target_settings, attacker_unit, target_unit)
+
+		range = ok and value or nil
+	end
+
+	local health = target_unit and ScriptUnit.has_extension(target_unit, "health_system")
+	local ok_health, hp = pcall(function ()
+		return health and health:current_health_percent()
+	end)
+	local immune = state and state.stagger_immune_time
+	local heavy_immune = state and state.heavy_stagger_immune_time
+	local difficulty = Managers.state.difficulty and Managers.state.difficulty:get_difficulty()
+
+	return string.format("power=%s boost=%s crit=%s zone=%s target=%s blocked=%s source=%s attacker[impact=%s push=%s counter_push=%s potion=%s push_increase=%s] enemy[vulnerability=%s resistance=%s range=%s hp=%s accumulated=%s count=%s anim_done=%s immune_left=%s heavy_immune_left=%s action=%s attack=%s difficulty=%s]",
+		number_text(power_level), number_text(boost_curve_multiplier), tostring(is_critical_strike == true), tostring(hit_zone_name), tostring(target_index), tostring(blocked == true), tostring(damage_source),
+		number_text(buffed(attacker_buffs, "power_level_impact")), number_text(buffed(attacker_buffs, "push_power")), number_text(buffed(attacker_buffs, "counter_push_power")),
+		has_buff(attacker_buffs, "has_buff_perk", "potion_armor_penetration"), has_buff(attacker_buffs, "has_buff_type", "push_increase"),
+		number_text(buffed(target_buffs, "impact_vulnerability")), number_text(buffed(target_buffs, "stagger_resistance")), number_text(range), number_text(ok_health and hp or nil),
+		number_text(state and state.stagger or 0), tostring(state and state.stagger_count or 0), tostring(state and state.stagger_anim_done), number_text(immune and t and immune - t), number_text(heavy_immune and t and heavy_immune - t),
+		action_name(state and state.action), action_name(state and state.attack_action), tostring(difficulty))
 end
 
 local function error_handler(message)

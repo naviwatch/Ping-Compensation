@@ -202,6 +202,118 @@ local function collect_attack_anims(node, lookup, depth)
 	end
 end
 
+local function collect_single_attacks(node, list, depth)
+	if type(node) ~= "table" or depth > 30 then
+		return
+	end
+
+	if node[1] == "BTAttackAction" and type(node.action_data) == "table" then
+		list[#list + 1] = node.action_data
+	end
+
+	for i = 2, #node do
+		collect_single_attacks(node[i], list, depth + 1)
+	end
+end
+
+-- Every animation a single attack can play. BTAttackAction picks one of its variants (default_attack, high_attack,
+-- mid_attack, ...) and plays a random one of that variant's anims (bt_attack_action.lua:41); attack_anim is only set on
+-- some attacks.
+local function single_attack_anims(action, lookup)
+	add_attack_anims(lookup, action.attack_anim, action)
+
+	for _, variant in pairs(action) do
+		local anims = type(variant) == "table" and rawget(variant, "anims")
+
+		if type(anims) == "table" then
+			add_attack_anims(lookup, anims, action)
+		end
+	end
+end
+
+local single_attack_lookup = {} -- breed name -> { [animation] = the single attack that plays it }
+
+-- The single attack an animation of this breed belongs to: the attack a recoil after it interrupted, which recoil
+-- timings are kept by (Timings.lua, D43).
+local function single_attack_of(breed, anim)
+	local lookup = single_attack_lookup[breed.name]
+
+	if not lookup then
+		local behaviors = rawget(_G, "BreedBehaviors")
+		local tree = behaviors and breed.behavior and behaviors[breed.behavior]
+		local actions = {}
+
+		lookup = {}
+
+		collect_single_attacks(tree, actions, 0)
+
+		for i = 1, #actions do
+			single_attack_anims(actions[i], lookup)
+		end
+
+		single_attack_lookup[breed.name] = lookup
+	end
+
+	return lookup[anim]
+end
+
+-- The animations whose timings the host needs for this breed (/pingcomp missing, Probe.lua): its stagger animations
+-- by stagger type, its recoil animations, and its single attacks (BTAttackAction), the only ones a block makes it
+-- recoil from, each with its name and animations.
+function reactions.timing_animations(breed)
+	local staggers = {}
+
+	stagger_type_of(breed, "")
+
+	for anim, stagger_type in pairs(stagger_lookup[breed.name] or {}) do
+		staggers[anim] = stagger_type
+	end
+
+	local blocked = actions_of(breed).blocked
+	local recoils = {}
+
+	if blocked and type(blocked.blocked_anims) == "table" then
+		for i = 1, #blocked.blocked_anims do
+			recoils[#recoils + 1] = blocked.blocked_anims[i]
+		end
+	end
+
+	local behaviors = rawget(_G, "BreedBehaviors")
+	local tree = behaviors and breed.behavior and behaviors[breed.behavior]
+	local actions = {}
+	local attacks = {}
+	local seen = {}
+
+	collect_single_attacks(tree, actions, 0)
+
+	for i = 1, #actions do
+		local action = actions[i]
+		local anims = {}
+
+		single_attack_anims(action, anims)
+
+		local list = {}
+
+		for anim in pairs(anims) do
+			if not seen[anim] then
+				seen[anim] = true
+				list[#list + 1] = anim
+			end
+		end
+
+		table.sort(list)
+
+		if #list > 0 then
+			attacks[#attacks + 1] = {
+				name = tostring(action.name),
+				anims = list,
+			}
+		end
+	end
+
+	return staggers, recoils, attacks
+end
+
 -- Which attack an animation of this breed belongs to, from its behaviour tree. The host's blackboard holds the attack
 -- an enemy is in (blackboard.action), and some attacks ignore some staggers: a frenzying plague monk or savage shrugs
 -- off light ones. This client only sees the host's animations, so it goes by those.
@@ -269,10 +381,11 @@ local function is_recoil_anim(breed, anim)
 	return lookup[anim] == true
 end
 
--- Times a stagger or recoil animation on this client's copy of an enemy, from its start to its cue (see
+-- Times a stagger or recoil animation on this client's copy of an enemy, from its start to its cues (see
 -- reactions.animation_callback), for the shared timings the host uses to end a client's stagger or recoil on time.
--- scale is the speed it plays at, so a stagger's length is kept at normal speed. after: for a recoil, the animation of
--- the attack that was blocked, which only goes into the log (pc.VARIABLE_CUE_BREEDS).
+-- kind is "length" for a stagger, "recoil" for a recoil, which is timed to both of its cues (Timings.lua). scale is the
+-- speed it plays at: a stagger's length is kept at normal speed, and a reading not taken at normal speed isn't learned.
+-- after: for a recoil, the animation of the attack that was blocked, which its timings are kept by (D43).
 local function measure_start(unit, kind, anim, scale, breed, after)
 	-- These animations play at normal speed whatever the variable says.
 	if pc.FIXED_SPEED_STAGGER_BREEDS[breed.name] then
@@ -287,6 +400,7 @@ local function measure_start(unit, kind, anim, scale, breed, after)
 		breed_name = breed.name,
 		go_id = Managers.state.unit_storage:go_id(unit),
 		after = after,
+		done = {},
 	}
 end
 
@@ -306,8 +420,9 @@ local function measure_host_animation(unit, anim, variable_id, variable_value)
 
 		measure_start(unit, "length", anim, scale, breed)
 	elseif is_recoil_anim(breed, anim) then
-		measure_start(unit, "cue", anim, 1, breed, last_attacks[unit])
-	elseif pc.REACTION_BREEDS[breed.name] and attack_actions_of(breed)[anim] then
+		measure_start(unit, "recoil", anim, 1, breed, last_attacks[unit])
+	elseif pc.REACTION_BREEDS[breed.name] and single_attack_of(breed, anim) then
+		-- The attack a recoil after it interrupted: the last single attack the enemy started.
 		last_attacks[unit] = anim
 	end
 end
@@ -526,18 +641,35 @@ function reactions.item_dropped(unit_id, reason_id)
 	end
 end
 
+-- The timing each animation cue gives, for the kind of animation being timed (measure_start).
+local CUE_TIMINGS = {
+	length = {
+		anim_cb_push_finished = "length",
+	},
+	recoil = {
+		anim_cb_blocked_cooldown = "cue",
+		anim_cb_stunned_finished = "stunned",
+	},
+}
+
 -- Animation cues seen on this client's copy of an enemy, which the host's blackboard records the same way
--- (animation_callback_templates.lua:31 and :857).
+-- (animation_callback_templates.lua:31, :37 and :857).
 function reactions.animation_callback(unit, callback_name)
 	local measure = measuring[unit]
+	local timing_kind = measure and CUE_TIMINGS[measure.kind][callback_name]
 
-	if measure and (callback_name == "anim_cb_push_finished" and measure.kind == "length" or callback_name == "anim_cb_blocked_cooldown" and measure.kind == "cue") then
-		measuring[unit] = nil
+	if timing_kind and not measure.done[timing_kind] then
+		measure.done[timing_kind] = true
+
+		-- A recoil is timed to both of its cues; most recoil animations fire only one of them.
+		if measure.kind == "length" or measure.done.cue and measure.done.stunned then
+			measuring[unit] = nil
+		end
 
 		if Managers.state.unit_storage:go_id(unit) == measure.go_id then
 			local elapsed = pc.now() - measure.t
 
-			pc.timings.learn(measure.kind, measure.breed_name, measure.anim, measure.kind == "length" and elapsed * measure.scale or elapsed, measure.after)
+			pc.timings.learn(timing_kind, measure.breed_name, measure.anim, timing_kind == "length" and elapsed * measure.scale or elapsed, measure.after, measure.scale)
 		end
 	end
 
@@ -551,6 +683,8 @@ function reactions.animation_callback(unit, callback_name)
 		fake.stagger_anim_done = true
 	elseif callback_name == "anim_cb_stagger_immune" then
 		fake.anim_cb_stagger_immune = true
+	elseif callback_name == "anim_cb_stunned_finished" then
+		fake.blocked = nil
 	end
 end
 
@@ -796,7 +930,7 @@ end
 -- stand-in for the host's blackboard. The stagger maths itself is the game's own DamageUtils.calculate_stagger_player,
 -- which reads BLACKBOARDS[unit]; enemies have none on a client, so the stand-in is put there for the call.
 -- Not copied: the stagger immunity of elites and bosses, which none of pc.REACTION_BREEDS have.
-local function work_out_stagger(unit, breed, fake, attacker, damage_profile, target_index, hit_zone_name, attack_direction, damage_source, t)
+local function work_out_stagger(unit, breed, fake, attacker, damage_profile, target_index, hit_zone_name, attack_direction, damage_source, t, profile_name)
 	local target_settings = damage_profile.targets and damage_profile.targets[target_index] or damage_profile.default_target
 	local attack_template = target_settings and DamageUtils.get_attack_template(target_settings.attack_template)
 
@@ -811,7 +945,16 @@ local function work_out_stagger(unit, breed, fake, attacker, damage_profile, tar
 	fake.current_health_percent = health and health:current_health_percent() or 1
 
 	local power_level = hit.can_stagger and hit.power_level or 0
+	-- D45: what the maths uses, to compare with the host's "host check maths" line for the same hit (go= is the enemy).
+	local inputs = pc.debug and pc.CHECK_BREEDS[breed.name] and pc.stagger_inputs(unit, fake, attacker, damage_profile, target_index, hit_zone_name, power_level, hit.boost_curve_multiplier, hit.is_critical_strike, hit.blocking, damage_source, t)
 	local stagger_type, duration, length, stagger_value, strength = with_stand_ins(unit, fake, DamageUtils.calculate_stagger_player, ImpactTypeOutput, unit, attacker, hit_zone_name, power_level, hit.boost_curve_multiplier, hit.is_critical_strike, damage_profile, target_index, hit.blocking, damage_source)
+
+	if inputs then
+		local result = type(stagger_type) == "number" and stagger_type or 0
+
+		pc.log("client check maths enemy=%s go=%s profile=%s %s -> type=%s duration=%.2f strength=%.2f", breed.name, tostring(Managers.state.unit_storage:go_id(unit)), tostring(profile_name), inputs, pc.stagger_name(result), type(duration) == "number" and duration or 0,
+			type(strength) == "number" and strength or 0)
+	end
 
 	-- The strength goes into the log, to compare with the host's check of the same hit (HostReactions.check_hit).
 	if type(stagger_type) ~= "number" or stagger_type <= stagger_types.none then
@@ -979,7 +1122,7 @@ end
 -- batch: a blast's list of staggers (reactions.new_stagger_batch), which goes to the host after the blast is worked out.
 local function stagger(unit, breed, attacker, damage_profile, profile_name, target_index, hit_zone_name, attack_direction, damage_source_name, t, batch)
 	local fake = fake_for(unit, breed)
-	local stagger_type, duration, length, stagger_value, direction, anim_scale, always_stagger, is_push = work_out_stagger(unit, breed, fake, attacker, damage_profile, target_index, hit_zone_name, attack_direction, damage_source_name, t)
+	local stagger_type, duration, length, stagger_value, direction, anim_scale, always_stagger, is_push = work_out_stagger(unit, breed, fake, attacker, damage_profile, target_index, hit_zone_name, attack_direction, damage_source_name, t, profile_name)
 
 	if not stagger_type then
 		pc.count("client_hit_no_stagger")
@@ -1393,7 +1536,7 @@ end
 -- Plays the recoil chosen above, now. The host's copy comes back a ping later and is dropped.
 function reactions.play_recoil(swing, unit, anim)
 	animation_system():anim_event(unit, anim, true)
-	measure_start(unit, "cue", anim, 1, swing.breed, swing.attack_anim)
+	measure_start(unit, "recoil", anim, 1, swing.breed, swing.attack_anim)
 	start_prediction("recoil", swing.id, unit, swing.breed, { anim }, pc.recoil == "full", 1, RECOIL_HOLD, pc.now())
 	pc.count("client_recoil")
 end

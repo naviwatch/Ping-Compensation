@@ -647,8 +647,8 @@ mod:hook_safe("BTAttackAction", "enter", function (self, unit, blackboard, t)
 		return
 	end
 
-	-- BTAttackAction.leave clears blackboard.attack_anim before a recoil begins, and the host's own recoil cue
-	-- readings name the attack that was blocked (Timings.lua, pc.VARIABLE_CUE_BREEDS).
+	-- BTAttackAction.leave clears blackboard.attack_anim before a recoil begins, and recoil cues are looked up and
+	-- measured by the attack that was blocked (Timings.lua, D43).
 	pc.host_reactions.note_attack(unit, blackboard.attack_anim)
 	announce(unit, blackboard, "A")
 end)

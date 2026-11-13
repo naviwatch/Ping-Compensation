@@ -12,17 +12,20 @@ mod:dofile("scripts/mods/Ping Compensation/Client")
 mod:dofile("scripts/mods/Ping Compensation/Reactions")
 mod:dofile("scripts/mods/Ping Compensation/HitResults")
 mod:dofile("scripts/mods/Ping Compensation/Blasts")
+mod:dofile("scripts/mods/Ping Compensation/Probe")
 mod:dofile("scripts/mods/Ping Compensation/Version")
 
 local pc = mod.pc
 
--- Animation cues that the host's blackboard records for staggers. A client's copy of the enemy fires them too, and
--- Reactions.lua keeps the same record for the stagger maths it runs. On the host, the end of a stagger's push
--- animation also tells HostReactions.lua how long that animation is (D32).
+-- Animation cues that the host's blackboard records for staggers and recoils. A client's copy of the enemy fires them
+-- too, and Reactions.lua keeps the same record for the stagger maths it runs. Every machine also times them, for the
+-- shared timings (Timings.lua): a stagger's push animation ends with anim_cb_push_finished (D32), a recoil reaches
+-- anim_cb_blocked_cooldown or, for the savage, ends with anim_cb_stunned_finished (D14).
 local TRACKED_CALLBACKS = {
 	anim_cb_push_finished = true,
 	anim_cb_stagger_immune = true,
 	anim_cb_blocked_cooldown = true,
+	anim_cb_stunned_finished = true,
 }
 
 -- The one place where both sides meet the game's damage frame. An enemy's attack animation fires anim_cb_damage on
@@ -53,7 +56,15 @@ mod:hook("AnimationSystem", "animation_callback", function (func, self, unit, ca
 			elseif callback_name == "anim_cb_push_finished" and pc.host_reactions then
 				pc.guard("host stagger length", pc.host_reactions.push_finished, unit)
 			elseif callback_name == "anim_cb_blocked_cooldown" and pc.host_reactions then
-				pc.guard("host recoil cue", pc.host_reactions.recoil_cue, unit)
+				pc.guard("host recoil cue", pc.host_reactions.recoil_cue, unit, "cue")
+			elseif callback_name == "anim_cb_stunned_finished" and pc.host_reactions then
+				-- It ends the recoil (it clears blackboard.blocked). For a recoil a client played, the host holds it back
+				-- until its time counted from the damage frame, and then does what it does itself (D14).
+				local ok, hold = pc.guard("host recoil stunned", pc.host_reactions.recoil_stunned, unit)
+
+				if ok and hold then
+					return
+				end
 			end
 		end
 
@@ -89,7 +100,7 @@ end
 -- looks like a client, so the summary written then uses this.
 local hosted_last = nil
 
-local USAGE = "Usage: /pingcomp version | stats | timings | debug on|off | attacks on|off | recoil off|anim|full | predict on|off | stagger speed|end|off | combowait on|off | echo on|off | facing on|off | dodgecount on|off | mark <note>"
+local USAGE = "Usage: /pingcomp version | stats | timings | missing [enemy] | debug on|off | attacks on|off | recoil off|anim|full | predict on|off | stagger speed|end|off | combowait on|off | echo on|off | facing on|off | dodgecount on|off | probe vars|speed|off | mark <note>"
 
 local SWITCH_VALUES = {
 	on = true,
@@ -256,11 +267,12 @@ local function print_stats(to_chat, as_host)
 		local modded, matching = pc.host.modded_peer_count()
 
 		out("Judged by the host after a client went quiet %d. Answers ignored %d, rejected %d. Modded clients now: %d, %d of them with your enemy data.", stat("host_judged_quiet_client"), stat("host_ignored"), stat("host_rejected"), modded, matching)
-		out("Client staggers received %d, applied %d, own animation %d, overtaken %d, refused %d, never entered %d. Host staggers left to clients %d, followed by no client stagger or kill %d.", stat("host_stagger_received"), stat("host_stagger_applied"), stat("host_stagger_own_animation"), stat("host_stagger_overtaken"), stat("host_stagger_refused"), stat("host_stagger_not_entered"), stat("host_stagger_left_to_client"), stat("host_left_to_client_unanswered"))
+		out("Client staggers received %d, applied %d, own animation %d, overtaken %d, refused %d, never entered %d. Host staggers left to clients %d, answered before the host's own hit %d, followed by no client stagger or kill %d.", stat("host_stagger_received"), stat("host_stagger_applied"), stat("host_stagger_own_animation"), stat("host_stagger_overtaken"), stat("host_stagger_refused"), stat("host_stagger_not_entered"), stat("host_stagger_left_to_client"), stat("host_left_to_client_answered_first"), stat("host_left_to_client_unanswered"))
 		out("Client kills received %d, finished off here %d, already dead here %d.", stat("host_kill_received"), stat("host_kill_finished"), stat("host_kill_already_dead"))
 		out("Client blasts %d (%d from projectiles), their lists %d, lists that never came %d. Blast targets on covered enemies %d, of which staggered here after all %d. Messages of blast staggers %d.", stat("host_blasts"), stat("host_projectile_blasts"), stat("host_blast_lists"), stat("host_blast_list_missing"), stat("host_blast_targets"), stat("host_blast_host_staggers"), stat("host_blast_stagger_messages"))
-		out("Client recoils applied %d, own animation %d, refused %d, never entered %d, cue brought forward %d, early cues ignored %d, leftover cues cleared %d. Moved to the client's spot %d times, average %.2f m.", stat("host_recoil_applied"), stat("host_recoil_own_animation"), stat("host_recoil_refused"), stat("host_recoil_not_entered"), stat("host_recoil_cue_brought_forward"), stat("host_recoil_early_cue_ignored"), stat("host_recoil_stale_cue_cleared"), teleports, teleports > 0 and stat("host_teleport_distance_sum") / teleports or 0)
-		out("Recoils from clients' blocks ended by their timer and cue %d (the cue last %d), by a stagger %d (%d of them not the blocker's), by death %d, otherwise %d.", stat("host_recoil_end_done"), stat("host_recoil_end_cue_last"), stat("host_recoil_end_stagger"), stat("host_recoil_end_stagger_other"), stat("host_recoil_end_death"), stat("host_recoil_end_other"))
+		out("Client recoils applied %d, own animation %d, refused %d, never entered %d, cue brought forward %d, early cues ignored %d, leftover cues cleared %d. Stunned cues brought forward %d, held back %d, late ones dropped %d. Moved to the client's spot %d times, average %.2f m.", stat("host_recoil_applied"), stat("host_recoil_own_animation"), stat("host_recoil_refused"), stat("host_recoil_not_entered"), stat("host_recoil_cue_brought_forward"), stat("host_recoil_early_cue_ignored"), stat("host_recoil_stale_cue_cleared"),
+			stat("host_recoil_stunned_brought_forward"), stat("host_recoil_stunned_held"), stat("host_recoil_late_stunned_dropped"), teleports, teleports > 0 and stat("host_teleport_distance_sum") / teleports or 0)
+		out("Recoils from clients' blocks ended by their timer and cue %d (the cue last %d), by their stunned cue %d, by a stagger %d (%d of them not the blocker's), by death %d, otherwise %d.", stat("host_recoil_end_done"), stat("host_recoil_end_cue_last"), stat("host_recoil_end_stunned"), stat("host_recoil_end_stagger"), stat("host_recoil_end_stagger_other"), stat("host_recoil_end_death"), stat("host_recoil_end_other"))
 		out("Client hits on plague monks and savages checked against the host's own stagger maths %d: agreed %d, the host would have staggered and the client didn't %d, the client staggered and the host wouldn't have %d, a different stagger %d. Killed first %d.", stat("host_check_compared"), stat("host_check_agreed"), stat("host_check_host_only"), stat("host_check_client_only"), stat("host_check_different"), stat("host_check_killed"))
 
 		local sped_up = stat("host_stagger_sped_up")
@@ -291,8 +303,10 @@ local function print_stats(to_chat, as_host)
 
 	local lengths, own_lengths = pc.timings.count("length")
 	local cues, own_cues = pc.timings.count("cue")
+	local stunned, own_stunned = pc.timings.count("stunned")
 
-	out("Timings known: stagger lengths %d (%d measured here, %d this mission, %d readings ignored), recoil cues %d (%d measured here, %d this mission, %d readings ignored). /pingcomp timings writes them to the console log.", lengths, own_lengths, stat("timings_measured_length"), stat("timings_ignored_length"), cues, own_cues, stat("timings_measured_cue"), stat("timings_ignored_cue"))
+	out("Timings known: stagger lengths %d (%d learned here), recoil cues %d (%d learned here), recoil stunned cues %d (%d learned here). Readings this mission: lengths %d (%d learned, %d ignored), cues %d (%d learned, %d ignored), stunned %d (%d learned, %d ignored). /pingcomp timings writes them to the console log.",
+		lengths, own_lengths, cues, own_cues, stunned, own_stunned, stat("timings_read_length"), stat("timings_measured_length"), stat("timings_ignored_length"), stat("timings_read_cue"), stat("timings_measured_cue"), stat("timings_ignored_cue"), stat("timings_read_stunned"), stat("timings_measured_stunned"), stat("timings_ignored_stunned"))
 	out("Switches: debug %s, attacks %s, recoil %s, predict %s, stagger %s, combowait %s, echo %s, facing %s, dodgecount %s.%s", pc.debug and "on" or "off", pc.attacks and "on" or "off", pc.recoil, pc.predict and "on" or "off", pc.stagger_timing, pc.combowait and "on" or "off", pc.echo and "on" or "off", pc.facing and "on" or "off", pc.dodgecount and "on" or "off", pc.broken and " The mod has switched itself off after errors." or "")
 end
 
@@ -369,8 +383,14 @@ mod:command("pingcomp", mod:localize("pingcomp_command_description"), function (
 
 		local lengths, own_lengths = pc.timings.count("length")
 		local cues, own_cues = pc.timings.count("cue")
+		local stunned, own_stunned = pc.timings.count("stunned")
 
-		pc.say("Wrote %d stagger lengths (%d measured here) and %d recoil cues (%d measured here) to the console log.", lengths, own_lengths, cues, own_cues)
+		pc.say("Wrote %d stagger lengths (%d learned here), %d recoil cues (%d learned here) and %d recoil stunned cues (%d learned here) to the console log.", lengths, own_lengths, cues, own_cues, stunned, own_stunned)
+	elseif action == "missing" then
+		-- For a calibration session (D46): what each covered enemy still lacks.
+		pc.guard("missing timings", pc.probe_tools.missing, value)
+	elseif action == "probe" then
+		pc.guard("probe", pc.probe_tools.command, args)
 	elseif action == "mark" then
 		-- A line testers can drop into their log at the moment something looked wrong.
 		local note = table.concat(args, " ", 2)
@@ -391,6 +411,7 @@ local function clear()
 	pc.host.clear()
 	pc.client.clear()
 	pc.compat.clear()
+	pc.probe_tools.clear()
 	pc.timings.save()
 end
 
@@ -411,6 +432,10 @@ mod.update = function (dt)
 	pc.client.update(dt)
 	pc.version.update(dt)
 	pc.guard("difficulty mods", pc.compat.update, dt)
+
+	if pc.in_game() then
+		pc.guard("probe", pc.probe_tools.update)
+	end
 
 	if pc.in_game() then
 		hosted_last = pc.is_server()
@@ -450,7 +475,7 @@ local function write_summary(reason)
 	pc.print("summary written because %s:", reason)
 	print_stats(false, hosted_last)
 
-	if (pc.stats.timings_measured_length or 0) + (pc.stats.timings_measured_cue or 0) > 0 then
+	if (pc.stats.timings_measured_length or 0) + (pc.stats.timings_measured_cue or 0) + (pc.stats.timings_measured_stunned or 0) > 0 then
 		pc.timings.dump()
 	end
 end
