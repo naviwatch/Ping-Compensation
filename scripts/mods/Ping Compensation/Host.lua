@@ -89,11 +89,33 @@ local function action_set_name(action, breed)
 	return found or nil
 end
 
--- Runs after BTAttackAction.enter, once per attack, on the host.
-local function announce(unit, blackboard)
-	local target = blackboard.attacking_target
+-- Whether the enemy is still in the combo step this swing announced (family B). The same step name can come round
+-- again in a later combo, so its start time tells them apart.
+local function in_combo_step(swing, blackboard)
+	local combo = blackboard and blackboard.combo_attack_data
+
+	return combo ~= nil and blackboard.active_node == BTComboAttackAction and blackboard.action == swing.action and combo.current_attack_name == swing.step_name
+		and combo.attack_start_time == swing.step_start_t and combo.attacking_target == swing.target
+end
+
+-- Runs once per attack, on the host: after BTAttackAction.enter for family A, and after every
+-- BTComboAttackAction._start_attack for family B, whose combos announce each step as its own swing.
+local function announce(unit, blackboard, family, step_name)
 	local action = blackboard.action
 	local breed = blackboard.breed
+	local combo = blackboard.combo_attack_data
+	local target, step
+
+	if family == "B" then
+		step = action and action.combo_attacks and action.combo_attacks[step_name]
+		target = combo and combo.attacking_target
+
+		if not step or not combo or combo.current_attack_name ~= step_name then
+			return
+		end
+	else
+		target = blackboard.attacking_target
+	end
 
 	-- The vanilla damage frame does nothing without action.damage, and monsters and lords stay vanilla for now.
 	if not target or not action or not action.damage or not breed or breed.boss or not blackboard.attack_anim then
@@ -121,10 +143,15 @@ local function announce(unit, blackboard)
 	local swing = {
 		id = next_id,
 		peer = peer,
+		family = family,
 		attacker = unit,
 		attacker_go_id = attacker_go_id,
 		target = target,
 		action = action,
+		step = step, -- family B: the combo step, which has its own damage, block cost and follow-ups
+		step_name = step_name,
+		step_start_t = combo and step and combo.attack_start_time or nil,
+		damage = pc.attack_damage(action, step),
 		blackboard = blackboard,
 		breed_name = breed.name,
 		start_t = t,
@@ -151,7 +178,12 @@ local function announce(unit, blackboard)
 	local ok, scale = pcall(damage_scale, action, target)
 
 	pc.count("host_announced")
-	mod:network_send("pc_swing_begin", peer, pc.VERSION, swing.id, attacker_go_id, "A", set_name, action.name, blackboard.attack_anim, box_up, box_down, box_flat, pc.finite(ok and scale or 1, 3))
+
+	if family == "B" then
+		pc.count("host_announced_combo")
+	end
+
+	mod:network_send("pc_swing_begin", peer, pc.VERSION, swing.id, attacker_go_id, family, set_name, action.name, blackboard.attack_anim, box_up, box_down, box_flat, pc.finite(ok and scale or 1, 3), step_name or "")
 end
 
 -- What vanilla would have decided at this frame. Nothing here has side effects.
@@ -162,8 +194,10 @@ local function would_have_judged(swing, blackboard, unit)
 
 	local target = swing.target
 	local action = swing.action
+	local combo = swing.family == "B"
 
-	if not Unit.alive(target) or blackboard.has_line_of_sight == false then
+	-- A frenzy combo's damage frame checks neither line of sight nor unblockable (bt_combo_attack_action.lua:524).
+	if not Unit.alive(target) or not combo and blackboard.has_line_of_sight == false then
 		return "miss"
 	end
 
@@ -171,7 +205,7 @@ local function would_have_judged(swing, blackboard, unit)
 		return "miss"
 	end
 
-	if not action.unblockable then
+	if combo or not action.unblockable then
 		local status = ScriptUnit.has_extension(target, "status_system")
 
 		if status and status:is_blocking() then
@@ -189,10 +223,36 @@ local function would_have_judged(swing, blackboard, unit)
 	return "hit"
 end
 
--- Called from the AnimationSystem.animation_callback hook when an enemy's anim_cb_damage fires on the host.
--- Returns the swing whose vanilla hit test must be skipped, or nil to leave this frame to vanilla.
--- Everything here is plain table work, so it can't realistically fail halfway.
-function host.before_damage_frame(unit)
+-- D15 with /pingcomp combowait off: the follow-up of a combo step goes by what the host would have judged, as soon as
+-- vanilla would choose it. A step whose block cuts it short does so at the host's damage frame, as in vanilla.
+local function apply_guess(swing, blackboard, verdict)
+	if swing.guessed or not in_combo_step(swing, blackboard) then
+		return
+	end
+
+	swing.guessed = true
+
+	local combo = blackboard.combo_attack_data
+
+	if verdict == "hit" then
+		combo.successful_hit = true
+	elseif verdict == "blocked" then
+		blackboard.blocked = false
+		combo.blocked = true
+	end
+end
+
+-- Whether the next move after this combo step depends on whether it landed or was blocked (two plague monk steps, in
+-- the current game data). A step that a block cuts short (block_interrupts) needs no wait: the answer cuts it when it
+-- arrives.
+local function follow_up_depends(step)
+	return step.next_hit ~= nil and step.next_hit ~= step.next or step.next_blocked ~= nil and step.next_blocked ~= step.next
+end
+
+-- Called from the AnimationSystem.animation_callback hook when an enemy's anim_cb_damage (family A) or
+-- anim_cb_frenzy_damage (family B) fires on the host. Returns the swing whose vanilla hit test must be skipped, or nil
+-- to leave this frame to vanilla. Everything here is plain table work, so it can't realistically fail halfway.
+function host.before_damage_frame(unit, callback_name)
 	local swing = by_attacker[unit]
 
 	if not swing or swing.host_judged then
@@ -201,7 +261,15 @@ function host.before_damage_frame(unit)
 
 	local blackboard = BLACKBOARDS[unit]
 
-	if not blackboard or blackboard ~= swing.blackboard or blackboard.active_node ~= BTAttackAction or blackboard.action ~= swing.action or blackboard.attacking_target ~= swing.target then
+	if not blackboard or blackboard ~= swing.blackboard then
+		return nil
+	end
+
+	if swing.family == "B" then
+		if callback_name ~= "anim_cb_frenzy_damage" or not in_combo_step(swing, blackboard) then
+			return nil
+		end
+	elseif callback_name ~= "anim_cb_damage" or blackboard.active_node ~= BTAttackAction or blackboard.action ~= swing.action or blackboard.attacking_target ~= swing.target then
 		return nil
 	end
 
@@ -225,7 +293,52 @@ function host.before_damage_frame(unit)
 
 	swing.would[frame] = ok and verdict or "unknown"
 
+	-- Without the combo wait, a step whose block cuts it short goes by the host's own verdict now, as in vanilla.
+	if swing.family == "B" and not pc.combowait and swing.step.block_interrupts and swing.would[frame] == "blocked" then
+		apply_guess(swing, blackboard, "blocked")
+	end
+
 	return swing
+end
+
+-- D15: called before BTComboAttackAction.run. Returns true while the combo step's next move must wait for the
+-- client's answer. Vanilla chooses it once the step's animation ends (attack_finished), from whether the step landed
+-- or was blocked; here that is only known once the answer arrives, a round trip after the host's damage frame. With
+-- /pingcomp combowait on the enemy holds the end of its animation until then, for at most pc.COMBO_WAIT, and then
+-- goes with what the host would have judged. Damage and blocks always follow the answer.
+function host.combo_hold(unit, blackboard, t)
+	local swing = by_attacker[unit]
+
+	if not swing or swing.family ~= "B" or not blackboard.attack_finished or swing.frames == 0 or swing.answers[1] or swing.host_judged or not follow_up_depends(swing.step) then
+		return false
+	end
+
+	if blackboard ~= swing.blackboard or not in_combo_step(swing, blackboard) then
+		return false
+	end
+
+	if pc.combowait then
+		if not swing.wait_t then
+			swing.wait_t = t
+
+			pc.count("host_combo_waited")
+		end
+
+		if t - swing.wait_t < pc.COMBO_WAIT then
+			return true
+		end
+
+		pc.count("host_combo_wait_ran_out")
+		pc.log("host swing=%d enemy=%s combo step=%s: no answer within %.1fs, its next move goes by the host's guess (%s)", swing.id, swing.breed_name, tostring(swing.step_name), pc.COMBO_WAIT, tostring(swing.would[1]))
+	end
+
+	if not swing.guessed then
+		pc.count("host_combo_guessed")
+	end
+
+	apply_guess(swing, blackboard, swing.would[1])
+
+	return false
 end
 
 -- The enemy that swung is no longer a networked unit on the host, which takes far longer than an answer normally
@@ -234,7 +347,7 @@ end
 local function book_hit_without_attacker(swing)
 	local target = swing.target
 	local action = swing.action
-	local damage = DamageUtils.calculate_damage(action.damage, target, nil)
+	local damage = DamageUtils.calculate_damage(swing.damage, target, nil)
 	local diminishing = action.diminishing_damage
 	local slot_extension = ScriptUnit.has_extension(target, "ai_slot_system")
 
@@ -269,7 +382,26 @@ local function book_hit(swing, through_block)
 			blackboard.hit_through_block = true
 		end
 
-		AiUtils.damage_target(target, attacker, action, action.damage)
+		if swing.family == "B" then
+			-- What BTComboAttackAction.anim_cb_frenzy_damage does for a hit (bt_combo_attack_action.lua:551): the step
+			-- landed, which can change its next move, then the damage. Only while the enemy is still in that step.
+			if same_enemy and in_combo_step(swing, blackboard) then
+				blackboard.combo_attack_data.successful_hit = true
+
+				local dialogue = ScriptUnit.has_extension(target, "dialogue_system")
+				local surrounding = Managers.state.entity:system("surrounding_aware_system")
+
+				if dialogue and dialogue.context and surrounding then
+					pcall(surrounding.add_system_event, surrounding, attacker, "enemy_attack", DialogueSettings.armor_hit_broadcast_range, "attack_tag", "frenzy_attack_damage", "target_name", dialogue.context.player_profile)
+				end
+			end
+
+			AiUtils.damage_target(target, attacker, action, swing.damage)
+
+			return "booked"
+		end
+
+		AiUtils.damage_target(target, attacker, action, swing.damage)
 
 		-- Vanilla calls this straight after the damage. It only makes sense while the enemy is still in that attack.
 		if same_enemy and blackboard.active_node == BTAttackAction and blackboard.action == action and blackboard.attacking_target == target then
@@ -311,16 +443,7 @@ local function book_block(swing, multiplier, improved, direction, recoil)
 		return "attacker gone"
 	end
 
-	local fatigue_type = action.fatigue_type
-
-	if type(fatigue_type) == "table" then
-		fatigue_type = Managers.state.difficulty:get_difficulty_value_from_table(fatigue_type)
-	end
-
-	if not fatigue_type or not PlayerUnitStatusSettings.fatigue_point_costs[fatigue_type] then
-		fatigue_type = "blocked_attack"
-	end
-
+	local fatigue_type = pc.fatigue_type(action, swing.step)
 	local status = ScriptUnit.has_extension(target, "status_system")
 	local target_go_id = Managers.state.unit_storage:go_id(target)
 	local fatigue_type_id = NetworkLookup.fatigue_types[fatigue_type]
@@ -334,6 +457,22 @@ local function book_block(swing, multiplier, improved, direction, recoil)
 
 	local blackboard = BLACKBOARDS[attacker]
 	local recoil_outcome = "no recoil"
+
+	-- A blocked combo step has no recoil. What BTComboAttackAction.anim_cb_frenzy_damage does for a block
+	-- (bt_combo_attack_action.lua:544): the step was blocked, which can cut it short and changes its next move. Only
+	-- while the enemy is still in that step.
+	if swing.family == "B" then
+		reactions.recoil_refused(swing, recoil, "a combo step has no recoil")
+
+		if blackboard and blackboard == swing.blackboard and HEALTH_ALIVE[attacker] and in_combo_step(swing, blackboard) then
+			blackboard.blocked = false
+			blackboard.combo_attack_data.blocked = true
+
+			return "booked, the combo step was blocked"
+		end
+
+		return "booked, the combo had moved on"
+	end
 
 	if blackboard and blackboard == swing.blackboard and HEALTH_ALIVE[attacker] then
 		if blackboard.active_node == BTAttackAction and blackboard.action == action and blackboard.attacking_target == target then
@@ -472,6 +611,12 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 		pc.count("host_answer_time_n")
 	end
 
+	-- The combo step held the end of its animation for this answer (D15).
+	if swing.wait_t and not swing.guessed then
+		pc.count("host_combo_wait_sum", t - swing.wait_t)
+		pc.count("host_combo_wait_n")
+	end
+
 	-- A cut-short swing never reached the client's damage frame, so it has no verdict to compare.
 	local disagree = would ~= "n/a" and would ~= "unknown" and result ~= "cut" and result ~= "unjudged" and would ~= result
 		and not (would == "aborted" and result == "miss")
@@ -483,8 +628,9 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 	if pc.debug then
 		local ping = pc.network():ping_by_peer(sender)
 
-		pc.log("host swing=%d enemy=%s attack=%s frame=%d answer=%s host_would=%s outcome=%s answer_after=%s ping=%s client_distance=%.2f client_angle=%.1f", swing.id, swing.breed_name, tostring(swing.action.name), frame, result, would, outcome,
-			frame_t and string.format("%.3fs", t - frame_t) or "n/a", type(ping) == "number" and string.format("%.0fms", ping * 1000) or "n/a", distance, angle)
+		pc.log("host swing=%d enemy=%s attack=%s%s frame=%d answer=%s host_would=%s outcome=%s answer_after=%s ping=%s client_distance=%.2f client_angle=%.1f%s", swing.id, swing.breed_name, tostring(swing.action.name), swing.step_name and "/" .. swing.step_name or "", frame, result, would, outcome,
+			frame_t and string.format("%.3fs", t - frame_t) or "n/a", type(ping) == "number" and string.format("%.0fms", ping * 1000) or "n/a", distance, angle,
+			swing.wait_t and string.format(" combo_wait=%s", swing.guessed and "ran out" or string.format("%.3fs", t - swing.wait_t)) or "")
 
 	end
 
@@ -498,7 +644,38 @@ mod:hook_safe("BTAttackAction", "enter", function (self, unit, blackboard, t)
 		return
 	end
 
-	announce(unit, blackboard)
+	announce(unit, blackboard, "A")
+end)
+
+-- Family B: every step of a frenzy combo starts here, the first from enter and the rest from run.
+mod:hook_safe("BTComboAttackAction", "_start_attack", function (self, unit, blackboard, t, action, attack_name)
+	if pc.broken or not pc.is_server() or not pc.in_game() then
+		return
+	end
+
+	announce(unit, blackboard, "B", attack_name)
+end)
+
+-- D15: while the step's next move waits for the client's answer, vanilla's run must not see that the step's
+-- animation has ended. This is a mod:hook, so everything except the original call runs through pc.guard.
+mod:hook("BTComboAttackAction", "run", function (func, self, unit, blackboard, t, dt)
+	if pc.broken or not blackboard.attack_finished then
+		return func(self, unit, blackboard, t, dt)
+	end
+
+	local ok, hold = pc.guard("host combo wait", host.combo_hold, unit, blackboard, t)
+
+	if not ok or not hold then
+		return func(self, unit, blackboard, t, dt)
+	end
+
+	blackboard.attack_finished = false
+
+	local result = func(self, unit, blackboard, t, dt)
+
+	blackboard.attack_finished = true
+
+	return result
 end)
 
 -- While a swing is in host.suppress, vanilla's own damage frame stops at its reach test and never gets to the block
@@ -521,6 +698,7 @@ function host.update()
 	end
 
 	pc.guard("host reactions update", pc.host_reactions.update)
+	pc.guard("host blasts update", pc.blasts.update)
 
 	local t = pc.now()
 
@@ -554,6 +732,7 @@ function host.clear()
 	host.suppress = nil
 
 	pc.host_reactions.clear()
+	pc.blasts.clear()
 end
 
 function host.modded_peer_count()

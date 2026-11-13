@@ -13,8 +13,8 @@ local pc = mod.pc
 -- and the reaction replaces them there too. The host acknowledges every stagger and recoil. If it refuses one, the
 -- last change held back is played, so this screen catches up with the host.
 -- Only for enemies in pc.REACTION_BREEDS, only while the host runs the same build (pc.host_fresh), and only for this
--- player's own hits and blocks. Every hit this client sends counts: melee, pushes, ranged, career skills (D31).
--- Explosions and other area damage are worked out on the host and stay there (D33).
+-- player's own hits and blocks. Every hit this client sends counts: melee, pushes, ranged, career skills (D31), and
+-- so does every enemy in a blast this player sets off (Blasts.lua, D37). Damage over time stays with the host (T8).
 
 local reactions = {}
 
@@ -154,6 +154,92 @@ local function stagger_type_of(breed, anim)
 	end
 
 	return lookup[anim]
+end
+
+local attack_lookup = {} -- breed name -> { [animation] = the attack action that plays it }
+
+local function add_attack_anims(lookup, anims, action)
+	if type(anims) == "string" then
+		lookup[anims] = lookup[anims] or action
+	elseif type(anims) == "table" then
+		for i = 1, #anims do
+			if type(anims[i]) == "string" then
+				lookup[anims[i]] = lookup[anims[i]] or action
+			end
+		end
+	end
+end
+
+local function collect_attack_anims(node, lookup, depth)
+	if type(node) ~= "table" or depth > 30 then
+		return
+	end
+
+	local action = node.action_data
+
+	if type(action) == "table" and node[1] ~= "BTStaggerAction" and node[1] ~= "BTBlockedAction" then
+		if node[1] == "BTComboAttackAction" then
+			-- A combo plays its steps' animations, not the action's attack_anim, which other attacks share.
+			if type(action.combo_attacks) == "table" then
+				for _, step in pairs(action.combo_attacks) do
+					if type(step) == "table" then
+						add_attack_anims(lookup, step.anim, action)
+						add_attack_anims(lookup, step.move_anim, action)
+					end
+				end
+			end
+		else
+			add_attack_anims(lookup, action.attack_anim, action)
+		end
+	end
+
+	for i = 2, #node do
+		collect_attack_anims(node[i], lookup, depth + 1)
+	end
+end
+
+-- Which attack an animation of this breed belongs to, from its behaviour tree. The host's blackboard holds the attack
+-- an enemy is in (blackboard.action), and some attacks ignore some staggers: a frenzying plague monk or savage shrugs
+-- off light ones. This client only sees the host's animations, so it goes by those.
+local function attack_actions_of(breed)
+	local lookup = attack_lookup[breed.name]
+
+	if not lookup then
+		local behaviors = rawget(_G, "BreedBehaviors")
+		local tree = behaviors and breed.behavior and behaviors[breed.behavior]
+
+		lookup = {}
+
+		collect_attack_anims(tree, lookup, 0)
+
+		attack_lookup[breed.name] = lookup
+	end
+
+	return lookup
+end
+
+-- The attack the stand-in's enemy is in now, or nil. A frenzy combo (BTComboAttackAction) clears the aborted flag of
+-- its combo data when it starts, and a stagger that stops it sets it; the plague monk's and the savage's stagger code
+-- reads that flag to play a shorter stagger (custom_enter_function in their breed files).
+local function note_attack(fake, action)
+	local was_combo = fake.attack_action ~= nil and fake.attack_action.combo_attacks ~= nil
+
+	if action and action.combo_attacks and not was_combo then
+		fake.combo_attack_data = fake.combo_attack_data or {}
+		fake.combo_attack_data.aborted = false
+	end
+
+	fake.attack_action = action
+end
+
+-- A stagger, the host's or this client's, ends the attack the enemy was in.
+local function attack_staggered(fake)
+	if fake.attack_action and fake.attack_action.combo_attacks then
+		fake.combo_attack_data = fake.combo_attack_data or {}
+		fake.combo_attack_data.aborted = true
+	end
+
+	fake.attack_action = nil
 end
 
 -- The game reuses a dead enemy's unit for a new enemy of the same breed (BreedFreezer), with a new network id, so
@@ -374,22 +460,40 @@ local function track_host_animation(unit, anim)
 			fake.anim_cb_stagger_immune = nil
 		end
 
+		-- The attack this animation belongs to, if any; any other move means the last attack is over.
+		local attack = breed and attack_actions_of(breed)[anim]
+
+		if attack or fake and fake.attack_action then
+			note_attack(fake or fake_for(unit, breed), attack)
+		end
+
 		return
 	end
 
 	-- Someone else's stagger, seen as the host plays it. Its strength isn't sent, so it counts as one.
 	local t = pc.now()
 	local action = stagger_action(breed)
+	local health = ScriptUnit.has_extension(unit, "health_system")
 
 	fake = fake_for(unit, breed)
+	attack_staggered(fake)
 	fake.stagger = (fake.stagger or 0) + 1
 	fake.stagger_type = stagger_type
 	fake.stagger_anim_done = false
 	fake.staggering_id = fake.stagger
 	fake.action = action
+	-- The shielded stormvermin's stagger code reads it (breed_skaven_storm_vermin_with_shield.lua:732).
+	fake.current_health_percent = health and health:current_health_percent() or 1
 
 	if action and action.custom_enter_function then
 		pcall(with_stand_ins, unit, fake, action.custom_enter_function, unit, fake, t, action)
+	end
+end
+
+-- Client.lua: the host announced a swing at this player, so the enemy is in that attack now.
+function reactions.attack_started(unit, breed, action)
+	if pc.REACTION_BREEDS[breed.name] then
+		note_attack(fake_for(unit, breed), action)
 	end
 end
 
@@ -445,6 +549,7 @@ local function read_hit_args(...)
 	hit.can_damage = true
 	hit.can_stagger = true
 	hit.ragdoll_actor_id = 1
+	hit.ragdoll_actor_name = nil
 	hit.blocking = false
 	hit.shield_break_procced = false
 	hit.backstab_multiplier = 1
@@ -641,13 +746,14 @@ function reactions.after_locomotion(t, dt)
 	end
 end
 
--- Copy of action_ignores_stagger (damage_utils.lua:3537) for an enemy.
+-- Copy of action_ignores_stagger (damage_utils.lua:3537) for an enemy. The host reads blackboard.action, which is the
+-- stagger while the enemy is staggered and the attack while it attacks.
 local function action_ignores_stagger(fake, attack_template, stagger_type)
 	if fake.anim_cb_stagger_immune then
 		return true
 	end
 
-	local action = fake.action
+	local action = fake.action or fake.attack_action
 	local ignore_staggers = action and action.ignore_staggers
 
 	if not ignore_staggers or attack_template.always_stagger then
@@ -823,6 +929,7 @@ local function enter_stagger(unit, breed, fake, attacker, stagger_type, duration
 
 	local prediction = predictions[unit]
 
+	attack_staggered(fake)
 	fake.blocked = prediction ~= nil and prediction.kind == "recoil" or nil
 	fake.stagger_anim_done = false
 	fake.staggering_id = fake.stagger
@@ -936,7 +1043,12 @@ local function kill(unit, breed, attacker, health, damage, damage_profile, targe
 
 	pc.client.reaction_started(unit, "killed by you")
 
-	local ragdoll_actor = NetworkLookup.hit_ragdoll_actors[hit.ragdoll_actor_id]
+	-- A blast names its actor itself (blast_hit); a hit sends the actor's network id.
+	local ragdoll_actor = hit.ragdoll_actor_name
+
+	if not ragdoll_actor and hit.ragdoll_actor_id then
+		ragdoll_actor = NetworkLookup.hit_ragdoll_actors[hit.ragdoll_actor_id]
+	end
 
 	if ragdoll_actor == "n/a" then
 		ragdoll_actor = nil
@@ -1094,6 +1206,54 @@ function reactions.attack_hit(damage_source_id, attacker_unit_id, hit_unit_id, h
 
 	-- Decided here, stagger or not, so a swing from this enemy is cut only if a stagger was shown.
 	return true
+end
+
+-- Blasts.lua: whether this enemy was killed on this screen, so a blast leaves it alone.
+function reactions.killed_here(unit)
+	return dead_here(unit)
+end
+
+-- Blasts.lua: one enemy in a blast this player set off, as AreaDamageSystem._damage_unit books it on the host
+-- (area_damage_system.lua:313): the damage, which may kill, then, if it lives, the stagger, with the blast's power
+-- level at that enemy's distance. A blast's damage isn't stopped by a shield; its stagger is told whether the
+-- shield blocked it. Returns "kill" or "decided".
+function reactions.blast_hit(unit, breed, attacker, damage_profile, profile_name, target_index, power_level, hit_zone_name, hit_position, direction, damage_source_name, shield_blocked, ragdoll_actor, t)
+	hit.power_level = power_level
+	hit.target_index = target_index
+	hit.boost_curve_multiplier = 0
+	hit.is_critical_strike = false
+	hit.can_damage = true
+	hit.can_stagger = true
+	hit.ragdoll_actor_id = nil
+	hit.ragdoll_actor_name = ragdoll_actor or "n/a"
+	hit.blocking = false
+	hit.shield_break_procced = false
+	hit.backstab_multiplier = 1
+	hit.first_hit = false
+	hit.total_hits = 0
+
+	-- A blast is never a projectile's hit, whose damage the game records itself.
+	local saved_inside_projectile = inside_projectile
+
+	inside_projectile = false
+
+	local ok, killed = pcall(damage, unit, breed, attacker, damage_profile, target_index, hit_zone_name, hit_position, direction, damage_source_name, t)
+
+	inside_projectile = saved_inside_projectile
+
+	if not ok then
+		error(killed, 0)
+	end
+
+	if killed then
+		return "kill"
+	end
+
+	hit.blocking = shield_blocked and true or false
+
+	stagger(unit, breed, attacker, damage_profile, profile_name, target_index, hit_zone_name, direction, damage_source_name, t)
+
+	return "decided"
 end
 
 local function blocked_action(swing)

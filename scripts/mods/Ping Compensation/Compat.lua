@@ -37,12 +37,17 @@ local FINGERPRINT_BREEDS = {
 	"skaven_clan_rat_with_shield",
 	"skaven_plague_monk",
 	"skaven_slave",
+	"skaven_storm_vermin_with_shield",
 }
 
 local BREED_FIELDS = {
 	"armor_category",
+	"berzerking_stagger_time",
+	"block_stagger_mod",
+	"block_stagger_mod_2",
 	"boss_staggers",
 	"diff_stagger_resist",
+	"dodge_timer",
 	"hit_mass_counts",
 	"hitzone_armor_categories",
 	"hitzone_multiplier_types",
@@ -79,6 +84,7 @@ local BREED_FIELDS = {
 local ACTION_NODES = {
 	BTAttackAction = true,
 	BTBlockedAction = true,
+	BTComboAttackAction = true,
 	BTStaggerAction = true,
 }
 
@@ -88,6 +94,7 @@ local ACTION_FIELDS = {
 	"attack_directions",
 	"blocked_anim",
 	"blocked_anims",
+	"combo_attacks",
 	"damage",
 	"damage_type",
 	"difficulty_duration",
@@ -272,54 +279,59 @@ local function collect_actions(node, list, depth)
 	end
 end
 
+local function feed_breed(out, name)
+	local breed = Breeds[name]
+
+	out[#out + 1] = name
+
+	if breed then
+		for j = 1, #BREED_FIELDS do
+			out[#out + 1] = BREED_FIELDS[j]
+
+			feed(out, breed[BREED_FIELDS[j]], 0)
+		end
+	end
+end
+
+local function feed_breed_actions(out, name)
+	local behaviors = rawget(_G, "BreedBehaviors")
+	local breed = Breeds[name]
+	local tree = behaviors and breed and breed.behavior and behaviors[breed.behavior]
+	local list = {}
+
+	collect_actions(tree, list, 0)
+	table.sort(list, function (a, b)
+		return a.name < b.name
+	end)
+
+	out[#out + 1] = name
+
+	for j = 1, #list do
+		local action = list[j].action
+
+		out[#out + 1] = list[j].name
+
+		for k = 1, #ACTION_FIELDS do
+			local value = action[ACTION_FIELDS[k]]
+
+			if value ~= nil then
+				out[#out + 1] = ACTION_FIELDS[k]
+
+				feed(out, value, 0)
+			end
+		end
+	end
+end
+
 local SECTION_FEEDERS = {
 	enemies = function (out)
 		for i = 1, #FINGERPRINT_BREEDS do
-			local name = FINGERPRINT_BREEDS[i]
-			local breed = Breeds[name]
-
-			out[#out + 1] = name
-
-			if breed then
-				for j = 1, #BREED_FIELDS do
-					out[#out + 1] = BREED_FIELDS[j]
-
-					feed(out, breed[BREED_FIELDS[j]], 0)
-				end
-			end
+			feed_breed(out, FINGERPRINT_BREEDS[i])
 		end
 	end,
 	actions = function (out)
-		local behaviors = rawget(_G, "BreedBehaviors")
-
 		for i = 1, #FINGERPRINT_BREEDS do
-			local name = FINGERPRINT_BREEDS[i]
-			local breed = Breeds[name]
-			local tree = behaviors and breed and breed.behavior and behaviors[breed.behavior]
-			local list = {}
-
-			collect_actions(tree, list, 0)
-			table.sort(list, function (a, b)
-				return a.name < b.name
-			end)
-
-			out[#out + 1] = name
-
-			for j = 1, #list do
-				local action = list[j].action
-
-				out[#out + 1] = list[j].name
-
-				for k = 1, #ACTION_FIELDS do
-					local value = action[ACTION_FIELDS[k]]
-
-					if value ~= nil then
-						out[#out + 1] = ACTION_FIELDS[k]
-
-						feed(out, value, 0)
-					end
-				end
-			end
+			feed_breed_actions(out, FINGERPRINT_BREEDS[i])
 		end
 	end,
 	difficulty = function (out)
@@ -366,6 +378,19 @@ function compat.fingerprint()
 	fingerprint = table.concat(parts, "-")
 
 	pc.log("enemy data fingerprint %s", fingerprint)
+
+	-- One line per enemy type, so the host's and a client's logs show which enemies differ, which points at the mod
+	-- that changes them (2.2 playtest: one client's enemies and attacks differed for an hour, cause unknown).
+	if pc.debug then
+		for i = 1, #FINGERPRINT_BREEDS do
+			local name = FINGERPRINT_BREEDS[i]
+			local enemy_out, action_out = {}, {}
+			local ok_enemy = pcall(feed_breed, enemy_out, name)
+			local ok_actions = pcall(feed_breed_actions, action_out, name)
+
+			pc.log("enemy data breed=%s enemy=%s actions=%s", name, ok_enemy and hash_text(table.concat(enemy_out, "|")) or "error000", ok_actions and hash_text(table.concat(action_out, "|")) or "error000")
+		end
+	end
 
 	return fingerprint
 end

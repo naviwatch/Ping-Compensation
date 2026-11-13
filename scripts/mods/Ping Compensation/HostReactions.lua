@@ -39,6 +39,7 @@ local STAGGER_ANIM_TABLES = {
 }
 
 local skip_stagger_for = nil -- the enemy whose vanilla stagger is skipped while the current hit is booked
+local skip_capture = nil -- if set, handed the skipped stagger's arguments, so it can still be applied later (Blasts.lua)
 local forcing = nil -- the client stagger that BTStaggerAction is entering right now
 local staggers = {} -- enemy unit -> client stagger waiting for BTStaggerAction.enter
 local recoils = {} -- enemy unit -> client recoil waiting for BTBlockedAction.enter
@@ -373,6 +374,9 @@ end)
 
 -- Called before BTStaggerAction.enter. Returns the client stagger it is entering, if any.
 function host_reactions.before_stagger_enter(node, unit, blackboard, t)
+	-- A stagger replaces a recoil's animation, so a recoil being watched for its cue will never reach it.
+	cue_watch[unit] = nil
+
 	local record = staggers[unit]
 
 	if not record then
@@ -444,14 +448,27 @@ function host_reactions.stagger_entered(node, unit, blackboard, t)
 	end
 
 	local scale = action.scale_animation_speeds and (action.stagger_animation_scale or blackboard.stagger_animation_scale or 1) or 1
-
-	stagger_watch[unit] = {
+	local watch = {
 		anim = anim,
 		scale = scale > 0 and scale or 1,
 		t = t,
 		breed_name = breed.name,
 	}
+
+	-- D38: a client's stagger played faster here. Its time to the end cue shows the speed the animation really reached.
+	local record = forcing
+
+	if record and record.unit == unit and record.anim_used and record.speed and record.base_scale and record.base_scale > 0 then
+		watch.asked = record.speed
+		watch.base = record.base_scale
+		watch.id = record.id
+		watch.peer = record.peer
+	end
+
+	stagger_watch[unit] = watch
 end
+
+local SLOW_SHARE = 0.9 -- a sped-up stagger that reached less than this share of the speed asked counts as slow
 
 -- The host's anim_cb_push_finished: the stagger animation has reached the cue BTStaggerAction waits for. Its length,
 -- at normal speed, is what plan_timing uses next time.
@@ -464,7 +481,33 @@ function host_reactions.push_finished(unit)
 
 	stagger_watch[unit] = nil
 
-	pc.timings.learn("length", timing.breed_name, timing.anim, (pc.now() - timing.t) * timing.scale)
+	local elapsed = pc.now() - timing.t
+
+	if timing.asked then
+		local length = pc.timings.get("length", timing.breed_name, timing.anim)
+
+		if length and elapsed > 0 then
+			-- The speed it reached, relative to the stagger's own speed, as timing.asked is.
+			local reached = length / (timing.base * elapsed)
+			local slow = reached < timing.asked * SLOW_SHARE
+
+			pc.count("host_stagger_speed_checked")
+			pc.count("host_stagger_speed_share_sum", reached / timing.asked)
+
+			if slow then
+				pc.count("host_stagger_slow")
+			end
+
+			pc.log("host stagger=%d from=%s enemy=%s anim=%s speed asked=%.2f reached=%.2f%s", timing.id, name_of(timing.peer), timing.breed_name, timing.anim, timing.asked, reached, slow and " (slow)" or "")
+
+			-- Timed at a speed it didn't reach, the reading isn't this animation's length.
+			if slow then
+				return
+			end
+		end
+	end
+
+	pc.timings.learn("length", timing.breed_name, timing.anim, elapsed * timing.scale)
 end
 
 function host_reactions.after_stagger_enter(unit, blackboard, t, record)
@@ -568,6 +611,11 @@ end
 -- recoils a record that only watches for the animation's cue. Vanilla picks a random animation inside enter; for
 -- those, the same random pick is made here and handed to enter through blackboard.blocked_anim, so it is known.
 function host_reactions.before_recoil_enter(node, unit, blackboard)
+	-- A recoil watched for its cue may have been cut short (a stagger) before its cue came, and this recoil may be one
+	-- that isn't measured (a client's, or one started late). Without this, this recoil's cue would be timed from the
+	-- older one's start: in the 2.2 playtest the host's marauder readings came out at 1.2 to 2.35 s instead of 0.95 s.
+	cue_watch[unit] = nil
+
 	-- A recoil ends once anim_cb_blocked_cooldown is set and its timer has run out, and only BTBlockedAction.leave
 	-- clears the flag. When before_recoil_run ended a recoil before its animation's own cue, that cue still fires
 	-- afterwards and sets the flag again, so the enemy's next recoil would end as soon as its timer ran out (0.5 to
@@ -868,6 +916,7 @@ end
 
 function host_reactions.clear()
 	skip_stagger_for = nil
+	skip_capture = nil
 	forcing = nil
 	staggers = {}
 	recoils = {}
@@ -881,6 +930,33 @@ function host_reactions.clear()
 	pc.timings.save()
 end
 
+local profile_names = nil -- damage profile table -> its name in DamageProfileTemplates
+
+-- Most damage profiles don't carry their own name (the 2.2 playtest's log said "profile=table" for a third of them).
+local function profile_name(damage_profile)
+	if type(damage_profile) ~= "table" then
+		return tostring(damage_profile)
+	end
+
+	if damage_profile.name then
+		return damage_profile.name
+	end
+
+	if not profile_names then
+		profile_names = {}
+
+		for name, profile in pairs(DamageProfileTemplates) do
+			if type(profile) == "table" then
+				profile_names[profile] = name
+			end
+		end
+	end
+
+	return profile_names[damage_profile] or "unnamed"
+end
+
+host_reactions.profile_name = profile_name
+
 -- The client sends its stagger or kill right after the hit; host_reactions.update logs a skip that none followed.
 local function note_left_to_client(target_unit, damage_profile)
 	if left_to_client[target_unit] then
@@ -892,7 +968,7 @@ local function note_left_to_client(target_unit, damage_profile)
 	left_to_client[target_unit] = {
 		t = pc.now(),
 		breed_name = blackboard and blackboard.breed and blackboard.breed.name or "unknown",
-		profile = type(damage_profile) == "table" and damage_profile.name or tostring(damage_profile),
+		profile = profile_name(damage_profile),
 	}
 end
 
@@ -926,11 +1002,32 @@ mod:hook("WeaponSystem", "rpc_attack_hit", function (func, self, channel_id, dam
 	skip_stagger_for = nil
 end)
 
+-- Blasts.lua: while a blast's damage is booked on this enemy, its stagger is skipped too. on_skip, if given, gets the
+-- skipped call's arguments, for a stagger the client may turn out not to decide.
+function host_reactions.begin_skip(unit, on_skip)
+	skip_stagger_for = unit
+	skip_capture = on_skip
+end
+
+function host_reactions.end_skip()
+	skip_stagger_for = nil
+	skip_capture = nil
+end
+
+-- The host is staggering this enemy itself after all, so its skip isn't waiting for the client any more.
+function host_reactions.forget_left_to_client(unit)
+	left_to_client[unit] = nil
+end
+
 mod:hook("DamageUtils", "stagger_ai", function (func, t, damage_profile, target_index, power_level, target_unit, ...)
 	if skip_stagger_for ~= nil and skip_stagger_for == target_unit then
 		pc.count("host_stagger_left_to_client")
 		pc.guard("host skipped stagger", note_left_to_client, target_unit, damage_profile)
 		pc.guard("host skipped stagger", note_shield_block, target_unit, (select(6, ...)))
+
+		if skip_capture then
+			pc.guard("host held stagger", skip_capture, t, damage_profile, target_index, power_level, target_unit, ...)
+		end
 
 		return
 	end

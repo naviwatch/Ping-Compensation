@@ -1,7 +1,7 @@
 local mod = get_mod("Ping Compensation")
 
 -- Host and client must run the same VERSION. Bump it whenever any message in CLAUDE.md's "Network messages" changes.
-local VERSION = 7
+local VERSION = 8
 
 -- Playtest builds write the debug log by default, so testers don't have to remember /pingcomp debug on. Set this to
 -- false for a public release: players who want the log can still switch it on, and their choice is remembered.
@@ -20,14 +20,16 @@ local pc = {
 	facing = true, -- /pingcomp facing
 	dodgecount = true, -- /pingcomp dodgecount: apply the weapon's dodge count to clients, as the game does for the host
 	attacks = true, -- /pingcomp attacks: this player's hits decide staggers and kills on the enemies below (D26 to D29)
-	recoil = "full", -- /pingcomp recoil off|anim|full: the enemy's recoil after this player's block (D13)
+	recoil = "anim", -- /pingcomp recoil off|anim|full: the enemy's recoil after this player's block (D13, D39)
 	predict = true, -- /pingcomp predict: a hit on this player shows its results at once (D11)
 	stagger_timing = "speed", -- /pingcomp stagger speed|end|off, on the host: how a client's stagger is shortened (D32)
+	combowait = true, -- /pingcomp combowait, on the host: a frenzy combo waits for the client's answer before its next move (D15)
+	COMBO_WAIT = 0.5, -- seconds a combo waits for that answer before the host goes with its own guess (D15)
 	TELEPORT_LIMIT = 2.5, -- metres the host will move its copy of an enemy to where a client saw it (D27)
-	MAX_STAGGER_SPEEDUP = 1.5, -- fastest the host plays a client's stagger; past this it ends the stagger early
-	-- Enemies whose reactions to a player's hits that player's client decides (D29, D31). Every hit the client
-	-- sends counts: melee, pushes, ranged, career skills. Explosions and area damage are worked out on the host
-	-- and stay there (D33).
+	MAX_STAGGER_SPEEDUP = 3, -- fastest the host plays a client's stagger; past this it ends the stagger early (D38)
+	-- Enemies whose reactions to a player's hits that player's client decides (D29, D31, D40). Every hit the client
+	-- sends counts: melee, pushes, ranged, career skills, and the player's own explosions and area skills (D37).
+	-- Damage over time stays with the host (T8).
 	REACTION_BREEDS = {
 		skaven_slave = true,
 		skaven_clan_rat = true,
@@ -37,6 +39,9 @@ local pc = {
 		chaos_fanatic = true,
 		beastmen_gor = true,
 		beastmen_ungor = true,
+		skaven_plague_monk = true,
+		chaos_berzerker = true,
+		skaven_storm_vermin_with_shield = true,
 	},
 	broken = false, -- set after repeated errors; the mod then leaves everything to vanilla
 	stats = {},
@@ -118,6 +123,34 @@ end
 
 function pc.host_fresh()
 	return host_heard ~= nil and pc.clock() - host_heard <= pc.PEER_EXPIRY
+end
+
+-- The damage one hit of an attack deals before the game's own scaling, as the game's damage frame works it out: family
+-- A's from the attack (AnimationCallbackTemplates.server.anim_cb_damage), family B's from the combo step if it has
+-- its own (BTComboAttackAction.anim_cb_frenzy_damage, bt_combo_attack_action.lua:553).
+function pc.attack_damage(action, combo_step)
+	local damage_table = combo_step and combo_step.difficulty_damage
+
+	if damage_table then
+		return Managers.state.difficulty:get_difficulty_value_from_table(damage_table)
+	end
+
+	return action.damage
+end
+
+-- The block cost of an attack: a combo step's own, else the attack's (bt_combo_attack_action.lua:541).
+function pc.fatigue_type(action, combo_step)
+	local fatigue_type = combo_step and combo_step.fatigue_type or action.fatigue_type
+
+	if type(fatigue_type) == "table" then
+		fatigue_type = Managers.state.difficulty:get_difficulty_value_from_table(fatigue_type)
+	end
+
+	if not fatigue_type or not PlayerUnitStatusSettings.fatigue_point_costs[fatigue_type] then
+		fatigue_type = "blocked_attack"
+	end
+
+	return fatigue_type
 end
 
 function pc.local_player_unit()

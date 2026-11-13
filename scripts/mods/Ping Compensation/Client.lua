@@ -16,6 +16,9 @@ pc.client = client
 local DODGE_DISTANCE = 4 -- DEFAULT_DODGE_DISTANCE_THRESHOLD in bt_attack_action.lua
 local DEFAULT_DODGE_ROTATION_TIME = 1.5 -- also from bt_attack_action.lua
 local ROTATION_SPEED = 10 -- DEFAULT_ROTATION_SPEED in ai_locomotion_extension.lua
+local COMBO_ROTATION_SPEED = 20 -- DEFAULT_ROTATION_SPEED in bt_combo_attack_action.lua, set at every combo step
+local COMBO_DODGED_ROTATION_SPEED = 2 -- what a dodge drops it to for the rest of the step (bt_combo_attack_action.lua:417)
+local COMBO_DODGE_TIMER = 0.3 -- seconds the enemy aims where the player was when they dodged, unless the breed says (:421)
 local FACING_HOLD = 1 -- seconds the facing stays ours after the damage frame, unless the enemy moves on first
 local CUT_MEMORY = 2 -- seconds a cut swing is remembered, only so that a damage event that still fires gets logged
 local MAX_FRAMES = 8
@@ -166,6 +169,81 @@ local function update_facing(swing, unit, target, t, dt)
 	end
 end
 
+-- The turning speed a combo step with a lerped rotation scheme sets, by how far into the step it is
+-- (BTComboAttackAction._update_rotation_target_lerped, bt_combo_attack_action.lua:446).
+local function lerped_rotation_speed(scheme, attack_t)
+	local start_in, end_in, start_out, end_out = scheme.start_lerp_in or 0, scheme.end_lerp_in or 0, scheme.start_lerp_out or 0, scheme.end_lerp_out or 0
+	local target_speed = scheme.target_speed or COMBO_ROTATION_SPEED
+
+	if attack_t < start_in then
+		return COMBO_ROTATION_SPEED
+	elseif attack_t < end_in then
+		return math.lerp(COMBO_ROTATION_SPEED, target_speed, (attack_t - start_in) / math.max(end_in - start_in, 0.001))
+	elseif attack_t < start_out then
+		return target_speed
+	elseif attack_t < end_out then
+		return math.lerp(target_speed, COMBO_ROTATION_SPEED, (attack_t - start_out) / math.max(end_out - start_out, 0.001))
+	end
+
+	return COMBO_ROTATION_SPEED
+end
+
+-- Family B: copy of BTComboAttackAction._update_rotation_target (bt_combo_attack_action.lua:411), fed from this
+-- player's live state. The enemy tracks the player the whole step. When the player first dodges during the step, it
+-- aims where they were for the breed's dodge_timer and turns at 2 instead of 20 for the rest of the step. After the
+-- damage frame it stops tracking ("no_rotation"), still easing towards where it last aimed.
+local function update_combo_facing(swing, unit, target, t, dt)
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local scheme = swing.step.rotation_scheme
+
+	-- For the debug log, as for family A.
+	if status and not swing.past_damage and status.is_dodging then
+		swing.dodged = true
+
+		if not status:get_is_dodging() then
+			swing.dodge_over_count = true
+		end
+	end
+
+	local speed = swing.rotation_speed
+
+	if not swing.past_damage and (scheme == "continuous" or type(scheme) == "table") then
+		if status and is_dodging(status) and not swing.dodged_during_attack then
+			swing.rotation_speed = COMBO_DODGED_ROTATION_SPEED
+			swing.dodged_during_attack = true
+			swing.dodge_timer = t + (swing.breed.dodge_timer or COMBO_DODGE_TIMER)
+		end
+
+		local aim
+
+		if swing.dodged_during_attack and t < swing.dodge_timer then
+			aim = swing.last_target_position:unbox()
+		else
+			aim = Unit.local_position(target, 0)
+		end
+
+		swing.last_target_position:store(aim)
+
+		local rotation = flat_rotation(Unit.local_position(unit, 0), aim)
+
+		if rotation then
+			swing.wanted:store(rotation)
+		end
+
+		speed = type(scheme) == "table" and lerped_rotation_speed(scheme, t - swing.begin_t) or swing.rotation_speed
+	end
+
+	-- The host's AI locomotion snaps once a frame's step reaches 1 (locomotion_templates_ai.lua:156).
+	local step = speed * dt
+	local rotation = step >= 1 and swing.wanted:unbox() or Quaternion.lerp(swing.current:unbox(), swing.wanted:unbox(), step)
+
+	swing.current:store(rotation)
+
+	if pc.facing then
+		Unit.set_local_rotation(unit, 0, rotation)
+	end
+end
+
 -- Runs after LocomotionSystem.update, which is where the engine has just eased every enemy copy towards the facing
 -- the host sent. Setting the rotation here, every frame, is what makes the facing ours.
 function client.after_locomotion(t, dt)
@@ -180,6 +258,8 @@ function client.after_locomotion(t, dt)
 			finish(swing, "player unit changed")
 		elseif swing.past_damage and t > swing.release_t then
 			forget(swing)
+		elseif swing.family == "B" then
+			update_combo_facing(swing, unit, target, t, dt)
 		else
 			update_facing(swing, unit, target, t, dt)
 		end
@@ -218,22 +298,18 @@ end
 
 -- Spark, sound, stamina and parry, on this machine, now. This is what the host's message would have triggered.
 local function play_block(swing, unit, status, multiplier, improved, direction)
-	local fatigue_type = swing.action.fatigue_type
-
-	if type(fatigue_type) == "table" then
-		fatigue_type = Managers.state.difficulty:get_difficulty_value_from_table(fatigue_type)
-	end
-
-	if not fatigue_type or not PlayerUnitStatusSettings.fatigue_point_costs[fatigue_type] then
-		fatigue_type = "blocked_attack"
-	end
-
-	status:blocked_attack(fatigue_type, unit, multiplier, improved, direction)
+	status:blocked_attack(pc.fatigue_type(swing.action, swing.step), unit, multiplier, improved, direction)
 end
 
--- Called from the AnimationSystem.animation_callback hook when an enemy copy fires anim_cb_damage on this client.
-function client.damage_frame(unit)
+-- Called from the AnimationSystem.animation_callback hook when an enemy copy fires anim_cb_damage (family A) or
+-- anim_cb_frenzy_damage (family B) on this client.
+function client.damage_frame(unit, callback_name)
 	local swing = by_unit[unit]
+
+	-- A frenzy step's damage frame is anim_cb_frenzy_damage, a single swing's anim_cb_damage.
+	if swing and (callback_name == "anim_cb_frenzy_damage") ~= (swing.family == "B") then
+		return
+	end
 
 	if not swing then
 		local cut_record = recently_cut[unit]
@@ -271,11 +347,15 @@ function client.damage_frame(unit)
 
 	local action = swing.action
 	local breed = swing.breed
+	local combo = swing.family == "B"
 	local use_our_facing = pc.facing
 	local rotation = use_our_facing and swing.current:unbox() or Unit.local_rotation(unit, 0)
 	local forward = Quaternion.forward(rotation)
 	local offset = position(target) - position(unit)
-	local in_reach, in_front, distance, reach, angle, cone = pc.geometry.single_target(offset.x, offset.y, offset.z, forward.x, forward.y, swing.frozen, action, breed, swing.box_up, swing.box_down, swing.box_flat)
+	-- The game tightens the reach and cone after a dodge: family A while its facing is frozen, family B once the player
+	-- has dodged during the step (target_dodged_during_attack, damage_utils.lua:2642).
+	local tightened = combo and swing.dodged_during_attack or not combo and swing.frozen
+	local in_reach, in_front, distance, reach, angle, cone = pc.geometry.single_target(offset.x, offset.y, offset.z, forward.x, forward.y, tightened, action, breed, swing.box_up, swing.box_down, swing.box_flat)
 	local status = ScriptUnit.has_extension(target, "status_system")
 	local result, reason = "hit", "landed"
 	local multiplier, improved, direction, through_block
@@ -302,7 +382,8 @@ function client.damage_frame(unit)
 	local reactions = pc.reactions
 	local recoil_anim, recoil_position, recoil_yaw
 
-	if result == "blocked" then
+	-- A blocked frenzy step has no recoil and no push (bt_combo_attack_action.lua:544).
+	if result == "blocked" and not combo then
 		local ok
 
 		ok, recoil_anim, recoil_position, recoil_yaw = pc.guard("client recoil choice", reactions.choose_recoil, swing, unit)
@@ -322,7 +403,9 @@ function client.damage_frame(unit)
 			pc.guard("client recoil", reactions.play_recoil, swing, unit, recoil_anim)
 		end
 
-		pc.guard("client blocked push", pc.hit_results.blocked, swing, unit, target)
+		if not combo then
+			pc.guard("client blocked push", pc.hit_results.blocked, swing, unit, target)
+		end
 	elseif result == "hit" then
 		pc.guard("client hit results", pc.hit_results.hit, swing, unit, target)
 	end
@@ -335,8 +418,8 @@ function client.damage_frame(unit)
 		local dodging_now = status ~= nil and status.is_dodging == true
 		local effective_now = status ~= nil and status:get_is_dodging() and true or false
 
-		pc.log("client swing=%d enemy=%s attack=%s frame=%d verdict=%s reason=%s distance=%.2f reach=%.2f angle=%.1f cone=%.1f frozen=%s facing=%s since_begin=%.3fs dodging=%s effective=%s dodges=%s/%s dodged_in_swing=%s over_count_in_swing=%s dodgecount=%s recoil=%s",
-			swing.id, breed.name, swing.action_name, frame, result, reason, distance, reach, angle, cone, tostring(swing.frozen), use_our_facing and "client" or "host", t - swing.begin_t,
+		pc.log("client swing=%d enemy=%s attack=%s%s frame=%d verdict=%s reason=%s distance=%.2f reach=%.2f angle=%.1f cone=%.1f frozen=%s facing=%s since_begin=%.3fs dodging=%s effective=%s dodges=%s/%s dodged_in_swing=%s over_count_in_swing=%s dodgecount=%s recoil=%s",
+			swing.id, breed.name, swing.action_name, combo and "/" .. tostring(swing.step_name) or "", frame, result, reason, distance, reach, angle, cone, tostring(tightened), use_our_facing and "client" or "host", t - swing.begin_t,
 			tostring(dodging_now), tostring(effective_now), tostring(status and status.dodge_cooldown), tostring(status and status.dodge_count), tostring(swing.dodged == true), tostring(swing.dodge_over_count == true), pc.dodgecount and "on" or "off",
 			tostring(recoil_anim or "host"))
 	end
@@ -402,12 +485,14 @@ function client.reaction_started(unit, reason)
 	end
 end
 
-mod:network_register("pc_swing_begin", function (sender, version, id, attacker_go_id, family, set_name, action_name, attack_anim, box_up, box_down, box_flat, damage_scale)
+-- family: "A" for a single swing (BTAttackAction), "B" for one step of a frenzy combo (BTComboAttackAction), whose
+-- step_name finds the step in action.combo_attacks. Each step of a combo is announced as its own swing.
+mod:network_register("pc_swing_begin", function (sender, version, id, attacker_go_id, family, set_name, action_name, attack_anim, box_up, box_down, box_flat, damage_scale, step_name)
 	if pc.broken or pc.is_server() or not pc.in_game() or sender ~= pc.host_peer() or version ~= pc.VERSION then
 		return
 	end
 
-	if type(id) ~= "number" or type(attacker_go_id) ~= "number" or family ~= "A" or type(set_name) ~= "string" or type(action_name) ~= "string" or type(attack_anim) ~= "string" then
+	if type(id) ~= "number" or type(attacker_go_id) ~= "number" or family ~= "A" and family ~= "B" or type(set_name) ~= "string" or type(action_name) ~= "string" or type(attack_anim) ~= "string" then
 		return
 	end
 
@@ -417,17 +502,21 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 	local breed = unit and Unit.alive(unit) and Unit.get_data(unit, "breed")
 	local set = BreedActions[set_name]
 	local action = set and set[action_name]
+	local step = family == "B" and action and type(action.combo_attacks) == "table" and type(step_name) == "string" and action.combo_attacks[step_name] or nil
 
 	pc.count("client_announced")
 
-	if not breed or not target or not action then
+	if not breed or not target or not action or family == "B" and not step then
 		-- This client can't judge the swing, so it says so. The host books nothing for it.
 		pc.count("client_unjudged")
-		pc.print("client swing=%d can't be judged: enemy=%s target=%s action=%s/%s", id, tostring(breed and breed.name), tostring(target ~= nil), set_name, action_name)
+		pc.print("client swing=%d can't be judged: enemy=%s target=%s action=%s/%s%s", id, tostring(breed and breed.name), tostring(target ~= nil), set_name, action_name, family == "B" and "/" .. tostring(step_name) or "")
 		send_answer({ id = id }, 1, "unjudged")
 
 		return
 	end
+
+	-- This player's own hits on the enemy go by the attack it is in, which can ignore some staggers (Reactions.lua).
+	pc.guard("client attack seen", pc.reactions.attack_started, unit, breed, action)
 
 	-- The host started this swing before it heard of the stagger, kill or recoil this screen is already showing, and
 	-- that reaction will cancel it there too.
@@ -442,8 +531,10 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 		return
 	end
 
-	-- The enemy started a new swing while an older one was still open, so the older one is over.
+	-- The enemy started a new swing while an older one was still open, so the older one is over. A combo's next step
+	-- turns on from where the last one left the enemy facing on this screen.
 	local previous = by_unit[unit]
+	local current_rotation = previous and previous.family == "B" and family == "B" and previous.current:unbox() or Unit.local_rotation(unit, 0)
 
 	if previous then
 		finish(previous, "new swing")
@@ -459,17 +550,24 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 
 	local durations = action.dodge_window_duration
 	local window_duration = type(durations) == "table" and durations[difficulty] or DEFAULT_DODGE_ROTATION_TIME
-	local current_rotation = Unit.local_rotation(unit, 0)
 	local wanted_rotation = flat_rotation(Unit.local_position(unit, 0), Unit.local_position(target, 0)) or current_rotation
 
 	local swing = {
 		id = id,
+		family = family,
 		unit = unit,
 		go_id = attacker_go_id,
 		target = target,
 		action = action,
 		action_name = action_name,
 		set_name = set_name,
+		step = step,
+		step_name = step and step_name or nil,
+		damage = pc.attack_damage(action, step),
+		rotation_speed = COMBO_ROTATION_SPEED, -- family B: the step's turning speed, until a dodge drops it
+		dodged_during_attack = false, -- family B: the player dodged during this step
+		dodge_timer = 0,
+		last_target_position = Vector3Box(Unit.local_position(target, 0)),
 		breed = breed,
 		damage_scale = type(damage_scale) == "number" and damage_scale == damage_scale and damage_scale or 1,
 		attack_anim = attack_anim,

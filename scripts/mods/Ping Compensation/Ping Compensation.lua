@@ -11,6 +11,7 @@ mod:dofile("scripts/mods/Ping Compensation/HostReactions")
 mod:dofile("scripts/mods/Ping Compensation/Client")
 mod:dofile("scripts/mods/Ping Compensation/Reactions")
 mod:dofile("scripts/mods/Ping Compensation/HitResults")
+mod:dofile("scripts/mods/Ping Compensation/Blasts")
 mod:dofile("scripts/mods/Ping Compensation/Version")
 
 local pc = mod.pc
@@ -31,12 +32,21 @@ local TRACKED_CALLBACKS = {
 -- This is a mod:hook, so an error in here would crash the game. Everything except the call to the original runs
 -- through pc.guard, which catches errors and logs them.
 mod:hook("AnimationSystem", "animation_callback", function (func, self, unit, callback_name, param)
+	-- A restarted mission shuts the host's game session down a second or two before the level unloads, and enemy
+	-- animations keep playing until then. The game's own damage frames then try to send messages into the closed
+	-- session and crash it (2026-11-12 playtest: a monster's swing, rpc_set_catapulted). Nothing that happens in
+	-- that gap matters, so the host skips its animation callbacks once the session is gone.
+	if self.is_server and not pc.in_game() then
+		return
+	end
+
 	-- pc.host, pc.client and pc.reactions are only missing if one of the files above failed to load.
 	if pc.broken or not pc.host or not pc.client or not pc.reactions then
 		return func(self, unit, callback_name, param)
 	end
 
-	if callback_name ~= "anim_cb_damage" then
+	-- The frenzy combos' damage frame (family B) is handled like family A's.
+	if callback_name ~= "anim_cb_damage" and callback_name ~= "anim_cb_frenzy_damage" then
 		if TRACKED_CALLBACKS[callback_name] then
 			if not self.is_server then
 				pc.guard("client animation cue", pc.reactions.animation_callback, unit, callback_name)
@@ -52,13 +62,13 @@ mod:hook("AnimationSystem", "animation_callback", function (func, self, unit, ca
 
 	if not self.is_server then
 		-- Client: judge the swing now, on what this player sees, and send the result.
-		pc.guard("client damage frame", pc.client.damage_frame, unit)
+		pc.guard("client damage frame", pc.client.damage_frame, unit, callback_name)
 
 		return func(self, unit, callback_name, param)
 	end
 
 	-- Host: if this swing was announced to a modded client, let vanilla do its bookkeeping but skip its hit test.
-	local ok, swing = pc.guard("host damage frame", pc.host.before_damage_frame, unit)
+	local ok, swing = pc.guard("host damage frame", pc.host.before_damage_frame, unit, callback_name)
 
 	if not ok or not swing then
 		return func(self, unit, callback_name, param)
@@ -79,7 +89,7 @@ end
 -- looks like a client, so the summary written then uses this.
 local hosted_last = nil
 
-local USAGE = "Usage: /pingcomp version | stats | timings | debug on|off | attacks on|off | recoil off|anim|full | predict on|off | stagger speed|end|off | echo on|off | facing on|off | dodgecount on|off | mark <note>"
+local USAGE = "Usage: /pingcomp version | stats | timings | debug on|off | attacks on|off | recoil off|anim|full | predict on|off | stagger speed|end|off | combowait on|off | echo on|off | facing on|off | dodgecount on|off | mark <note>"
 
 local SWITCH_VALUES = {
 	on = true,
@@ -107,6 +117,10 @@ local SWITCH_NOTES = {
 		[true] = "On the host, swings judged differently from the host and swings never answered also show in chat.",
 		[false] = "Those lines only go to the console log.",
 	},
+	combowait = {
+		[true] = string.format("On the host, a plague monk's frenzy waits up to %.1f s for the targeted player's answer before choosing its next move, which depends on whether they blocked or were hit.", pc.COMBO_WAIT),
+		[false] = "Off: the host chooses the frenzy's next move at once, from its own older view of that player's block. Damage and blocks still follow the answer.",
+	},
 	attacks = {
 		[true] = "Your hits stagger and kill trash on your screen at once, and the host follows.",
 		[false] = "Off leaves your hits to the host, as in step 1: staggers and kills show a ping late.",
@@ -121,7 +135,7 @@ local SWITCH_NOTES = {
 		full = "Full: the enemy's recoil plays at once and moves on your screen.",
 	},
 	stagger_timing = {
-		speed = "Speed: on the host, a stagger a client caused plays faster, so its next move reaches that client as the stagger ends there. Past 1.5x, or for ungors, it ends early instead.",
+		speed = string.format("Speed: on the host, a stagger a client caused plays faster, so its next move reaches that client as the stagger ends there. Past %gx, or for ungors, it ends early instead.", pc.MAX_STAGGER_SPEEDUP),
 		["end"] = "End: on the host, a stagger a client caused ends early by that client's ping, cutting its animation short for everyone else.",
 		off = "Off: on the host, a stagger a client caused runs its full length, so that client sees the enemy pause for about a ping afterwards.",
 	},
@@ -235,16 +249,23 @@ local function print_stats(to_chat, as_host)
 
 		out("Swings announced %d, answered %d: hit %d, blocked %d, miss %d, cut short %d, not judged %d.", stat("host_announced"), stat("host_answers"), stat("host_hit"), stat("host_blocked"), stat("host_miss"), stat("host_cut"), stat("host_unjudged"))
 		out("Host would have judged differently %d. Never answered %d. Average answer time %.0f ms.", stat("host_disagree"), stat("host_unanswered"), average)
+
+		local waits = stat("host_combo_wait_n")
+
+		out("Frenzy combo steps announced %d. Next moves that waited for the answer %d (average %.0f ms), went by the host's guess %d (%d after the wait ran out).", stat("host_announced_combo"), stat("host_combo_waited"), waits > 0 and stat("host_combo_wait_sum") / waits * 1000 or 0, stat("host_combo_guessed"), stat("host_combo_wait_ran_out"))
 		local modded, matching = pc.host.modded_peer_count()
 
 		out("Judged by the host after a client went quiet %d. Answers ignored %d, rejected %d. Modded clients now: %d, %d of them with your enemy data.", stat("host_judged_quiet_client"), stat("host_ignored"), stat("host_rejected"), modded, matching)
 		out("Client staggers received %d, applied %d, own animation %d, overtaken %d, refused %d, never entered %d. Host staggers left to clients %d, followed by no client stagger or kill %d.", stat("host_stagger_received"), stat("host_stagger_applied"), stat("host_stagger_own_animation"), stat("host_stagger_overtaken"), stat("host_stagger_refused"), stat("host_stagger_not_entered"), stat("host_stagger_left_to_client"), stat("host_left_to_client_unanswered"))
 		out("Client kills received %d, finished off here %d, already dead here %d.", stat("host_kill_received"), stat("host_kill_finished"), stat("host_kill_already_dead"))
+		out("Client blasts %d, their lists %d, lists that never came %d. Blast targets on covered enemies %d, of which staggered here after all %d.", stat("host_blasts"), stat("host_blast_lists"), stat("host_blast_list_missing"), stat("host_blast_targets"), stat("host_blast_host_staggers"))
 		out("Client recoils applied %d, own animation %d, refused %d, never entered %d, cue brought forward %d, early cues ignored %d, leftover cues cleared %d. Moved to the client's spot %d times, average %.2f m.", stat("host_recoil_applied"), stat("host_recoil_own_animation"), stat("host_recoil_refused"), stat("host_recoil_not_entered"), stat("host_recoil_cue_brought_forward"), stat("host_recoil_early_cue_ignored"), stat("host_recoil_stale_cue_cleared"), teleports, teleports > 0 and stat("host_teleport_distance_sum") / teleports or 0)
 
 		local sped_up = stat("host_stagger_sped_up")
+		local checked = stat("host_stagger_speed_checked")
 
-		out("Client staggers sped up %d (average %.2fx), ended early %d, timer only (length not yet known) %d.", sped_up, sped_up > 0 and stat("host_stagger_speed_sum") / sped_up or 0, stat("host_stagger_ended_early"), stat("host_stagger_timer_only"))
+		out("Client staggers sped up %d (average %.2fx), ended early %d, timer only (length not yet known) %d. Speed checked at the end cue %d: slower than asked %d, average %.0f%% of the speed asked.", sped_up, sped_up > 0 and stat("host_stagger_speed_sum") / sped_up or 0, stat("host_stagger_ended_early"), stat("host_stagger_timer_only"),
+			checked, stat("host_stagger_slow"), checked > 0 and stat("host_stagger_speed_share_sum") / checked * 100 or 0)
 
 		for name, value in pairs(pc.stats) do
 			local breed_name = string.match(name, "^host_unanswered_(.+)$")
@@ -261,6 +282,7 @@ local function print_stats(to_chat, as_host)
 		out("Hits during a swing where a dodge was over your dodge count %d. Could not judge %d. Open right now %d.", stat("client_hit_over_dodge_count"), stat("client_unjudged"), pc.client.open_swing_count())
 		out("Your staggers %d, kills %d, recoils %d, shields broken %d. Hits that didn't stagger %d. Host agreed %d, refused %d. Echoes dropped %d, host changes held back %d (replayed %d), no echo %d.", stat("client_stagger"), stat("client_kill"), stat("client_recoil"), stat("client_shield_broken"), stat("client_hit_no_stagger"), stat("client_ack_applied"), stat("client_ack_rejected"), stat("client_echo_dropped"), stat("client_held_back"), stat("client_held_replayed"), stat("client_echo_timeout"))
 		out("Hits on you shown at once %d (average estimate %.1f), host copies dropped %d, never booked %d. Knockbacks shown %d, host copies dropped %d.", shown, shown > 0 and stat("client_hit_estimate_sum") / shown or 0, stat("client_hit_message_dropped"), stat("client_hit_never_booked"), stat("client_push_shown"), stat("client_push_message_dropped"))
+		out("Your blasts worked out here %d, covered enemies in them %d, blasts left to the host %d.", stat("client_blasts"), stat("client_blast_targets"), stat("client_blast_not_followed"))
 		out("Host runs this build: %s. Enemy data: %s.", pc.host_fresh() and "yes" or "no (nothing is shown early)", pc.compat.state())
 	end
 
@@ -268,7 +290,7 @@ local function print_stats(to_chat, as_host)
 	local cues, own_cues = pc.timings.count("cue")
 
 	out("Timings known: stagger lengths %d (%d measured here, %d this mission, %d readings ignored), recoil cues %d (%d measured here, %d this mission, %d readings ignored). /pingcomp timings writes them to the console log.", lengths, own_lengths, stat("timings_measured_length"), stat("timings_ignored_length"), cues, own_cues, stat("timings_measured_cue"), stat("timings_ignored_cue"))
-	out("Switches: debug %s, attacks %s, recoil %s, predict %s, stagger %s, echo %s, facing %s, dodgecount %s.%s", pc.debug and "on" or "off", pc.attacks and "on" or "off", pc.recoil, pc.predict and "on" or "off", pc.stagger_timing, pc.echo and "on" or "off", pc.facing and "on" or "off", pc.dodgecount and "on" or "off", pc.broken and " The mod has switched itself off after errors." or "")
+	out("Switches: debug %s, attacks %s, recoil %s, predict %s, stagger %s, combowait %s, echo %s, facing %s, dodgecount %s.%s", pc.debug and "on" or "off", pc.attacks and "on" or "off", pc.recoil, pc.predict and "on" or "off", pc.stagger_timing, pc.combowait and "on" or "off", pc.echo and "on" or "off", pc.facing and "on" or "off", pc.dodgecount and "on" or "off", pc.broken and " The mod has switched itself off after errors." or "")
 end
 
 local SWITCHES = {
@@ -278,6 +300,7 @@ local SWITCHES = {
 	predict = true,
 	facing = true,
 	dodgecount = true,
+	combowait = true,
 }
 
 -- Words testers have typed for a command, mapped to the command.
@@ -295,6 +318,7 @@ local SWITCH_ROLE = {
 	dodgecount = "client",
 	stagger = "host",
 	echo = "host",
+	combowait = "host",
 }
 
 local function note_role(action)

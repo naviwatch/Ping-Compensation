@@ -50,7 +50,7 @@ end
 -- applied, so this is an estimate, and the bar settles on the host's number when it arrives.
 local function estimate_damage(swing, attacker, target)
 	local action = swing.action
-	local amount = DamageUtils.calculate_damage(action.damage, target, attacker)
+	local amount = DamageUtils.calculate_damage(swing.damage or action.damage, target, attacker)
 
 	if type(amount) ~= "number" then
 		return 0
