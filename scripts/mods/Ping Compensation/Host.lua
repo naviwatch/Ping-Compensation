@@ -150,6 +150,7 @@ local function announce(unit, blackboard, family, step_name)
 		action = action,
 		step = step, -- family B: the combo step, which has its own damage, block cost and follow-ups
 		step_name = step_name,
+		attack_anim = blackboard.attack_anim, -- for the log lines of the recoil that a block of it causes
 		step_start_t = combo and step and combo.attack_start_time or nil,
 		damage = pc.attack_damage(action, step),
 		blackboard = blackboard,
@@ -596,6 +597,8 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 			frame_t = swing.frame_t[frame],
 		} or nil
 
+		-- For the log line of a recoil left to the host (HostReactions.recoil_ended).
+		swing.blocked_frame_t = swing.frame_t[frame]
 		outcome = book_block(swing, multiplier, improved, direction, recoil)
 	end
 
@@ -644,6 +647,9 @@ mod:hook_safe("BTAttackAction", "enter", function (self, unit, blackboard, t)
 		return
 	end
 
+	-- BTAttackAction.leave clears blackboard.attack_anim before a recoil begins, and the host's own recoil cue
+	-- readings name the attack that was blocked (Timings.lua, pc.VARIABLE_CUE_BREEDS).
+	pc.host_reactions.note_attack(unit, blackboard.attack_anim)
 	announce(unit, blackboard, "A")
 end)
 

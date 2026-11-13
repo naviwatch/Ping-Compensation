@@ -23,6 +23,9 @@ pc.reactions = reactions
 local stagger_types = pc.stagger_types
 
 local ECHO_WAIT = 1.5 -- seconds to wait for the host's copy of a reaction before giving up on it
+local BLAST_ECHO_WAIT = 3 -- the same for a blast's stagger, which reaches the host with many others
+local MAX_MESSAGE_LENGTH = 450 -- characters; VMF packs a message's values into one string of at most 500 (mod_manager.lua:626)
+local BLAST_STAGGER_FIELDS = 15 -- values per stagger in pc_blast_staggers
 local STAGGER_MARGIN = 2 -- seconds the position stays ours past the predicted end of a stagger, unless the host moves on
 local RECOIL_HOLD = 2.5 -- the same for a recoil
 local DEAD_MEMORY = 5 -- seconds the host's messages about an enemy killed on this screen are ignored
@@ -35,6 +38,7 @@ local dead = {} -- enemy unit -> { health = its health extension, t } for enemie
 local stagger_lookup = {} -- breed name -> { [animation] = stagger type }
 local recoil_lookup = {} -- breed name -> { [animation] = true } for its recoil animations
 local measuring = {} -- enemy unit -> the stagger or recoil animation its copy here is playing, until its cue (Timings.lua)
+local last_attacks = {} -- enemy unit -> the host's latest attack animation for it, which a recoil's cue reading names
 local MEASURE_LIMIT = 10 -- seconds an animation is watched for its cue
 local next_id = 0
 local sweep_timer = 0
@@ -267,8 +271,14 @@ end
 
 -- Times a stagger or recoil animation on this client's copy of an enemy, from its start to its cue (see
 -- reactions.animation_callback), for the shared timings the host uses to end a client's stagger or recoil on time.
--- scale is the speed it plays at, so a stagger's length is kept at normal speed.
-local function measure_start(unit, kind, anim, scale, breed)
+-- scale is the speed it plays at, so a stagger's length is kept at normal speed. after: for a recoil, the animation of
+-- the attack that was blocked, which only goes into the log (pc.VARIABLE_CUE_BREEDS).
+local function measure_start(unit, kind, anim, scale, breed, after)
+	-- These animations play at normal speed whatever the variable says.
+	if pc.FIXED_SPEED_STAGGER_BREEDS[breed.name] then
+		scale = 1
+	end
+
 	measuring[unit] = {
 		kind = kind,
 		anim = anim,
@@ -276,6 +286,7 @@ local function measure_start(unit, kind, anim, scale, breed)
 		t = pc.now(),
 		breed_name = breed.name,
 		go_id = Managers.state.unit_storage:go_id(unit),
+		after = after,
 	}
 end
 
@@ -295,7 +306,9 @@ local function measure_host_animation(unit, anim, variable_id, variable_value)
 
 		measure_start(unit, "length", anim, scale, breed)
 	elseif is_recoil_anim(breed, anim) then
-		measure_start(unit, "cue", anim, 1, breed)
+		measure_start(unit, "cue", anim, 1, breed, last_attacks[unit])
+	elseif pc.REACTION_BREEDS[breed.name] and attack_actions_of(breed)[anim] then
+		last_attacks[unit] = anim
 	end
 end
 
@@ -524,7 +537,7 @@ function reactions.animation_callback(unit, callback_name)
 		if Managers.state.unit_storage:go_id(unit) == measure.go_id then
 			local elapsed = pc.now() - measure.t
 
-			pc.timings.learn(measure.kind, measure.breed_name, measure.anim, measure.kind == "length" and elapsed * measure.scale or elapsed)
+			pc.timings.learn(measure.kind, measure.breed_name, measure.anim, measure.kind == "length" and elapsed * measure.scale or elapsed, measure.after)
 		end
 	end
 
@@ -798,14 +811,16 @@ local function work_out_stagger(unit, breed, fake, attacker, damage_profile, tar
 	fake.current_health_percent = health and health:current_health_percent() or 1
 
 	local power_level = hit.can_stagger and hit.power_level or 0
-	local stagger_type, duration, length, stagger_value = with_stand_ins(unit, fake, DamageUtils.calculate_stagger_player, ImpactTypeOutput, unit, attacker, hit_zone_name, power_level, hit.boost_curve_multiplier, hit.is_critical_strike, damage_profile, target_index, hit.blocking, damage_source)
+	local stagger_type, duration, length, stagger_value, strength = with_stand_ins(unit, fake, DamageUtils.calculate_stagger_player, ImpactTypeOutput, unit, attacker, hit_zone_name, power_level, hit.boost_curve_multiplier, hit.is_critical_strike, damage_profile, target_index, hit.blocking, damage_source)
 
+	-- The strength goes into the log, to compare with the host's check of the same hit (HostReactions.check_hit).
 	if type(stagger_type) ~= "number" or stagger_type <= stagger_types.none then
-		return nil, "too weak to stagger"
+		-- do_stagger_calculation returns all zeros when the enemy's action ignores the stagger (damage_utils.lua:802).
+		return nil, stagger_value == 0 and duration == 0 and "its action ignores this stagger" or "too weak to stagger", strength
 	end
 
 	if action_ignores_stagger(fake, attack_template, stagger_type) then
-		return nil, fake.anim_cb_stagger_immune and "stagger immune (animation cue)" or "its action ignores this stagger"
+		return nil, fake.anim_cb_stagger_immune and "stagger immune (animation cue)" or "its action ignores this stagger", strength
 	end
 
 	local is_push = damage_profile.is_push and true or false
@@ -961,13 +976,14 @@ local function enter_stagger(unit, breed, fake, attacker, stagger_type, duration
 	return anim, idle_event or "idle", override_rotation or impact_rotation, variable_scale
 end
 
-local function stagger(unit, breed, attacker, damage_profile, profile_name, target_index, hit_zone_name, attack_direction, damage_source_name, t)
+-- batch: a blast's list of staggers (reactions.new_stagger_batch), which goes to the host after the blast is worked out.
+local function stagger(unit, breed, attacker, damage_profile, profile_name, target_index, hit_zone_name, attack_direction, damage_source_name, t, batch)
 	local fake = fake_for(unit, breed)
 	local stagger_type, duration, length, stagger_value, direction, anim_scale, always_stagger, is_push = work_out_stagger(unit, breed, fake, attacker, damage_profile, target_index, hit_zone_name, attack_direction, damage_source_name, t)
 
 	if not stagger_type then
 		pc.count("client_hit_no_stagger")
-		pc.log("client hit enemy=%s profile=%s no stagger: %s", breed.name, tostring(profile_name), tostring(duration))
+		pc.log("client hit enemy=%s profile=%s no stagger: %s%s", breed.name, tostring(profile_name), tostring(duration), type(length) == "number" and string.format(" strength=%.2f", length) or "")
 
 		return
 	end
@@ -986,11 +1002,27 @@ local function stagger(unit, breed, attacker, damage_profile, profile_name, targ
 
 	local id = next_id
 	local position = Unit.local_position(unit, 0)
+	local go_id = pc.network():unit_game_object_id(unit)
+	local anim_id = batch and rawget(NetworkLookup.anims, anim)
+	local profile_id = batch and rawget(NetworkLookup.damage_profiles, profile_name)
 
-	-- The host hears of it before anything plays here, so a problem in the local effects can't leave it out.
-	send("pc_stagger", id, pc.network():unit_game_object_id(unit), stagger_type, pc.finite(duration, 3), pc.finite(length, 3), pc.finite(direction.x, 3), pc.finite(direction.y, 3), pc.finite(direction.z, 3),
-		anim_scale and pc.finite(anim_scale, 3) or -1, pc.finite(stagger_value, 3), always_stagger, is_push, anim, pc.finite(Quaternion.yaw(rotation), 4),
-		pc.finite(position.x, 3), pc.finite(position.y, 3), pc.finite(position.z, 3), true, profile_name, target_index or 0, damage_source_name)
+	-- The host hears of it before anything plays here, so a problem in the local effects can't leave it out. A blast's
+	-- staggers wait for the end of the blast, a moment later, and go several to a message, in the order of
+	-- valid_blast_stagger in HostReactions.lua. They leave out the enemy's position: the host doesn't move enemies for
+	-- a blast's stagger.
+	if anim_id and profile_id then
+		local entries = batch.entries
+
+		entries[#entries + 1] = {
+			id, go_id, stagger_type, pc.finite(duration, 2), pc.finite(length, 2), pc.finite(direction.x, 2), pc.finite(direction.y, 2), pc.finite(direction.z, 2),
+			anim_scale and pc.finite(anim_scale, 2) or -1, pc.finite(stagger_value, 2), (always_stagger and 1 or 0) + (is_push and 2 or 0), anim_id, pc.finite(Quaternion.yaw(rotation), 3),
+			profile_id, target_index or 0,
+		}
+	else
+		send("pc_stagger", id, go_id, stagger_type, pc.finite(duration, 3), pc.finite(length, 3), pc.finite(direction.x, 3), pc.finite(direction.y, 3), pc.finite(direction.z, 3),
+			anim_scale and pc.finite(anim_scale, 3) or -1, pc.finite(stagger_value, 3), always_stagger, is_push, anim, pc.finite(Quaternion.yaw(rotation), 4),
+			pc.finite(position.x, 3), pc.finite(position.y, 3), pc.finite(position.z, 3), true, profile_name, target_index or 0, damage_source_name)
+	end
 
 	pc.client.reaction_started(unit, "staggered by you")
 
@@ -1012,6 +1044,10 @@ local function stagger(unit, breed, attacker, damage_profile, profile_name, targ
 	local prediction = start_prediction("stagger", id, unit, breed, { anim, idle_event }, true, length, duration * (difficulty_settings.stagger_modifier or 1) + STAGGER_MARGIN, t)
 
 	prediction.opening_event = breed.shield_opening_event
+
+	if batch then
+		prediction.echo_deadline = t + BLAST_ECHO_WAIT
+	end
 
 	measure_start(unit, "length", anim, variable_scale or 1, breed)
 
@@ -1216,8 +1252,8 @@ end
 -- Blasts.lua: one enemy in a blast this player set off, as AreaDamageSystem._damage_unit books it on the host
 -- (area_damage_system.lua:313): the damage, which may kill, then, if it lives, the stagger, with the blast's power
 -- level at that enemy's distance. A blast's damage isn't stopped by a shield; its stagger is told whether the
--- shield blocked it. Returns "kill" or "decided".
-function reactions.blast_hit(unit, breed, attacker, damage_profile, profile_name, target_index, power_level, hit_zone_name, hit_position, direction, damage_source_name, shield_blocked, ragdoll_actor, t)
+-- shield blocked it, and goes into batch. Returns "kill" or "decided".
+function reactions.blast_hit(unit, breed, attacker, damage_profile, profile_name, target_index, power_level, hit_zone_name, hit_position, direction, damage_source_name, shield_blocked, ragdoll_actor, t, batch)
 	hit.power_level = power_level
 	hit.target_index = target_index
 	hit.boost_curve_multiplier = 0
@@ -1251,9 +1287,67 @@ function reactions.blast_hit(unit, breed, attacker, damage_profile, profile_name
 
 	hit.blocking = shield_blocked and true or false
 
-	stagger(unit, breed, attacker, damage_profile, profile_name, target_index, hit_zone_name, direction, damage_source_name, t)
+	stagger(unit, breed, attacker, damage_profile, profile_name, target_index, hit_zone_name, direction, damage_source_name, t, batch)
 
 	return "decided"
+end
+
+-- Blasts.lua: a big blast reaches dozens of enemies, and one message per stagger reached the host over seconds
+-- (build 3), so a blast's staggers are gathered here and sent several to a message (pc_blast_staggers).
+function reactions.new_stagger_batch(damage_source_name)
+	return {
+		damage_source = damage_source_name,
+		entries = {},
+	}
+end
+
+-- Sends the gathered staggers, as many to a message as fit in MAX_MESSAGE_LENGTH. Returns the number of messages.
+function reactions.send_stagger_batch(batch)
+	local entries = batch.entries
+	local messages = 0
+	local values = { pc.VERSION, batch.damage_source }
+	local in_message = 0
+
+	local function flush()
+		if in_message > 0 then
+			send("pc_blast_staggers", unpack(values, 2))
+
+			messages = messages + 1
+		end
+
+		values = { pc.VERSION, batch.damage_source }
+		in_message = 0
+	end
+
+	for i = 1, #entries do
+		local entry = entries[i]
+		local start = #values
+
+		for j = 1, #entry do
+			values[start + j] = entry[j]
+		end
+
+		-- VMF sends the values as one JSON string (cjson), so its length is what counts.
+		if in_message > 0 and #cjson.encode(values) > MAX_MESSAGE_LENGTH then
+			for j = #values, start + 1, -1 do
+				values[j] = nil
+			end
+
+			flush()
+
+			for j = 1, #entry do
+				values[2 + j] = entry[j]
+			end
+		end
+
+		in_message = in_message + 1
+	end
+
+	flush()
+
+	batch.entries = {}
+
+	return messages
 end
 
 local function blocked_action(swing)
@@ -1299,7 +1393,7 @@ end
 -- Plays the recoil chosen above, now. The host's copy comes back a ping later and is dropped.
 function reactions.play_recoil(swing, unit, anim)
 	animation_system():anim_event(unit, anim, true)
-	measure_start(unit, "cue", anim, 1, swing.breed)
+	measure_start(unit, "cue", anim, 1, swing.breed, swing.attack_anim)
 	start_prediction("recoil", swing.id, unit, swing.breed, { anim }, pc.recoil == "full", 1, RECOIL_HOLD, pc.now())
 	pc.count("client_recoil")
 end
@@ -1446,6 +1540,26 @@ function reactions.damage_message(victim_go_id)
 	return false
 end
 
+-- Returns true to drop the host's voice line, or the end of one, for an enemy killed on this screen. The host's copy of
+-- that enemy is still alive and talking, but this screen's copy has lost its dialogue extension, which the game's
+-- handlers index without a check (build 3: a client crashed on a plague monk's line 0.6 s after killing it). Any other
+-- unit without a dialogue extension is dropped too, since the game's handler would crash on it the same way.
+function reactions.dialogue_message(unit_extension_data, go_id, is_level_unit)
+	local unit = Managers.state.network:game_object_or_level_unit(go_id, is_level_unit)
+
+	if not unit then
+		return false
+	end
+
+	if dead_here(unit) or unit_extension_data[unit] == nil then
+		pc.count("client_dialogue_dropped")
+
+		return true
+	end
+
+	return false
+end
+
 mod:network_register("pc_reaction_ack", function (sender, version, kind, id, result)
 	if pc.is_server() or sender ~= pc.host_peer() or version ~= pc.VERSION then
 		return
@@ -1495,10 +1609,17 @@ function reactions.update(dt)
 			measuring[unit] = nil
 		end
 	end
+
+	for unit in pairs(last_attacks) do
+		if not Unit.alive(unit) or not HEALTH_ALIVE[unit] then
+			last_attacks[unit] = nil
+		end
+	end
 end
 
 function reactions.clear()
 	measuring = {}
+	last_attacks = {}
 	fakes = {}
 	predictions = {}
 	by_key = {}
@@ -1589,4 +1710,30 @@ mod:hook("LocomotionSystem", "rpc_teleport_unit_with_yaw_rotation", function (fu
 	end
 
 	return func(self, channel_id, game_object_id, position, yaw)
+end)
+
+-- The host's voice lines for enemies (DialogueSystem.rpc_play_dialogue_event and rpc_interrupt_dialogue_event). The
+-- third dialogue message, rpc_trigger_dialogue_event, only ever goes from a client to the host, so it isn't hooked.
+mod:hook("DialogueSystem", "rpc_play_dialogue_event", function (func, self, channel_id, go_id, is_level_unit, ...)
+	if not self._is_server and not pc.broken then
+		local ok, drop = pc.guard("client dialogue message", reactions.dialogue_message, self._unit_extension_data, go_id, is_level_unit)
+
+		if ok and drop then
+			return
+		end
+	end
+
+	return func(self, channel_id, go_id, is_level_unit, ...)
+end)
+
+mod:hook("DialogueSystem", "rpc_interrupt_dialogue_event", function (func, self, channel_id, go_id, is_level_unit, ...)
+	if not self._is_server and not pc.broken then
+		local ok, drop = pc.guard("client dialogue message", reactions.dialogue_message, self._unit_extension_data, go_id, is_level_unit)
+
+		if ok and drop then
+			return
+		end
+	end
+
+	return func(self, channel_id, go_id, is_level_unit, ...)
 end)

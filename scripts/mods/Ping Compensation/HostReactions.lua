@@ -40,18 +40,36 @@ local STAGGER_ANIM_TABLES = {
 
 local skip_stagger_for = nil -- the enemy whose vanilla stagger is skipped while the current hit is booked
 local skip_capture = nil -- if set, handed the skipped stagger's arguments, so it can still be applied later (Blasts.lua)
+local skip_is_blast = false -- the stagger being skipped is a client blast's (Blasts.lua), whose staggers can take longer
 local forcing = nil -- the client stagger that BTStaggerAction is entering right now
 local staggers = {} -- enemy unit -> client stagger waiting for BTStaggerAction.enter
 local recoils = {} -- enemy unit -> client recoil waiting for BTBlockedAction.enter
 local timed_recoils = {} -- enemy unit -> running recoil whose end was brought forward (D14)
+local recoil_ends = {} -- enemy unit -> running recoil a client's block caused, until BTBlockedAction.leave logs why it ended
 local kills = {} -- enemy unit -> client kill waiting to be finished off
 local stagger_watch = {} -- enemy unit -> the stagger animation the host is playing for it, until its end cue
 local playable = {} -- stagger action table -> set of every animation it can play
 local cue_watch = {} -- enemy unit -> the recoil animation the host is playing for it, until its cue
-local late_recoils = {} -- enemy unit -> when a client's block was booked with the recoil left to the host
+local late_recoils = {} -- enemy unit -> a client's block booked with the recoil left to the host, until its recoil starts
 local left_to_client = {} -- enemy unit -> a stagger skipped here, until that client's stagger or kill for it arrives
+local attack_anims = {} -- enemy unit -> the animation of its latest single attack (BTAttackAction), for the log
+local checks = {} -- enemy unit -> the host's own stagger decisions for client hits on it, oldest first (check_hit)
+local early_answers = {} -- enemy unit -> client staggers and kills that arrived before the host booked their hit
 local LEFT_TO_CLIENT_WAIT = 1 -- seconds; the client sends its stagger or kill right after the hit
+local BLAST_LEFT_TO_CLIENT_WAIT = 3 -- seconds; a big blast's staggers reach the host over a second or more
 local LATE_RECOIL_WAIT = 1 -- seconds; a booked block's recoil starts within a frame or two, or not at all
+local RECOIL_END_LIMIT = 10 -- seconds a recoil is watched for its end
+-- Build 3.1 diagnostic: the clients decided "too weak to stagger" for hundreds of hits on these. For a client's hits on
+-- them, the host still works out its own stagger, without applying it, and logs where it disagrees (check_hit).
+local CHECK_BREEDS = {
+	skaven_plague_monk = true,
+	chaos_berzerker = true,
+}
+local stagger_names = {}
+
+for name, value in pairs(pc.stagger_types) do
+	stagger_names[value] = name
+end
 
 local function ack(peer, kind, id, result)
 	mod:network_send("pc_reaction_ack", peer, pc.VERSION, kind, id, result)
@@ -198,8 +216,9 @@ local function plan_timing(node, blackboard, record, t)
 	local rtt = peer_rtt(record.peer)
 	local lead = rtt + math.max(t - record.t, 0)
 	local action = node._tree_node and node._tree_node.action_data
-	local scalable = action ~= nil and action.scale_animation_speeds and not action.stagger_animation_scale
-	local base_scale = blackboard.stagger_animation_scale or 1
+	-- D42: the Chaos enemies' stagger animations ignore the speed variable, so theirs end early on the timer.
+	local scalable = action ~= nil and action.scale_animation_speeds and not action.stagger_animation_scale and not pc.FIXED_SPEED_STAGGER_BREEDS[record.breed_name]
+	local base_scale = scalable and blackboard.stagger_animation_scale or 1
 	local length = pc.timings.get("length", record.breed_name, record.anim)
 
 	record.rtt = rtt
@@ -291,6 +310,229 @@ local function stagger_procs(unit, blackboard, attacker, profile_name, target_in
 	end
 end
 
+-- Copy of action_ignores_stagger (damage_utils.lua:3537), without the side effect of its "reset_attack" case, which
+-- none of CHECK_BREEDS use.
+local function action_ignores(blackboard, attack_template, stagger_type)
+	if blackboard.anim_cb_stagger_immune then
+		return true
+	end
+
+	local action = blackboard.action
+	local ignore_staggers = action and action.ignore_staggers
+
+	if not ignore_staggers or attack_template.always_stagger then
+		return false
+	end
+
+	if ignore_staggers.allow_push and attack_template.is_push then
+		return false
+	end
+
+	local ignore = ignore_staggers[stagger_type]
+
+	if type(ignore) == "table" then
+		if ignore.type == "ignore_by_health" then
+			local percent = blackboard.current_health_percent or 1
+
+			return percent > ignore.health.min and percent <= ignore.health.max
+		end
+
+		return ignore.type == "reset_attack"
+	end
+
+	return ignore == true
+end
+
+-- What DamageUtils.stagger_ai (damage_utils.lua:3578) would have decided here for a hit whose stagger the client
+-- decides, without applying it. Its maths, DamageUtils.calculate_stagger_player, runs as it would have in vanilla, procs
+-- included. The one thing it leaves on the enemy, a shield's blocked_previous_attack, is put back (CHECK_BREEDS carry no
+-- shield). Not copied: the stagger immunity of elites and bosses, which CHECK_BREEDS don't have.
+-- Returns the stagger type (0 for none), why there is none, and the stagger strength the maths worked out.
+local function host_would(damage_profile, target_index, power_level, target_unit, attacker_unit, hit_zone_name, boost_curve_multiplier, is_critical_strike, blocked, damage_source)
+	local blackboard = BLACKBOARDS[target_unit]
+	local target_settings = damage_profile.targets and damage_profile.targets[target_index] or damage_profile.default_target
+	local attack_template = target_settings and DamageUtils.get_attack_template(target_settings.attack_template)
+
+	if not blackboard or not attack_template or not attacker_unit or not Unit.alive(attacker_unit) then
+		return nil
+	end
+
+	local shield = ScriptUnit.has_extension(target_unit, "ai_shield_system")
+	local shield_blocked = shield and shield.blocked_previous_attack
+	local stagger_type, duration, _, stagger_value, strength = DamageUtils.calculate_stagger_player(ImpactTypeOutput, target_unit, attacker_unit, hit_zone_name, power_level, boost_curve_multiplier, is_critical_strike, damage_profile, target_index, blocked, damage_source)
+
+	if shield then
+		shield.blocked_previous_attack = shield_blocked
+	end
+
+	strength = type(strength) == "number" and strength or 0
+
+	if type(stagger_type) ~= "number" or stagger_type <= pc.stagger_types.none then
+		-- do_stagger_calculation returns all zeros when the enemy's action ignores the stagger (damage_utils.lua:802),
+		-- as a frenzy does for light staggers.
+		return 0, stagger_value == 0 and duration == 0 and "its action ignores this stagger" or "too weak to stagger", strength
+	end
+
+	if action_ignores(blackboard, attack_template, stagger_type) then
+		return 0, blackboard.anim_cb_stagger_immune and "stagger immune (animation cue)" or "its action ignores this stagger", strength
+	end
+
+	-- AiUtils.stagger refuses this one (ai_utils.lua:1117).
+	if not attack_template.always_stagger and not damage_profile.is_push and blackboard.stagger and blackboard.stagger_type == pc.stagger_types.explosion and stagger_type ~= pc.stagger_types.explosion then
+		return 0, "already blown back", strength
+	end
+
+	return stagger_type, nil, strength
+end
+
+local function stagger_name(stagger_type)
+	return stagger_names[stagger_type] or tostring(stagger_type)
+end
+
+-- answer: the client's stagger type, 0 if it sent no stagger for that hit, or "kill".
+local function compare_check(decision, answer, answer_id)
+	if answer == "kill" then
+		pc.count("host_check_killed")
+
+		return
+	end
+
+	pc.count("host_check_compared")
+
+	local host_type = decision.stagger_type
+
+	if host_type == answer then
+		pc.count("host_check_agreed")
+
+		return
+	end
+
+	local key = host_type == 0 and "host_check_client_only" or answer == 0 and "host_check_host_only" or "host_check_different"
+	local here = host_type == 0 and "no stagger (" .. decision.reason .. ")" or stagger_name(host_type)
+	local there = answer == 0 and "no stagger" or string.format("%s (client stagger=%s)", stagger_name(answer), tostring(answer_id))
+
+	pc.count(key)
+	pc.log("host check enemy=%s from=%s profile=%s: host %s, client %s; strength=%.2f action=%s accumulated=%.2f%s", decision.breed_name, name_of(decision.peer), decision.profile, here, there, decision.strength, decision.action, decision.accumulated,
+		decision.client_first and ", the client's answer arrived before the hit" or "")
+end
+
+local function take(list, peer)
+	if list then
+		for i = 1, #list do
+			if list[i].peer == peer then
+				return table.remove(list, i)
+			end
+		end
+	end
+
+	return nil
+end
+
+-- Called from the DamageUtils.stagger_ai hook for every hit on CHECK_BREEDS whose stagger a client decides. The
+-- client's own stagger or kill for that hit follows within a moment (check_answer), or nothing, if its maths found no
+-- stagger.
+local function check_hit(damage_profile, target_index, power_level, target_unit, attacker_unit, hit_zone_name, _, boost_curve_multiplier, is_critical_strike, blocked, damage_source)
+	local blackboard = BLACKBOARDS[target_unit]
+	local breed = blackboard and blackboard.breed
+	local owner = breed and CHECK_BREEDS[breed.name] and attacker_unit and Managers.player:owner(attacker_unit)
+	local peer = owner and owner.peer_id
+
+	if not peer or type(damage_profile) ~= "table" then
+		return
+	end
+
+	local stagger_type, reason, strength = host_would(damage_profile, target_index, power_level, target_unit, attacker_unit, hit_zone_name, boost_curve_multiplier, is_critical_strike, blocked, damage_source)
+
+	if not stagger_type then
+		return
+	end
+
+	local action = blackboard.action
+	local decision = {
+		peer = peer,
+		t = pc.now(),
+		wait = skip_is_blast and BLAST_LEFT_TO_CLIENT_WAIT or LEFT_TO_CLIENT_WAIT,
+		held = skip_capture ~= nil,
+		breed_name = breed.name,
+		profile = host_reactions.profile_name(damage_profile),
+		stagger_type = stagger_type,
+		reason = reason,
+		strength = strength,
+		action = type(action) == "table" and tostring(action.name) or "none",
+		accumulated = blackboard.stagger or 0,
+	}
+	local early = take(early_answers[target_unit], peer)
+
+	if early then
+		decision.client_first = true
+
+		return compare_check(decision, early.answer, early.id)
+	end
+
+	local list = checks[target_unit] or {}
+
+	list[#list + 1] = decision
+	checks[target_unit] = list
+end
+
+-- A client's stagger (answer: its type) or kill (answer: "kill") for an enemy in CHECK_BREEDS.
+local function check_answer(unit, peer, answer, id)
+	local decision = take(checks[unit], peer)
+
+	if decision then
+		return compare_check(decision, answer, id)
+	end
+
+	local blackboard = BLACKBOARDS[unit]
+
+	if blackboard and blackboard.breed and CHECK_BREEDS[blackboard.breed.name] then
+		local list = early_answers[unit] or {}
+
+		list[#list + 1] = {
+			peer = peer,
+			answer = answer,
+			id = id,
+			t = pc.now(),
+		}
+		early_answers[unit] = list
+	end
+end
+
+local function update_checks(t)
+	for unit, list in pairs(checks) do
+		for i = #list, 1, -1 do
+			local decision = list[i]
+
+			if t - decision.t > decision.wait then
+				table.remove(list, i)
+
+				-- No stagger or kill came from the client: its maths found no stagger for that hit.
+				if HEALTH_ALIVE[unit] then
+					compare_check(decision, 0)
+				else
+					pc.count("host_check_killed")
+				end
+			end
+		end
+
+		if #list == 0 then
+			checks[unit] = nil
+		end
+	end
+
+	for unit, list in pairs(early_answers) do
+		for i = #list, 1, -1 do
+			if t - list[i].t > BLAST_LEFT_TO_CLIENT_WAIT then
+				table.remove(list, i)
+			end
+		end
+
+		if #list == 0 then
+			early_answers[unit] = nil
+		end
+	end
+end
+
 local function apply_stagger(sender, id, go_id, stagger_type, duration, length, dx, dy, dz, anim_scale, stagger_value, always_stagger, is_push, anim, yaw, x, y, z, has_position, profile_name, target_index, damage_source)
 	local function refuse(reason)
 		pc.count("host_stagger_refused")
@@ -309,6 +551,8 @@ local function apply_stagger(sender, id, go_id, stagger_type, duration, length, 
 
 	if unit then
 		left_to_client[unit] = nil
+
+		check_answer(unit, sender, stagger_type, id)
 	end
 
 	if not breed or not pc.REACTION_BREEDS[breed.name] or not HEALTH_ALIVE[unit] then
@@ -370,6 +614,50 @@ mod:network_register("pc_stagger", function (sender, version, id, go_id, stagger
 	end
 
 	pc.guard("host client stagger", apply_stagger, sender, id, go_id, stagger_type, duration, length, dx, dy, dz, anim_scale, stagger_value, always_stagger, is_push, anim, yaw, x, y, z, has_position, profile_name, target_index, damage_source)
+end)
+
+local BLAST_STAGGER_FIELDS = 15 -- values per stagger in pc_blast_staggers, in the order below
+local MAX_BLAST_STAGGER_VALUES = 20 * BLAST_STAGGER_FIELDS
+
+-- A client's blast's staggers, several to a message: per stagger id, go_id, stagger_type, duration, length, dx, dy,
+-- dz, anim_scale, stagger_value, flags (1 always_stagger, 2 is_push), the animation's and the damage profile's
+-- NetworkLookup ids, yaw, target_index. They carry no position: the host doesn't move enemies for a blast.
+mod:network_register("pc_blast_staggers", function (sender, version, damage_source, ...)
+	if pc.broken or not pc.is_server() or not pc.in_game() or version ~= pc.VERSION then
+		return
+	end
+
+	local count = select("#", ...)
+
+	if not known(NetworkLookup.damage_sources, damage_source) or count == 0 or count % BLAST_STAGGER_FIELDS ~= 0 or count > MAX_BLAST_STAGGER_VALUES then
+		pc.count("host_rejected")
+		pc.print("host rejected a malformed list of blast staggers from %s", name_of(sender))
+
+		return
+	end
+
+	local values = { ... }
+
+	pc.count("host_blast_stagger_messages")
+
+	for i = 1, count, BLAST_STAGGER_FIELDS do
+		local id, go_id, stagger_type, duration, length, dx, dy, dz, anim_scale, stagger_value, flags, anim_id, yaw, profile_id, target_index = unpack(values, i, i + BLAST_STAGGER_FIELDS - 1)
+		local anim = type(anim_id) == "number" and rawget(NetworkLookup.anims, anim_id) or nil
+		local profile_name = type(profile_id) == "number" and rawget(NetworkLookup.damage_profiles, profile_id) or nil
+		local always_stagger = flags == 1 or flags == 3
+		local is_push = flags == 2 or flags == 3
+
+		if (flags == 0 or always_stagger or is_push) and anim and profile_name and valid_stagger(id, go_id, stagger_type, duration, length, dx, dy, dz, anim_scale, stagger_value, always_stagger, is_push, anim, yaw, 0, 0, 0, false, profile_name, target_index, damage_source) then
+			pc.guard("host client stagger", apply_stagger, sender, id, go_id, stagger_type, duration, length, dx, dy, dz, anim_scale, stagger_value, always_stagger, is_push, anim, yaw, 0, 0, 0, false, profile_name, target_index, damage_source)
+		else
+			pc.count("host_rejected")
+			pc.print("host rejected a malformed blast stagger from %s", name_of(sender))
+
+			if type(id) == "number" then
+				ack(sender, "stagger", id, "rejected")
+			end
+		end
+	end
 end)
 
 -- Called before BTStaggerAction.enter. Returns the client stagger it is entering, if any.
@@ -447,7 +735,7 @@ function host_reactions.stagger_entered(node, unit, blackboard, t)
 		return
 	end
 
-	local scale = action.scale_animation_speeds and (action.stagger_animation_scale or blackboard.stagger_animation_scale or 1) or 1
+	local scale = action.scale_animation_speeds and not pc.FIXED_SPEED_STAGGER_BREEDS[breed.name] and (action.stagger_animation_scale or blackboard.stagger_animation_scale or 1) or 1
 	local watch = {
 		anim = anim,
 		scale = scale > 0 and scale or 1,
@@ -566,9 +854,14 @@ end
 -- BTBlockedAction.enter would pick (it reads blackboard.blocked_anim first).
 function host_reactions.recoil_booked(swing, blackboard, recoil)
 	if not recoil then
-		-- This recoil starts when the answer arrives, after the damage frame, and then its animation's cue can come
-		-- much later than vanilla's (marauders: 1.65 s instead of 0.95 s), so it isn't measured.
-		late_recoils[swing.attacker] = pc.now()
+		-- This recoil starts when the answer arrives, after the damage frame, so it isn't measured; its end is logged.
+		late_recoils[swing.attacker] = {
+			t = pc.now(),
+			id = swing.id,
+			peer = swing.peer,
+			frame_t = swing.blocked_frame_t,
+			blocked_attack = swing.attack_anim,
+		}
 
 		return "recoil left to the host"
 	end
@@ -585,6 +878,7 @@ function host_reactions.recoil_booked(swing, blackboard, recoil)
 		id = swing.id,
 		peer = swing.peer,
 		anim = recoil.anim,
+		blocked_attack = swing.attack_anim,
 		attack_anim = swing.action.blocked_anim,
 		position = recoil.position and Vector3Box(recoil.position) or nil,
 		frame_t = recoil.frame_t,
@@ -638,7 +932,7 @@ function host_reactions.before_recoil_enter(node, unit, blackboard)
 
 		late_recoils[unit] = nil
 
-		if not breed or not pc.REACTION_BREEDS[breed.name] or late and pc.now() - late < LATE_RECOIL_WAIT then
+		if not breed or not pc.REACTION_BREEDS[breed.name] then
 			return nil
 		end
 
@@ -646,9 +940,23 @@ function host_reactions.before_recoil_enter(node, unit, blackboard)
 			blackboard.blocked_anim = anims[Math.random(1, #anims)]
 		end
 
+		-- A client's block whose recoil the client left to the host (recoil off): not measured, but its end is logged.
+		if late and pc.now() - late.t < LATE_RECOIL_WAIT then
+			return {
+				left_to_host = true,
+				id = late.id,
+				peer = late.peer,
+				frame_t = late.frame_t,
+				anim = blackboard.blocked_anim,
+				blocked_attack = late.blocked_attack,
+				breed_name = breed.name,
+			}
+		end
+
 		return blackboard.blocked_anim and {
 			watch_only = true,
 			anim = blackboard.blocked_anim,
+			blocked_attack = attack_anims[unit],
 			breed_name = breed.name,
 		} or nil
 	end
@@ -670,6 +978,22 @@ function host_reactions.before_recoil_enter(node, unit, blackboard)
 	return record
 end
 
+-- Every recoil a client's block caused is watched until BTBlockedAction.leave, which says why it ended (recoil_ended).
+local function watch_recoil_end(unit, blackboard, t, record, kind)
+	recoil_ends[unit] = {
+		id = record.id,
+		peer = record.peer,
+		kind = kind,
+		anim = kind ~= "vanilla's animation" and record.anim or nil,
+		blocked_attack = record.blocked_attack,
+		breed_name = record.breed_name,
+		blackboard = blackboard,
+		t = t,
+		frame_t = record.frame_t,
+		leave_at = blackboard.leave_blocked_at_t,
+	}
+end
+
 function host_reactions.after_recoil_enter(unit, blackboard, t, record)
 	-- Only the host's own recoils, which start at the damage frame as in vanilla, are measured. A client's starts when
 	-- its answer arrives, and its cue can then come later than vanilla's; the client measures its own copy instead,
@@ -677,6 +1001,7 @@ function host_reactions.after_recoil_enter(unit, blackboard, t, record)
 	if record.watch_only then
 		cue_watch[unit] = {
 			anim = record.anim,
+			blocked_attack = record.blocked_attack,
 			breed_name = record.breed_name,
 			t = t,
 		}
@@ -684,9 +1009,16 @@ function host_reactions.after_recoil_enter(unit, blackboard, t, record)
 		return
 	end
 
+	if record.left_to_host then
+		watch_recoil_end(unit, blackboard, t, record, "left to the host")
+
+		return
+	end
+
 	if record.refused then
 		pc.count("host_recoil_own_animation")
 		ack(record.peer, "recoil", record.id, "rejected")
+		watch_recoil_end(unit, blackboard, t, record, "vanilla's animation")
 
 		return
 	end
@@ -707,6 +1039,7 @@ function host_reactions.after_recoil_enter(unit, blackboard, t, record)
 		breed_name = record.breed_name,
 	}
 
+	watch_recoil_end(unit, blackboard, t, record, "predicted")
 	pc.count("host_recoil_applied")
 
 	if record.moved and record.moved > 0 then
@@ -738,7 +1071,8 @@ function host_reactions.before_recoil_run(unit, blackboard, t)
 		return
 	end
 
-	local cue = pc.timings.get("cue", record.breed_name, record.anim)
+	-- A breed whose cue depends on the attack that was blocked waits for its animation's own cue (pc.VARIABLE_CUE_BREEDS).
+	local cue = not pc.VARIABLE_CUE_BREEDS[record.breed_name] and pc.timings.get("cue", record.breed_name, record.anim) or nil
 
 	if not cue then
 		if blackboard.anim_cb_blocked_cooldown then
@@ -766,6 +1100,12 @@ function host_reactions.before_recoil_run(unit, blackboard, t)
 	blackboard.anim_cb_blocked_cooldown = true
 	timed_recoils[unit] = nil
 
+	local watch = recoil_ends[unit]
+
+	if watch then
+		watch.cue_learned = true
+	end
+
 	pc.count("host_recoil_cue_brought_forward")
 end
 
@@ -784,11 +1124,102 @@ function host_reactions.recoil_cue(unit)
 		return
 	end
 
-	pc.timings.learn("cue", watch.breed_name, watch.anim, pc.now() - watch.t)
+	pc.timings.learn("cue", watch.breed_name, watch.anim, pc.now() - watch.t, watch.blocked_attack)
 end
 
 function host_reactions.has_timed_recoil(unit)
 	return timed_recoils[unit] ~= nil
+end
+
+-- Called from the BTAttackAction.enter hook in Host.lua for every single attack.
+function host_reactions.note_attack(unit, anim)
+	attack_anims[unit] = anim
+end
+
+-- Called from the BTBlockedAction.run hook, after before_recoil_run, for a recoil watched for its end: when its cue
+-- flag was first set, by the animation's own cue or brought forward to the learned cue time.
+function host_reactions.note_recoil_cue(unit, blackboard, t)
+	local record = recoil_ends[unit]
+
+	if record.blackboard == blackboard and not record.cue_t and blackboard.anim_cb_blocked_cooldown then
+		record.cue_t = t
+	end
+end
+
+-- Who staggered an enemy out of a recoil: the player whose client decided it, or the owner of blackboard.pushing_unit,
+-- which AiUtils.stagger sets to the attacker.
+local function stagger_cause(unit, blackboard, record)
+	local pending = staggers[unit]
+
+	if pending then
+		return string.format("%s's hit, decided on their screen%s", name_of(pending.peer), pending.peer == record.peer and " (the blocker)" or "")
+	end
+
+	local pusher = blackboard.pushing_unit
+	local owner = pusher and Unit.alive(pusher) and Managers.player:owner(pusher)
+
+	if owner then
+		local who = owner.bot_player and "a bot's" or owner.peer_id == record.peer and "the blocker's" or owner.local_player and "the host's" or "another player's"
+
+		return string.format("%s's hit (%s), decided here", owner:name(), who)
+	end
+
+	local breed = pusher and Unit.alive(pusher) and Unit.get_data(pusher, "breed")
+
+	return breed and string.format("a %s", breed.name) or "something else"
+end
+
+-- Called from the BTBlockedAction.leave hook for a recoil a client's block caused. reason "done" means its run ended
+-- it (timer and cue); otherwise a higher branch of the behaviour tree took over (a stagger, a fall), or the enemy died
+-- or was removed (destroy).
+function host_reactions.recoil_ended(unit, blackboard, t, reason, destroy)
+	local record = recoil_ends[unit]
+
+	recoil_ends[unit] = nil
+
+	if record.blackboard ~= blackboard then
+		return
+	end
+
+	local why, key
+
+	if reason == "done" then
+		local cue_last = record.cue_t ~= nil and record.leave_at ~= nil and record.cue_t > record.leave_at
+
+		key = "done"
+		why = cue_last and "its cue, after its timer" or "its timer, after its cue"
+
+		if cue_last then
+			pc.count("host_recoil_end_cue_last")
+		end
+	elseif destroy then
+		key = HEALTH_ALIVE[unit] and "other" or "death"
+		why = HEALTH_ALIVE[unit] and "the enemy was removed" or "death"
+	elseif blackboard.stagger then
+		local cause = stagger_cause(unit, blackboard, record)
+
+		key = "stagger"
+		why = "a stagger, " .. cause
+
+		if not string.find(cause, "the blocker", 1, true) then
+			pc.count("host_recoil_end_stagger_other")
+		end
+	else
+		key = "other"
+		why = blackboard.is_falling and "a fall" or blackboard.in_vortex and "a vortex" or "the behaviour tree (" .. tostring(reason) .. ")"
+	end
+
+	pc.count("host_recoil_end_" .. key)
+
+	-- lasted, cue and timer_left count from the recoil's start here; from_frame from the host's damage frame, which is
+	-- what the blocker's lasted= counts from on their screen.
+	local cue = record.cue_t and string.format("%.3fs%s", record.cue_t - record.t, record.cue_learned and " (learned)" or "") or "not reached"
+	local known = record.anim and pc.timings.get("cue", record.breed_name, record.anim)
+
+	local known_cue = pc.VARIABLE_CUE_BREEDS[record.breed_name] and "not used (varies)" or known and string.format("%.2fs", known) or "none"
+
+	pc.log("host swing=%d recoil=%s enemy=%s ended: %s; kind=%s blocker=%s after=%s from_frame=%s lasted=%.3fs timer_left=%s cue=%s known_cue=%s", record.id, tostring(record.anim or "vanilla's"), record.breed_name, why, record.kind, name_of(record.peer), tostring(record.blocked_attack),
+		record.frame_t and string.format("%.3fs", t - record.frame_t) or "n/a", t - record.t, record.leave_at and string.format("%.3fs", record.leave_at - t) or "n/a", cue, known_cue)
 end
 
 local function schedule_kill(sender, id, go_id, hit_zone, damage_type, dx, dy, dz, damage_source)
@@ -796,6 +1227,8 @@ local function schedule_kill(sender, id, go_id, hit_zone, damage_type, dx, dy, d
 
 	if unit then
 		left_to_client[unit] = nil
+
+		check_answer(unit, sender, "kill", id)
 	end
 
 	if not unit or not HEALTH_ALIVE[unit] then
@@ -889,9 +1322,18 @@ function host_reactions.update()
 		end
 	end
 
+	-- BTBlockedAction.leave runs for every recoil, even on death, so this only catches an enemy removed without it.
+	for unit, record in pairs(recoil_ends) do
+		if t - record.t > RECOIL_END_LIMIT or not Unit.alive(unit) or BLACKBOARDS[unit] ~= record.blackboard then
+			recoil_ends[unit] = nil
+		end
+	end
+
+	update_checks(t)
+
 	-- A stagger skipped here that no client stagger or kill followed: the enemy didn't stagger anywhere.
 	for unit, skip in pairs(left_to_client) do
-		if t - skip.t > LEFT_TO_CLIENT_WAIT then
+		if t - skip.t > skip.wait then
 			left_to_client[unit] = nil
 
 			if HEALTH_ALIVE[unit] then
@@ -917,15 +1359,20 @@ end
 function host_reactions.clear()
 	skip_stagger_for = nil
 	skip_capture = nil
+	skip_is_blast = false
 	forcing = nil
 	staggers = {}
 	recoils = {}
 	timed_recoils = {}
+	recoil_ends = {}
 	kills = {}
 	stagger_watch = {}
 	cue_watch = {}
 	late_recoils = {}
 	left_to_client = {}
+	attack_anims = {}
+	checks = {}
+	early_answers = {}
 
 	pc.timings.save()
 end
@@ -967,6 +1414,8 @@ local function note_left_to_client(target_unit, damage_profile)
 
 	left_to_client[target_unit] = {
 		t = pc.now(),
+		-- A big blast's staggers can reach the host over a second or more (the build 3 playtest's shouts).
+		wait = skip_is_blast and BLAST_LEFT_TO_CLIENT_WAIT or LEFT_TO_CLIENT_WAIT,
 		breed_name = blackboard and blackboard.breed and blackboard.breed.name or "unknown",
 		profile = profile_name(damage_profile),
 	}
@@ -1007,22 +1456,39 @@ end)
 function host_reactions.begin_skip(unit, on_skip)
 	skip_stagger_for = unit
 	skip_capture = on_skip
+	skip_is_blast = true
 end
 
 function host_reactions.end_skip()
 	skip_stagger_for = nil
 	skip_capture = nil
+	skip_is_blast = false
 end
 
--- The host is staggering this enemy itself after all, so its skip isn't waiting for the client any more.
+-- The host is staggering this enemy itself after all, so its skip isn't waiting for the client any more, and neither is
+-- the host's own check of that stagger.
 function host_reactions.forget_left_to_client(unit)
 	left_to_client[unit] = nil
+
+	local list = checks[unit]
+
+	if list then
+		for i = 1, #list do
+			if list[i].held then
+				table.remove(list, i)
+
+				break
+			end
+		end
+	end
 end
 
 mod:hook("DamageUtils", "stagger_ai", function (func, t, damage_profile, target_index, power_level, target_unit, ...)
 	if skip_stagger_for ~= nil and skip_stagger_for == target_unit then
 		pc.count("host_stagger_left_to_client")
 		pc.guard("host skipped stagger", note_left_to_client, target_unit, damage_profile)
+		-- Before note_shield_block, so the check's maths sees the shield as the skipped call would have.
+		pc.guard("host stagger check", check_hit, damage_profile, target_index, power_level, target_unit, ...)
 		pc.guard("host skipped stagger", note_shield_block, target_unit, (select(6, ...)))
 
 		if skip_capture then
@@ -1076,5 +1542,17 @@ mod:hook("BTBlockedAction", "run", function (func, self, unit, blackboard, t, dt
 		pc.guard("host recoil timing", host_reactions.before_recoil_run, unit, blackboard, t)
 	end
 
+	if recoil_ends[unit] ~= nil then
+		pc.guard("host recoil end", host_reactions.note_recoil_cue, unit, blackboard, t)
+	end
+
 	return func(self, unit, blackboard, t, dt)
+end)
+
+-- Every recoil leaves through here: reason "done" when its run ended it, "aborted" when a higher branch of the
+-- behaviour tree took over, and destroy when the enemy died or was removed (bt_node.lua:87, ai_brain.lua:79).
+mod:hook_safe("BTBlockedAction", "leave", function (self, unit, blackboard, t, reason, destroy)
+	if recoil_ends[unit] ~= nil then
+		pc.guard("host recoil end", host_reactions.recoil_ended, unit, blackboard, t, reason, destroy)
+	end
 end)

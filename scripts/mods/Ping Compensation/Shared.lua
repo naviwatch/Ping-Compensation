@@ -1,7 +1,7 @@
 local mod = get_mod("Ping Compensation")
 
 -- Host and client must run the same VERSION. Bump it whenever any message in CLAUDE.md's "Network messages" changes.
-local VERSION = 8
+local VERSION = 9
 
 -- Playtest builds write the debug log by default, so testers don't have to remember /pingcomp debug on. Set this to
 -- false for a public release: players who want the log can still switch it on, and their choice is remembered.
@@ -42,6 +42,23 @@ local pc = {
 		skaven_plague_monk = true,
 		chaos_berzerker = true,
 		skaven_storm_vermin_with_shield = true,
+	},
+	-- Breeds whose stagger animations ignore the stagger_scale variable, though their stagger actions set
+	-- scale_animation_speeds (build 3: 68-78% of the speed asked, about normal speed). The host ends their client
+	-- staggers early on the timer instead (D42), and their stagger lengths are measured at normal speed.
+	FIXED_SPEED_STAGGER_BREEDS = {
+		chaos_marauder = true,
+		chaos_marauder_with_shield = true,
+		chaos_fanatic = true,
+		chaos_berzerker = true,
+	},
+	-- Breeds whose recoil cue isn't a fixed property of the recoil animation: the fanatic's one recoil (blocked)
+	-- reached its cue 0.95 to 2.37 s in, depending on the swing that was blocked (build 3 playtest). The host doesn't
+	-- bring their cue forward to a shipped or learned time (D14); it waits for the animation's own cue, which never
+	-- cuts the recoil short and leaves the blocker about a ping of extra recoil. The timing lines name the blocked
+	-- attack's animation, to find out whether the cue follows it.
+	VARIABLE_CUE_BREEDS = {
+		chaos_fanatic = true,
 	},
 	broken = false, -- set after repeated errors; the mod then leaves everything to vanilla
 	stats = {},

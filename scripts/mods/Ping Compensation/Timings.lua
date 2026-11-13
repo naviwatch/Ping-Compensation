@@ -33,64 +33,86 @@ local SETTINGS = {
 }
 
 -- Seconds: the median of each animation's readings from the 2026-11-12 playtests of steps 2 and 2.1 (host and client
--- stagger lengths, the client's recoil cues) and of step 2.2 (the host's stagger lengths; its recoil cues were timed
--- from the wrong start and left out), with how many there were. Readings under 0.3 s or under half the median were
--- dropped. "saved average": measured on the testers' machines in earlier sessions, not in these logs.
+-- stagger lengths, the client's recoil cues), of step 2.2 (the host's stagger lengths; its recoil cues were timed
+-- from the wrong start and left out) and of build 3 on 2026-11-13 (host and clients, but the Chaos breeds' stagger
+-- lengths from the host only, and new animations only with two readings or more), with how many there were. Readings
+-- under 0.3 s or under half the median were dropped. "saved average": measured on the testers' machines in earlier
+-- sessions, not in these logs. The fanatic has no recoil cue: it depends on the attack blocked (VARIABLE_CUE_BREEDS).
 local DEFAULTS = {
 	length = {
+		chaos_berzerker = {
+			run_stagger_left = 0.79, -- 17
+			stagger_bwd = 1.15, -- 3
+			stagger_bwd_2 = 1.28, -- 4
+			stagger_bwd_3 = 1.18, -- 5
+			stagger_bwd_heavy = 2.52, -- 3
+			stagger_bwd_heavy_2 = 2.86, -- 3
+			stagger_bwd_heavy_3 = 2.51, -- 5
+			stagger_bwd_heavy_4 = 2.58, -- 5
+			stagger_bwd_light = 0.73, -- 4
+			stagger_bwd_light_2 = 0.71, -- 4
+			stagger_bwd_light_4 = 0.66, -- 4
+			stagger_bwd_light_5 = 0.73, -- 3
+			stagger_bwd_light_6 = 0.88, -- 5
+			stagger_bwd_light_7 = 0.81, -- 3
+			stagger_left = 0.83, -- 4
+			stagger_left_light = 0.74, -- 6
+			stagger_left_light_4 = 0.85, -- 2
+			stagger_right_heavy_3 = 2.55, -- 2
+		},
 		chaos_fanatic = {
-			stagger_bwd = 1.16, -- 54
-			stagger_bwd_2 = 1.28, -- 64
-			stagger_bwd_3 = 1.18, -- 60
-			stagger_bwd_4 = 1.12, -- 55
+			stagger_bwd = 1.16, -- 78
+			stagger_bwd_2 = 1.28, -- 98
+			stagger_bwd_3 = 1.18, -- 92
+			stagger_bwd_4 = 1.12, -- 89
 			stagger_bwd_heavy = 2.67, -- 11
 			stagger_bwd_heavy_2 = 2.92, -- 11
 			stagger_bwd_heavy_3 = 2.66, -- 10
 			stagger_bwd_heavy_4 = 2.64, -- 5
-			stagger_bwd_light = 0.74, -- 65
-			stagger_bwd_light_2 = 0.71, -- 41
-			stagger_bwd_light_3 = 0.69, -- 56
-			stagger_bwd_light_4 = 0.67, -- 50
-			stagger_bwd_light_5 = 0.74, -- 55
-			stagger_bwd_light_6 = 0.88, -- 39
-			stagger_bwd_light_7 = 0.81, -- 51
-			stagger_bwd_light_8 = 0.71, -- 45
+			stagger_bwd_light = 0.74, -- 66
+			stagger_bwd_light_2 = 0.71, -- 43
+			stagger_bwd_light_3 = 0.69, -- 63
+			stagger_bwd_light_4 = 0.67, -- 53
+			stagger_bwd_light_5 = 0.74, -- 60
+			stagger_bwd_light_6 = 0.88, -- 40
+			stagger_bwd_light_7 = 0.81, -- 53
+			stagger_bwd_light_8 = 0.71, -- 47
 			stagger_fwd = 1.18, -- 7
 			stagger_fwd_2 = 1.20, -- 5
-			stagger_fwd_3 = 1.12, -- 4
+			stagger_fwd_3 = 1.12, -- 5
 			stagger_fwd_4 = 1.18, -- 4
 			stagger_fwd_heavy_2 = 2.96, -- 1
-			stagger_fwd_light = 0.74, -- 19
-			stagger_fwd_light_2 = 0.74, -- 9
-			stagger_fwd_light_3 = 0.74, -- 13
-			stagger_fwd_light_4 = 0.97, -- 22
-			stagger_fwd_light_5 = 0.98, -- 13
-			stagger_fwd_light_6 = 0.97, -- 12
+			stagger_fwd_light = 0.74, -- 20
+			stagger_fwd_light_2 = 0.74, -- 13
+			stagger_fwd_light_3 = 0.74, -- 14
+			stagger_fwd_light_4 = 0.97, -- 23
+			stagger_fwd_light_5 = 0.98, -- 15
+			stagger_fwd_light_6 = 0.97, -- 14
 			stagger_left = 0.84, -- 15
-			stagger_left_2 = 1.20, -- 11
+			stagger_left_2 = 1.20, -- 13
 			stagger_left_3 = 1.38, -- 13
-			stagger_left_4 = 1.38, -- 7
-			stagger_left_5 = 1.15, -- 24
+			stagger_left_4 = 1.38, -- 8
+			stagger_left_5 = 1.15, -- 26
 			stagger_left_heavy = 2.58, -- 2
 			stagger_left_heavy_3 = 2.52, -- 3
 			stagger_left_heavy_4 = 2.63, -- 2
-			stagger_left_light = 0.74, -- 46
-			stagger_left_light_2 = 0.88, -- 32
-			stagger_left_light_3 = 0.88, -- 33
+			stagger_left_light = 0.74, -- 52
+			stagger_left_light_2 = 0.88, -- 38
+			stagger_left_light_3 = 0.88, -- 37
 			stagger_left_light_4 = 0.86, -- 37
-			stagger_right = 1.10, -- 19
-			stagger_right_2 = 1.35, -- 9
-			stagger_right_3 = 1.36, -- 16
-			stagger_right_4 = 1.23, -- 8
-			stagger_right_5 = 1.20, -- 14
+			stagger_right = 1.10, -- 24
+			stagger_right_2 = 1.35, -- 13
+			stagger_right_3 = 1.36, -- 20
+			stagger_right_4 = 1.23, -- 11
+			stagger_right_5 = 1.20, -- 16
 			stagger_right_heavy = 1.97, -- 5
 			stagger_right_heavy_2 = 2.54, -- 2
 			stagger_right_heavy_3 = 2.55, -- 2
 			stagger_right_heavy_4 = 2.73, -- 1
-			stagger_right_light = 0.74, -- 43
-			stagger_right_light_2 = 0.76, -- 36
-			stagger_right_light_3 = 0.95, -- 51
-			stagger_right_light_4 = 0.74, -- 78
+			stagger_right_light = 0.74, -- 45
+			stagger_right_light_2 = 0.76, -- 38
+			stagger_right_light_3 = 0.95, -- 54
+			stagger_right_light_4 = 0.74, -- 81
 			stagger_up_heavy = 3.59, -- 6
 			stagger_up_heavy_2 = 3.40, -- 3
 			stagger_up_heavy_3 = 3.49, -- 7
@@ -98,45 +120,45 @@ local DEFAULTS = {
 			stun_down = 0.69, -- 1
 		},
 		chaos_marauder = {
-			stagger_bwd = 1.27, -- 43
-			stagger_bwd_2 = 1.40, -- 58
-			stagger_bwd_3 = 1.37, -- 59
-			stagger_bwd_4 = 1.29, -- 45
+			stagger_bwd = 1.27, -- 47
+			stagger_bwd_2 = 1.40, -- 73
+			stagger_bwd_3 = 1.37, -- 69
+			stagger_bwd_4 = 1.29, -- 57
 			stagger_bwd_heavy = 2.52, -- 1
 			stagger_bwd_heavy_2 = 2.92, -- 3
 			stagger_bwd_heavy_3 = 2.48, -- 1
 			stagger_bwd_heavy_4 = 2.57, -- saved average
-			stagger_bwd_light = 0.74, -- 188
-			stagger_bwd_light_2 = 0.71, -- 163
-			stagger_bwd_light_3 = 0.69, -- 150
-			stagger_bwd_light_4 = 0.67, -- 156
-			stagger_bwd_light_5 = 0.74, -- 173
-			stagger_bwd_light_6 = 0.88, -- 145
-			stagger_bwd_light_7 = 0.81, -- 147
-			stagger_bwd_light_8 = 0.71, -- 159
+			stagger_bwd_light = 0.74, -- 190
+			stagger_bwd_light_2 = 0.71, -- 168
+			stagger_bwd_light_3 = 0.69, -- 155
+			stagger_bwd_light_4 = 0.67, -- 157
+			stagger_bwd_light_5 = 0.74, -- 177
+			stagger_bwd_light_6 = 0.88, -- 146
+			stagger_bwd_light_7 = 0.81, -- 150
+			stagger_bwd_light_8 = 0.71, -- 160
 			stagger_explosion_back_2 = 4.21, -- 1
 			stagger_fwd = 1.18, -- 5
 			stagger_fwd_2 = 1.20, -- 8
 			stagger_fwd_3 = 1.13, -- 6
 			stagger_fwd_4 = 1.17, -- 4
-			stagger_fwd_light = 0.74, -- 30
+			stagger_fwd_light = 0.74, -- 32
 			stagger_fwd_light_2 = 0.74, -- 40
 			stagger_fwd_light_3 = 0.74, -- 32
 			stagger_fwd_light_4 = 0.98, -- 25
-			stagger_fwd_light_5 = 0.98, -- 25
-			stagger_fwd_light_6 = 0.98, -- 23
+			stagger_fwd_light_5 = 0.98, -- 26
+			stagger_fwd_light_6 = 0.98, -- 25
 			stagger_left = 0.97, -- 9
-			stagger_left_2 = 1.20, -- 11
-			stagger_left_3 = 1.38, -- 7
-			stagger_left_4 = 1.38, -- 15
-			stagger_left_5 = 1.15, -- 6
+			stagger_left_2 = 1.20, -- 12
+			stagger_left_3 = 1.38, -- 8
+			stagger_left_4 = 1.38, -- 16
+			stagger_left_5 = 1.15, -- 7
 			stagger_left_heavy = 2.58, -- 1
 			stagger_left_heavy_2 = 2.77, -- 1
 			stagger_left_heavy_4 = 2.63, -- 2
 			stagger_left_light = 0.74, -- 145
-			stagger_left_light_2 = 0.88, -- 131
+			stagger_left_light_2 = 0.88, -- 133
 			stagger_left_light_3 = 0.88, -- 117
-			stagger_left_light_4 = 0.86, -- 135
+			stagger_left_light_4 = 0.86, -- 138
 			stagger_right = 1.10, -- 12
 			stagger_right_2 = 1.36, -- 8
 			stagger_right_3 = 1.36, -- 9
@@ -144,10 +166,10 @@ local DEFAULTS = {
 			stagger_right_5 = 1.19, -- 7
 			stagger_right_heavy = 1.97, -- 2
 			stagger_right_heavy_4 = 2.74, -- saved average
-			stagger_right_light = 0.74, -- 150
-			stagger_right_light_2 = 0.76, -- 133
-			stagger_right_light_3 = 0.95, -- 114
-			stagger_right_light_4 = 0.74, -- 126
+			stagger_right_light = 0.74, -- 152
+			stagger_right_light_2 = 0.76, -- 135
+			stagger_right_light_3 = 0.95, -- 117
+			stagger_right_light_4 = 0.74, -- 129
 			stagger_up_heavy = 3.52, -- 1
 			stagger_up_heavy_2 = 3.41, -- saved average
 			stagger_up_heavy_3 = 3.38, -- saved average
@@ -207,11 +229,11 @@ local DEFAULTS = {
 			stun_bwd_ranged_light_2 = 1.39, -- 1
 		},
 		skaven_clan_rat = {
-			stagger_bwd = 0.99, -- 145
-			stagger_bwd_2 = 0.92, -- 138
-			stagger_bwd_3 = 0.86, -- 145
-			stagger_bwd_4 = 1.06, -- 104
-			stagger_bwd_5 = 0.86, -- 107
+			stagger_bwd = 0.99, -- 234
+			stagger_bwd_2 = 0.92, -- 220
+			stagger_bwd_3 = 0.86, -- 192
+			stagger_bwd_4 = 1.06, -- 154
+			stagger_bwd_5 = 0.86, -- 177
 			stagger_bwd_exp = 3.57, -- 48
 			stagger_bwd_exp_2 = 3.82, -- 41
 			stagger_bwd_fall = 2.05, -- 8
@@ -220,45 +242,45 @@ local DEFAULTS = {
 			stagger_bwd_heavy_2 = 1.72, -- 3
 			stagger_bwd_heavy_3 = 2.01, -- 5
 			stagger_bwd_heavy_4 = 1.82, -- 9
-			stagger_fwd = 0.99, -- 39
+			stagger_fwd = 0.99, -- 43
 			stagger_fwd_2 = 1.02, -- 25
-			stagger_fwd_3 = 0.99, -- 17
-			stagger_fwd_4 = 1.02, -- 22
+			stagger_fwd_3 = 0.99, -- 18
+			stagger_fwd_4 = 1.02, -- 26
 			stagger_fwd_exp = 2.42, -- 4
 			stagger_fwd_exp_2 = 2.66, -- 6
-			stagger_left = 0.96, -- 62
-			stagger_left_2 = 0.92, -- 44
-			stagger_left_3 = 0.89, -- 48
-			stagger_left_4 = 1.02, -- 45
+			stagger_left = 0.96, -- 75
+			stagger_left_2 = 0.92, -- 61
+			stagger_left_3 = 0.89, -- 72
+			stagger_left_4 = 1.02, -- 69
 			stagger_left_exp = 3.16, -- 11
 			stagger_left_exp_2 = 3.52, -- 9
 			stagger_left_heavy = 1.52, -- 2
 			stagger_left_heavy_2 = 1.90, -- 1
 			stagger_left_heavy_4 = 2.01, -- 3
 			stagger_left_heavy_5 = 1.85, -- 2
-			stagger_right = 0.96, -- 51
-			stagger_right_2 = 0.96, -- 44
-			stagger_right_3 = 0.96, -- 39
-			stagger_right_4 = 1.12, -- 30
+			stagger_right = 0.96, -- 67
+			stagger_right_2 = 0.96, -- 48
+			stagger_right_3 = 0.96, -- 62
+			stagger_right_4 = 1.12, -- 50
 			stagger_right_exp = 3.59, -- 13
 			stagger_right_exp_2 = 3.06, -- 20
 			stagger_right_heavy = 2.08, -- 1
 			stagger_right_heavy_2 = 2.09, -- 2
 			stagger_right_heavy_3 = 1.42, -- 2
 			stagger_right_heavy_5 = 1.51, -- 2
-			stun_bwd_sword = 0.63, -- 277
-			stun_down = 0.64, -- 10
+			stun_bwd_sword = 0.63, -- 291
+			stun_down = 0.64, -- 11
 			stun_fwd_ranged_light = 0.62, -- 1
 			stun_fwd_ranged_light_2 = 0.63, -- 1
-			stun_fwd_sword = 0.62, -- 1458
+			stun_fwd_sword = 0.62, -- 1917
 			stun_left_ranged_light_2 = 0.63, -- 1
-			stun_left_sword = 0.62, -- 229
-			stun_left_sword_2 = 0.62, -- 224
-			stun_left_sword_3 = 0.62, -- 235
+			stun_left_sword = 0.62, -- 252
+			stun_left_sword_2 = 0.62, -- 258
+			stun_left_sword_3 = 0.62, -- 287
 			stun_right_ranged_light = 0.63, -- 1
-			stun_right_sword = 0.62, -- 217
-			stun_right_sword_2 = 0.62, -- 206
-			stun_right_sword_3 = 0.62, -- 221
+			stun_right_sword = 0.62, -- 277
+			stun_right_sword_2 = 0.62, -- 267
+			stun_right_sword_3 = 0.62, -- 246
 		},
 		skaven_clan_rat_with_shield = {
 			stagger_bwd = 0.96, -- 69
@@ -308,68 +330,77 @@ local DEFAULTS = {
 			stun_right_sword_2 = 0.66, -- 12
 			stun_right_sword_3 = 0.67, -- 11
 		},
+		skaven_plague_monk = {
+			stagger_bwd = 1.02, -- 17
+			stagger_bwd_2 = 0.92, -- 8
+			stagger_right = 1.02, -- 2
+			stun_bwd_sword = 0.69, -- 2
+			stun_fwd_sword = 0.69, -- 20
+			stun_right_sword = 0.66, -- 29
+		},
 		skaven_slave = {
-			stagger_bwd = 0.98, -- 125
-			stagger_bwd_2 = 0.92, -- 141
-			stagger_bwd_3 = 0.85, -- 122
-			stagger_bwd_4 = 1.05, -- 130
-			stagger_bwd_5 = 0.85, -- 121
+			stagger_bwd = 0.99, -- 393
+			stagger_bwd_2 = 0.92, -- 369
+			stagger_bwd_3 = 0.85, -- 405
+			stagger_bwd_4 = 1.05, -- 429
+			stagger_bwd_5 = 0.85, -- 396
 			stagger_bwd_exp = 3.57, -- 22
 			stagger_bwd_exp_2 = 3.83, -- 12
-			stagger_bwd_fall = 2.05, -- 11
-			stagger_bwd_fall_2 = 1.42, -- 6
-			stagger_bwd_heavy = 1.61, -- 8
-			stagger_bwd_heavy_2 = 1.72, -- 4
-			stagger_bwd_heavy_3 = 2.02, -- 5
-			stagger_bwd_heavy_4 = 1.81, -- 5
-			stagger_fwd = 0.99, -- 42
-			stagger_fwd_2 = 1.02, -- 25
-			stagger_fwd_3 = 0.99, -- 23
-			stagger_fwd_4 = 1.02, -- 24
+			stagger_bwd_fall = 2.05, -- 12
+			stagger_bwd_fall_2 = 1.42, -- 13
+			stagger_bwd_heavy = 1.61, -- 16
+			stagger_bwd_heavy_2 = 1.72, -- 12
+			stagger_bwd_heavy_3 = 2.02, -- 9
+			stagger_bwd_heavy_4 = 1.81, -- 9
+			stagger_fwd = 0.99, -- 71
+			stagger_fwd_2 = 1.02, -- 40
+			stagger_fwd_3 = 0.99, -- 39
+			stagger_fwd_4 = 1.02, -- 37
 			stagger_fwd_exp = 2.42, -- 3
 			stagger_fwd_exp_2 = 2.66, -- 3
-			stagger_left = 0.96, -- 47
-			stagger_left_2 = 0.92, -- 32
-			stagger_left_3 = 0.89, -- 45
-			stagger_left_4 = 1.02, -- 53
+			stagger_left = 0.96, -- 107
+			stagger_left_2 = 0.92, -- 79
+			stagger_left_3 = 0.89, -- 90
+			stagger_left_4 = 1.02, -- 119
 			stagger_left_exp = 3.16, -- 5
 			stagger_left_exp_2 = 3.53, -- 3
+			stagger_left_heavy = 1.52, -- 2
 			stagger_left_heavy_3 = 1.55, -- 7
-			stagger_left_heavy_4 = 2.02, -- 3
-			stagger_left_heavy_5 = 1.85, -- 3
-			stagger_right = 0.95, -- 26
-			stagger_right_2 = 0.95, -- 32
-			stagger_right_3 = 0.95, -- 39
-			stagger_right_4 = 1.12, -- 46
+			stagger_left_heavy_4 = 2.02, -- 5
+			stagger_left_heavy_5 = 1.85, -- 7
+			stagger_right = 0.95, -- 118
+			stagger_right_2 = 0.95, -- 97
+			stagger_right_3 = 0.95, -- 113
+			stagger_right_4 = 1.12, -- 121
 			stagger_right_exp = 3.59, -- 3
 			stagger_right_exp_2 = 3.06, -- 6
 			stagger_right_heavy = 2.09, -- 1
 			stagger_right_heavy_3 = 1.42, -- 4
 			stagger_right_heavy_4 = 1.82, -- 1
-			stun_bwd_sword = 0.80, -- 175
+			stun_bwd_sword = 0.80, -- 235
 			stun_down = 0.62, -- 1
-			stun_fwd_sword = 0.62, -- 816
-			stun_left_sword = 0.62, -- 130
-			stun_left_sword_2 = 0.62, -- 140
-			stun_left_sword_3 = 0.62, -- 116
-			stun_right_sword = 0.62, -- 201
-			stun_right_sword_2 = 0.62, -- 185
-			stun_right_sword_3 = 0.62, -- 197
+			stun_fwd_sword = 0.62, -- 1571
+			stun_left_sword = 0.62, -- 197
+			stun_left_sword_2 = 0.62, -- 225
+			stun_left_sword_3 = 0.62, -- 179
+			stun_right_sword = 0.62, -- 296
+			stun_right_sword_2 = 0.62, -- 272
+			stun_right_sword_3 = 0.62, -- 338
 		},
 	},
 	cue = {
 		chaos_marauder = {
-			blocked = 0.95, -- 23
+			blocked = 0.95, -- 34
 		},
 		skaven_clan_rat = {
-			blocked = 0.82, -- 6
-			blocked_2 = 1.02, -- 5
-			blocked_3 = 0.68, -- 2
+			blocked = 0.81, -- 114
+			blocked_2 = 1.01, -- 140
+			blocked_3 = 0.68, -- 139
 		},
 		skaven_slave = {
-			blocked = 0.82, -- 8
-			blocked_2 = 1.02, -- 6
-			blocked_3 = 0.69, -- 5
+			blocked = 0.82, -- 14
+			blocked_2 = 1.02, -- 13
+			blocked_3 = 0.69, -- 6
 		},
 	},
 }
@@ -426,16 +457,19 @@ function timings.get(kind, breed_name, anim)
 	return default and default[anim] or nil
 end
 
-function timings.learn(kind, breed_name, anim, seconds)
+-- after: for a recoil cue, the animation of the attack that was blocked, if known. It only goes into the log line
+-- (build 3.1: the fanatic's cue seems to depend on it, see pc.VARIABLE_CUE_BREEDS).
+function timings.learn(kind, breed_name, anim, seconds, after)
 	if type(breed_name) ~= "string" or type(anim) ~= "string" or type(seconds) ~= "number" then
 		return
 	end
 
 	local known = timings.get(kind, breed_name, anim)
+	local suffix = type(after) == "string" and " after=" .. after or ""
 
 	if seconds < MIN_SECONDS[kind] or seconds > MAX_SECONDS or known and seconds < known * MIN_SHARE then
 		pc.count("timings_ignored_" .. kind)
-		pc.log("timing %s breed=%s anim=%s seconds=%.3f ignored: not this animation's own (known %s)", kind, breed_name, anim, seconds, known and string.format("%.3f", known) or "none")
+		pc.log("timing %s breed=%s anim=%s seconds=%.3f%s ignored: not this animation's own (known %s)", kind, breed_name, anim, seconds, suffix, known and string.format("%.3f", known) or "none")
 
 		return
 	end
@@ -446,7 +480,7 @@ function timings.learn(kind, breed_name, anim, seconds)
 
 	if default and seconds > default * MAX_SHARE then
 		pc.count("timings_ignored_" .. kind)
-		pc.log("timing %s breed=%s anim=%s seconds=%.3f ignored: far longer than this animation's own (shipped %.3f)", kind, breed_name, anim, seconds, default)
+		pc.log("timing %s breed=%s anim=%s seconds=%.3f%s ignored: far longer than this animation's own (shipped %.3f)", kind, breed_name, anim, seconds, suffix, default)
 
 		return
 	end
@@ -466,7 +500,7 @@ function timings.learn(kind, breed_name, anim, seconds)
 	dirty[kind] = true
 
 	pc.count("timings_measured_" .. kind)
-	pc.log("timing %s breed=%s anim=%s seconds=%.3f", kind, breed_name, anim, seconds)
+	pc.log("timing %s breed=%s anim=%s seconds=%.3f%s", kind, breed_name, anim, seconds, suffix)
 end
 
 local function known(kind)

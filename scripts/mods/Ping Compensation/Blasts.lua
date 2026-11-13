@@ -1,17 +1,20 @@
 local mod = get_mod("Ping Compensation")
 local pc = mod.pc
 
--- Explosions and area skills (D37). A blast this player sets off (a bomb, an exploding projectile, a weapon whose hits
--- explode, a career skill such as the Mercenary's shout or the Slayer's leap) reaches the host as an explosion message
--- (rpc_create_explosion), from which the host works out who is hit. For the enemies in pc.REACTION_BREEDS this client
--- now works the same blast out too, with the game's own maths, and shows the staggers and kills at once, as for its
--- hits (D26 to D28):
---   * Client: right after the explosion message goes out, pc_blast lists the covered enemies this client decides for
---     that blast, and pc_stagger and pc_kill follow for those it staggered or killed (Reactions.lua).
+-- Explosions and area skills (D37). A blast this player sets off (a weapon whose hits explode, a career skill such as
+-- the Mercenary's shout or the Slayer's leap) reaches the host as an explosion message (rpc_create_explosion), from
+-- which the host works out who is hit. A projectile's blast (a bomb, a fireball) doesn't: each machine sets off its own
+-- copy when its copy of the projectile lands, and the host's (PlayerProjectileHuskExtension.do_aoe) is the real one.
+-- For the enemies in pc.REACTION_BREEDS this client now works the same blast out too, with the game's own maths, and
+-- shows the staggers and kills at once, as for its hits (D26 to D28):
+--   * Client: right after the explosion message goes out, or its own projectile's blast goes off, pc_blast lists the
+--     covered enemies this client decides for that blast (in several parts if it is long), then pc_blast_staggers
+--     carries their staggers several to a message, and pc_kill follows for those it killed (Reactions.lua).
 --   * Host: books the blast's damage as before, from its own maths, but skips its own stagger for the enemies on that
 --     list and plays the client's instead (HostReactions.lua). An enemy its blast reached that the list doesn't name
 --     (the two machines saw it at slightly different spots) gets the host's own stagger, as in vanilla. Until the
---     list arrives, the host holds those staggers back, for at most BLAST_WAIT.
+--     whole list arrives, the host holds those staggers back, for at most BLAST_WAIT. A projectile's list is matched
+--     to the host's blast by the projectile's network id, an explosion message's by its position.
 -- Damage over time and lingering areas stay with the host (T8). Blasts the host sets off itself (enemies' attacks and
 -- deaths, buffs, mutators) only go out to clients, so they stay with the host too.
 
@@ -22,8 +25,12 @@ pc.blasts = blasts
 local BLAST_WAIT = 0.5 -- seconds the host holds its own staggers for a client's blast back, waiting for its list
 local BLAST_MEMORY = 3 -- seconds a blast is remembered, on the host
 local MATCH_DISTANCE = 0.25 -- metres between where the client and the host have a blast; positions travel rounded
-local MAX_LIST_LENGTH = 2000
+local LIST_PART_LENGTH = 300 -- characters of network ids per pc_blast message; VMF allows 500 for all its values
+local MAX_LIST_LENGTH = 500
+local MAX_LIST_PARTS = 20
 local MAX_NAME_LENGTH = 64
+
+local next_blast_id = 0
 
 local ok_perks, buff_perk_names = pcall(require, "scripts/unit_extensions/default_player_unit/buffs/settings/buff_perk_names")
 local NO_FRIENDLY_FIRE_PERK = ok_perks and type(buff_perk_names) == "table" and buff_perk_names.no_explosion_friendly_fire or "no_explosion_friendly_fire"
@@ -285,23 +292,39 @@ local function send(message, ...)
 	end
 end
 
--- Called right after this client sends an explosion message to the host (NetworkTransmit.send_rpc_server), with that
--- message's own values, so this copy of the blast starts from exactly what the host gets.
-function blasts.client_blast(attacker_unit_id, attacker_is_level_unit, position, rotation, explosion_template_id, scale, damage_source_id, attacker_power_level, is_critical_strike, source_attacker_unit_id)
-	if attacker_is_level_unit or not pc.attacks or pc.broken or not pc.host_fresh() or not pc.compat.matches() then
-		return
+-- The network ids, comma-separated, in pieces of at most LIST_PART_LENGTH characters. Always at least one piece, so
+-- an empty list still tells the host to stagger that blast's enemies itself.
+local function list_parts(ids)
+	local parts = {}
+	local current = {}
+	local length = 0
+
+	for i = 1, #ids do
+		local id = ids[i]
+
+		if length > 0 and length + 1 + #id > LIST_PART_LENGTH then
+			parts[#parts + 1] = table.concat(current, ",")
+			current = {}
+			length = 0
+		end
+
+		current[#current + 1] = id
+		length = length + (length > 0 and 1 or 0) + #id
 	end
 
+	parts[#parts + 1] = table.concat(current, ",")
+
+	return parts
+end
+
+local function may_decide()
+	return pc.attacks and not pc.broken and pc.host_fresh() and pc.compat.matches()
+end
+
+-- This player's blast, worked out here: the list of covered enemies this client decides, then their damage and
+-- staggers. projectile_go_id is the network id of the projectile that set it off, or 0 for an explosion message.
+local function work_out(attacker, template_name, template, position, rotation, scale, damage_source, attacker_power_level, projectile_go_id)
 	local unit_storage = Managers.state.unit_storage
-	local attacker = unit_storage:unit(attacker_unit_id)
-
-	if not attacker or attacker ~= pc.local_player_unit() then
-		return
-	end
-
-	local template_name = NetworkLookup.explosion_templates[explosion_template_id]
-	local template = template_name and ExplosionUtils.get_template(template_name)
-	local damage_source = NetworkLookup.damage_sources[damage_source_id]
 	local area_damage = Managers.state.entity:system("area_damage_system")
 
 	if not template or not damage_source or not area_damage or not area_damage.world then
@@ -350,27 +373,83 @@ function blasts.client_blast(attacker_unit_id, attacker_is_level_unit, position,
 		end
 	end
 
-	-- The list goes first, so the host knows whose staggers to hold back for this client's.
-	send("pc_blast", template_name, pc.finite(position.x, 3), pc.finite(position.y, 3), pc.finite(position.z, 3), table.concat(ids, ","))
+	-- The list goes first, so the host knows whose staggers to hold back for this client's. A big blast's list takes
+	-- several messages (VMF allows 500 characters for a message's values); the host waits for all of them.
+	next_blast_id = next_blast_id + 1
+
+	local blast_id = next_blast_id
+	local parts = list_parts(ids)
+
+	for part = 1, #parts do
+		send("pc_blast", blast_id, part, #parts, template_name, pc.finite(position.x, 3), pc.finite(position.y, 3), pc.finite(position.z, 3), projectile_go_id, parts[part])
+	end
 
 	pc.count("client_blasts")
 	pc.count("client_blast_targets", #decided)
 
 	local t = pc.now()
 	local kills = 0
+	local batch = reactions.new_stagger_batch(damage_source)
 
 	for i = 1, #decided do
 		local target = decided[i]
 		local translation = target.breed.hitbox_ragdoll_translation
 		local ragdoll_actor = translation and (translation.j_spine or translation.j_spine1) or nil
-		local ok, outcome = pc.guard("client blast target", reactions.blast_hit, target.unit, target.breed, attacker, target.damage_profile, target.profile_name, target.target_number, target.power_level, target.hit_zone_name, position, target.direction:unbox(), damage_source, target.shield_blocked, ragdoll_actor, t)
+		local ok, outcome = pc.guard("client blast target", reactions.blast_hit, target.unit, target.breed, attacker, target.damage_profile, target.profile_name, target.target_number, target.power_level, target.hit_zone_name, position, target.direction:unbox(), damage_source, target.shield_blocked, ragdoll_actor, t, batch)
 
 		if ok and outcome == "kill" then
 			kills = kills + 1
 		end
 	end
 
-	pc.log("client blast template=%s source=%s enemies=%d kills=%d radius=%.2f", template_name, damage_source, #decided, kills, radius)
+	local staggers = #batch.entries
+	local _, messages = pc.guard("client blast staggers", reactions.send_stagger_batch, batch)
+
+	pc.log("client blast template=%s source=%s enemies=%d kills=%d radius=%.2f blast=%d projectile=%d list_parts=%d staggers=%d stagger_messages=%d", template_name, damage_source, #decided, kills, radius, blast_id, projectile_go_id, #parts, staggers, messages or 0)
+end
+
+-- Called right after this client sends an explosion message to the host (NetworkTransmit.send_rpc_server), with that
+-- message's own values, so this copy of the blast starts from exactly what the host gets.
+function blasts.client_blast(attacker_unit_id, attacker_is_level_unit, position, rotation, explosion_template_id, scale, damage_source_id, attacker_power_level, is_critical_strike, source_attacker_unit_id)
+	if attacker_is_level_unit or not may_decide() then
+		return
+	end
+
+	local attacker = Managers.state.unit_storage:unit(attacker_unit_id)
+
+	if not attacker or attacker ~= pc.local_player_unit() then
+		return
+	end
+
+	local template_name = NetworkLookup.explosion_templates[explosion_template_id]
+	local template = template_name and ExplosionUtils.get_template(template_name)
+
+	work_out(attacker, template_name, template, position, rotation, scale, NetworkLookup.damage_sources[damage_source_id], attacker_power_level, 0)
+end
+
+-- Called right after this player's own projectile (a bomb, a fireball) has set off its blast on this screen
+-- (PlayerProjectileUnitExtension.do_aoe), with the values the host's copy of the projectile uses for its own blast
+-- (PlayerProjectileHuskExtension.do_aoe). No explosion message goes to the host for these.
+function blasts.client_projectile_blast(extension, aoe_data, position)
+	if not may_decide() then
+		return
+	end
+
+	local attacker = extension._owner_unit
+	local projectile = extension._projectile_unit
+
+	if not attacker or attacker ~= pc.local_player_unit() or not projectile or not Unit.alive(projectile) then
+		return
+	end
+
+	local projectile_go_id = Managers.state.unit_storage:go_id(projectile)
+	local template_name = aoe_data.name
+
+	if not projectile_go_id or type(template_name) ~= "string" then
+		return
+	end
+
+	work_out(attacker, template_name, aoe_data, position, Unit.local_rotation(projectile, 0), extension.scale, extension.item_name, extension.power_level, projectile_go_id)
 end
 
 mod:hook_safe("NetworkTransmit", "send_rpc_server", function (self, rpc_name, ...)
@@ -381,13 +460,39 @@ mod:hook_safe("NetworkTransmit", "send_rpc_server", function (self, rpc_name, ..
 	pc.guard("client blast", blasts.client_blast, ...)
 end)
 
+-- A blast's explosion message (network_sync) is handled above, when it is sent.
+mod:hook_safe("PlayerProjectileUnitExtension", "do_aoe", function (self, aoe_data, position, network_sync)
+	if self._is_server or network_sync or pc.broken or type(aoe_data) ~= "table" or not aoe_data.explosion then
+		return
+	end
+
+	pc.guard("client projectile blast", blasts.client_projectile_blast, self, aoe_data, position)
+end)
+
 -- Host ----------------------------------------------------------------------------------------------------------
 
 local recent = {} -- peer -> list of that client's recent blasts
 local early = {} -- peer -> lists that arrived before their blast
+local gathering = {} -- peer -> the client's blast id -> the parts of that blast's list that have arrived
 
--- The newest blast of this client's with this template, close to this position, still waiting for its list if asked.
-local function find_blast(peer, template_name, position, undecided)
+-- Whether a client's list (or part of one) and a blast on the host are the same blast. A projectile's blast is matched
+-- by the projectile's network id, because the client's and the host's copies of the projectile can land a little
+-- apart; an explosion message's by its position, which both have from the same message.
+local function same_blast(entry, template_name, position, projectile_go_id)
+	if entry.template_name ~= template_name then
+		return false
+	end
+
+	if projectile_go_id ~= 0 or entry.projectile_go_id ~= 0 then
+		return entry.projectile_go_id == projectile_go_id
+	end
+
+	return Vector3.distance(entry.position:unbox(), position) <= MATCH_DISTANCE
+end
+
+-- The newest blast of this client's with this template at this position on the host (where the host's own blast
+-- books its targets).
+local function find_blast(peer, template_name, position)
 	local list = recent[peer]
 
 	if not list then
@@ -397,7 +502,26 @@ local function find_blast(peer, template_name, position, undecided)
 	for i = #list, 1, -1 do
 		local record = list[i]
 
-		if record.template_name == template_name and (not undecided or record.decided == nil) and Vector3.distance(record.position:unbox(), position) <= MATCH_DISTANCE then
+		if record.template_name == template_name and Vector3.distance(record.position:unbox(), position) <= MATCH_DISTANCE then
+			return record
+		end
+	end
+
+	return nil
+end
+
+-- The newest blast of this client's that this list is for and that is still waiting for its list.
+local function find_blast_for_list(peer, template_name, position, projectile_go_id)
+	local list = recent[peer]
+
+	if not list then
+		return nil
+	end
+
+	for i = #list, 1, -1 do
+		local record = list[i]
+
+		if record.decided == nil and same_blast(record, template_name, position, projectile_go_id) then
 			return record
 		end
 	end
@@ -441,14 +565,65 @@ local function resolve(record, decided, reason)
 	end
 end
 
-local function parse_list(text)
-	local decided = {}
+-- The parts of a list that has only partly arrived, for a blast that can't wait any longer. Normally every part
+-- arrives together: they are sent in one go, one after the other.
+local function partial_list(peer, template_name, position, projectile_go_id)
+	local by_id = gathering[peer]
 
-	for id in string.gmatch(text, "%d+") do
-		decided[tonumber(id)] = true
+	if not by_id then
+		return nil
 	end
 
-	return decided
+	for blast_id, entry in pairs(by_id) do
+		if same_blast(entry, template_name, position, projectile_go_id) then
+			by_id[blast_id] = nil
+
+			return entry.decided, entry.count, entry.parts
+		end
+	end
+
+	return nil
+end
+
+-- A blast of this client's that the host is about to work out, and whose list it waits for.
+local function add_blast(peer, name, template_name, position, projectile_go_id)
+	local record = {
+		peer = peer,
+		name = name,
+		template_name = template_name,
+		position = Vector3Box(position),
+		projectile_go_id = projectile_go_id,
+		t = pc.now(),
+		decided = nil, -- go id -> true, once the client's list has arrived
+		pending = {}, -- enemy unit -> the host's own stagger for it, held back until the list arrives
+	}
+	local list = recent[peer] or {}
+
+	list[#list + 1] = record
+	recent[peer] = list
+
+	pc.count("host_blasts")
+
+	if projectile_go_id ~= 0 then
+		pc.count("host_projectile_blasts")
+	end
+
+	-- The list can overtake its blast: the two travel by different routes, and a client's projectile usually lands on
+	-- its screen before the host's copy lands here.
+	local waiting = early[peer]
+
+	if waiting then
+		for i = 1, #waiting do
+			local entry = waiting[i]
+
+			if same_blast(entry, template_name, position, projectile_go_id) then
+				table.remove(waiting, i)
+				resolve(record, entry.decided, "list arrived first")
+
+				break
+			end
+		end
+	end
 end
 
 -- Called before AreaDamageSystem.rpc_create_explosion runs a client's blast on the host.
@@ -472,37 +647,29 @@ function blasts.host_blast_arrived(channel_id, attacker_unit_id, position, explo
 		return
 	end
 
-	local record = {
-		peer = peer,
-		name = owner:name(),
-		template_name = template_name,
-		position = Vector3Box(position),
-		t = pc.now(),
-		decided = nil, -- go id -> true, once the client's list has arrived
-		pending = {}, -- enemy unit -> the host's own stagger for it, held back until the list arrives
-	}
-	local list = recent[peer] or {}
+	add_blast(peer, owner:name(), template_name, position, 0)
+end
 
-	list[#list + 1] = record
-	recent[peer] = list
+-- Called before PlayerProjectileHuskExtension.do_aoe sets off the blast of a client's projectile on the host: the
+-- host's copy of the projectile has landed, and this blast is the real one.
+function blasts.host_projectile_blast(extension, aoe_data, position)
+	local owner_unit = extension._owner_unit
+	local owner = owner_unit and Unit.alive(owner_unit) and Managers.player:owner(owner_unit)
+	local peer = owner and owner.remote and not owner.bot_player and owner.peer_id
 
-	pc.count("host_blasts")
-
-	-- The list can overtake its blast: the two travel by different routes.
-	local waiting = early[peer]
-
-	if waiting then
-		for i = 1, #waiting do
-			local entry = waiting[i]
-
-			if entry.template_name == template_name and Vector3.distance(entry.position:unbox(), position) <= MATCH_DISTANCE then
-				table.remove(waiting, i)
-				resolve(record, entry.decided, "list arrived first")
-
-				break
-			end
-		end
+	if not peer or not pc.host.peer_decides_attacks(peer) then
+		return
 	end
+
+	local projectile = extension._projectile_unit
+	local projectile_go_id = projectile and Unit.alive(projectile) and Managers.state.unit_storage:go_id(projectile)
+	local template_name = aoe_data.name
+
+	if not projectile_go_id or type(template_name) ~= "string" then
+		return
+	end
+
+	add_blast(peer, owner:name(), template_name, position, projectile_go_id)
 end
 
 -- Called before AreaDamageSystem._damage_unit books one target of a blast. Returns the enemy whose stagger the
@@ -523,7 +690,7 @@ function blasts.target_of(aoe_damage_data)
 		return nil
 	end
 
-	local record = find_blast(peer, aoe_damage_data.explosion_template_name, aoe_damage_data.impact_position:unbox(), false)
+	local record = find_blast(peer, aoe_damage_data.explosion_template_name, aoe_damage_data.impact_position:unbox())
 
 	if not record then
 		return nil
@@ -584,13 +751,56 @@ mod:hook("AreaDamageSystem", "_damage_unit", function (func, self, aoe_damage_da
 	pc.host_reactions.end_skip()
 end)
 
-function blasts.list_arrived(sender, template_name, position, list)
+-- One part of a client's list for one of its blasts. Once every part is in, the list counts as arrived.
+function blasts.list_part_arrived(sender, blast_id, part, parts, template_name, position, projectile_go_id, list)
 	if not pc.host.peer_decides_attacks(sender) then
 		return
 	end
 
-	local decided = parse_list(list)
-	local record = find_blast(sender, template_name, position, true)
+	local by_id = gathering[sender] or {}
+	local entry = by_id[blast_id]
+
+	if not entry or entry.parts ~= parts or entry.template_name ~= template_name or entry.projectile_go_id ~= projectile_go_id then
+		entry = {
+			template_name = template_name,
+			position = Vector3Box(position),
+			projectile_go_id = projectile_go_id,
+			parts = parts,
+			got = {},
+			count = 0,
+			decided = {}, -- go id -> true
+			t = pc.now(),
+		}
+		by_id[blast_id] = entry
+		gathering[sender] = by_id
+	end
+
+	if entry.got[part] then
+		return
+	end
+
+	entry.got[part] = true
+	entry.count = entry.count + 1
+
+	for id in string.gmatch(list, "%d+") do
+		entry.decided[tonumber(id)] = true
+	end
+
+	if entry.count < parts then
+		return
+	end
+
+	by_id[blast_id] = nil
+
+	if next(by_id) == nil then
+		gathering[sender] = nil
+	end
+
+	blasts.list_arrived(sender, template_name, position, projectile_go_id, entry.decided)
+end
+
+function blasts.list_arrived(sender, template_name, position, projectile_go_id, decided)
+	local record = find_blast_for_list(sender, template_name, position, projectile_go_id)
 
 	pc.count("host_blast_lists")
 
@@ -605,29 +815,45 @@ function blasts.list_arrived(sender, template_name, position, list)
 	waiting[#waiting + 1] = {
 		template_name = template_name,
 		position = Vector3Box(position),
+		projectile_go_id = projectile_go_id,
 		decided = decided,
 		t = pc.now(),
 	}
 	early[sender] = waiting
 end
 
-mod:network_register("pc_blast", function (sender, version, template_name, x, y, z, list)
+local function whole(value, low, high)
+	return type(value) == "number" and value == math.floor(value) and value >= low and value <= high
+end
+
+mod:network_register("pc_blast", function (sender, version, blast_id, part, parts, template_name, x, y, z, projectile_go_id, list)
 	if pc.broken or not pc.is_server() or not pc.in_game() or version ~= pc.VERSION then
 		return
 	end
 
-	if type(template_name) ~= "string" or #template_name > MAX_NAME_LENGTH or type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" or x ~= x or y ~= y or z ~= z or type(list) ~= "string" or #list > MAX_LIST_LENGTH then
+	if not whole(blast_id, 1, math.huge) or not whole(parts, 1, MAX_LIST_PARTS) or not whole(part, 1, parts or 0) or type(template_name) ~= "string" or #template_name > MAX_NAME_LENGTH
+		or type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" or x ~= x or y ~= y or z ~= z or not whole(projectile_go_id, 0, math.huge) or type(list) ~= "string" or #list > MAX_LIST_LENGTH then
 		pc.count("host_rejected")
 		pc.print("host rejected a malformed blast list")
 
 		return
 	end
 
-	pc.guard("host blast list", blasts.list_arrived, sender, template_name, Vector3(x, y, z), list)
+	pc.guard("host blast list", blasts.list_part_arrived, sender, blast_id, part, parts, template_name, Vector3(x, y, z), projectile_go_id, list)
+end)
+
+-- The host's copy of a client's projectile has landed (PlayerProjectileHuskExtension.do_aoe). Before its blast is
+-- worked out here, it is noted as that client's, so its staggers wait for the client's list.
+mod:hook("PlayerProjectileHuskExtension", "do_aoe", function (func, self, aoe_data, position, ...)
+	if self._is_server and not pc.broken and type(aoe_data) == "table" and aoe_data.explosion then
+		pc.guard("host projectile blast", blasts.host_projectile_blast, self, aoe_data, position)
+	end
+
+	return func(self, aoe_data, position, ...)
 end)
 
 function blasts.update()
-	if next(recent) == nil and next(early) == nil then
+	if next(recent) == nil and next(early) == nil and next(gathering) == nil then
 		return
 	end
 
@@ -638,8 +864,15 @@ function blasts.update()
 			local record = list[i]
 
 			if record.decided == nil and t - record.t > BLAST_WAIT then
+				local partial, count, parts = partial_list(peer, record.template_name, record.position:unbox(), record.projectile_go_id)
+
 				pc.count("host_blast_list_missing")
-				resolve(record, {}, "no list came")
+
+				if partial then
+					resolve(record, partial, string.format("only %d of %d parts of the list came", count, parts))
+				else
+					resolve(record, {}, "no list came")
+				end
 			end
 
 			if t - record.t > BLAST_MEMORY then
@@ -663,9 +896,22 @@ function blasts.update()
 			early[peer] = nil
 		end
 	end
+
+	for peer, by_id in pairs(gathering) do
+		for blast_id, entry in pairs(by_id) do
+			if t - entry.t > BLAST_MEMORY then
+				by_id[blast_id] = nil
+			end
+		end
+
+		if next(by_id) == nil then
+			gathering[peer] = nil
+		end
+	end
 end
 
 function blasts.clear()
 	recent = {}
 	early = {}
+	gathering = {}
 end
