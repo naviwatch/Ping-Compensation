@@ -15,6 +15,8 @@ In the order they first tested, with the session date (the folder in `TestLogs/`
 - Hanime.tv: 2026-11-10
 - Uvess: 2026-11-11
 - skeletonIRL: 2026-11-12
+- Artorias: 2026-11-13
+- The Real Stabby (Stabby): 2026-11-13
 
 ## Research and inspiration
 
