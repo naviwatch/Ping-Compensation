@@ -216,8 +216,9 @@ local function plan_timing(node, blackboard, record, t)
 	local rtt = peer_rtt(record.peer)
 	local lead = rtt + math.max(t - record.t, 0)
 	local action = node._tree_node and node._tree_node.action_data
-	-- D42: the Chaos enemies' stagger animations ignore the speed variable, so theirs end early on the timer.
-	local scalable = action ~= nil and action.scale_animation_speeds and not action.stagger_animation_scale and not pc.FIXED_SPEED_STAGGER_BREEDS[record.breed_name]
+	-- D42, D47: only some enemies' stagger animations follow the speed variable (pc.STAGGER_SCALE_BREEDS, from the
+	-- probe); the others' end early on the timer. An action that sets its own speed keeps it (vanilla reads it first).
+	local scalable = action ~= nil and not action.stagger_animation_scale and pc.STAGGER_SCALE_BREEDS[record.breed_name] == true
 	local base_scale = scalable and blackboard.stagger_animation_scale or 1
 	local length = pc.timings.get("length", record.breed_name, record.anim)
 
@@ -691,7 +692,7 @@ function host_reactions.before_stagger_enter(node, unit, blackboard, t)
 	local record = staggers[unit]
 
 	if not record then
-		if pc.probe_tools and blackboard.breed and pc.REACTION_BREEDS[blackboard.breed.name] then
+		if pc.probe_tools and blackboard.breed then
 			pc.probe_tools.before_reaction(unit)
 		end
 
@@ -751,18 +752,54 @@ function host_reactions.forced_animation(unit, blackboard, stagger_anims)
 	return record.anim, Quaternion(Vector3.up(), record.yaw)
 end
 
--- Called after every BTStaggerAction.enter of a covered enemy: the animation it plays and how fast, until its end
--- cue arrives (push_finished).
+-- D47: ungors' stagger animations follow stagger_scale (the calibration probe), but their stagger action doesn't set
+-- scale_animation_speeds, so vanilla never sends the variable with their staggers (bt_stagger_action.lua:73). For such
+-- an enemy the host sets the flag for the length of BTStaggerAction.enter, so it sends the variable with every stagger
+-- as it does for the others: a client's stagger at the faster speed (forced_animation), the host's own at normal
+-- speed, as vanilla plays it, so a faster value never lingers on any machine. Returns what restore_stagger_flag puts
+-- back.
+function host_reactions.force_stagger_flag(node, unit, blackboard)
+	local action = node._tree_node and node._tree_node.action_data
+	local breed = blackboard.breed
+
+	if type(action) ~= "table" or action.scale_animation_speeds or not breed or not pc.STAGGER_SCALE_BREEDS[breed.name] then
+		return nil
+	end
+
+	local saved = {
+		action = action,
+		scale = action.stagger_animation_scale,
+	}
+
+	action.scale_animation_speeds = true
+
+	if not (forcing and forcing.unit == unit) then
+		action.stagger_animation_scale = 1
+	end
+
+	return saved
+end
+
+function host_reactions.restore_stagger_flag(saved)
+	saved.action.scale_animation_speeds = nil
+	saved.action.stagger_animation_scale = saved.scale
+end
+
+-- Called after every BTStaggerAction.enter, of any enemy (D47: every enemy is timed, for later steps), while
+-- force_stagger_flag's flag is still set: the animation it plays and how fast, until its end cue arrives
+-- (push_finished).
 function host_reactions.stagger_entered(node, unit, blackboard, t)
 	local breed = blackboard.breed
 	local action = node._tree_node and node._tree_node.action_data
 	local anim = blackboard.last_stagger_anim
 
-	if not breed or not pc.REACTION_BREEDS[breed.name] or not action or type(anim) ~= "string" then
+	if not breed or not action or type(anim) ~= "string" then
 		return
 	end
 
-	local scale = action.scale_animation_speeds and not pc.FIXED_SPEED_STAGGER_BREEDS[breed.name] and (action.stagger_animation_scale or blackboard.stagger_animation_scale or 1) or 1
+	-- What enter sent with the animation (bt_stagger_action.lua:73), and the speed this enemy's animation plays at then.
+	local asked = action.scale_animation_speeds and (action.stagger_animation_scale or blackboard.stagger_animation_scale or 1) or 1
+	local scale = pc.stagger_speed(breed.name, asked)
 	local record = forcing
 	local client_stagger = record ~= nil and record.unit == unit and record.anim_used
 	local watch = {
@@ -801,6 +838,10 @@ function host_reactions.push_finished(unit)
 	stagger_watch[unit] = nil
 
 	local elapsed = pc.now() - timing.t
+
+	if pc.probe_tools then
+		pc.probe_tools.cue_reached(unit, "length")
+	end
 
 	if timing.probe then
 		pc.probe_tools.reaction_timed(unit, "length", timing.breed_name, timing.anim, elapsed, nil, timing.probe)
@@ -853,8 +894,9 @@ function host_reactions.after_stagger_enter(unit, blackboard, t, record)
 			blackboard.stagger_time = math.max(blackboard.stagger_time - record.rtt, t)
 		end
 
-		-- Past the speed-up limit, or for an enemy whose stagger has no speed variable (ungors), the timer alone ends
-		-- the stagger, without waiting for the animation's cue. Other players see the animation cut short.
+		-- Past the speed-up limit, or for an enemy whose stagger animations ignore the speed variable (Chaos enemies,
+		-- gors, shielded stormvermin), the timer alone ends the stagger, without waiting for the animation's cue.
+		-- Other players see the animation cut short.
 		if record.end_at then
 			blackboard.stagger_ignore_anim_cb = true
 			blackboard.stagger_time = math.max(blackboard.stagger_time or t, record.end_at)
@@ -974,7 +1016,8 @@ function host_reactions.before_recoil_enter(node, unit, blackboard)
 
 		late_recoils[unit] = nil
 
-		if not breed or not pc.REACTION_BREEDS[breed.name] then
+		-- Every enemy's own recoils are timed (D47), for later steps as well as for the covered enemies.
+		if not breed then
 			return nil
 		end
 
@@ -1209,6 +1252,10 @@ function host_reactions.recoil_cue(unit, kind)
 
 	local elapsed = pc.now() - watch.t
 
+	if pc.probe_tools then
+		pc.probe_tools.cue_reached(unit, kind)
+	end
+
 	if watch.probe then
 		pc.probe_tools.reaction_timed(unit, kind, watch.breed_name, watch.anim, elapsed, watch.blocked_attack, watch.probe)
 	end
@@ -1263,6 +1310,18 @@ end
 -- Called from the BTAttackAction.enter hook in Host.lua for every single attack.
 function host_reactions.note_attack(unit, anim)
 	attack_anims[unit] = anim
+end
+
+-- Called for every animation the host plays on an enemy (AnimationSystem.anim_event): an attack animation is the attack
+-- a recoil after it interrupted, which recoil timings are kept by (D43). This covers every enemy's attacks (D47),
+-- including the sweeps and shoves of elites (BTStormVerminAttackAction plays its animation without noting it).
+function host_reactions.note_animation(unit, anim)
+	local blackboard = BLACKBOARDS[unit]
+	local breed = blackboard and blackboard.breed
+
+	if breed and type(anim) == "string" and pc.reactions.is_attack_anim(breed, anim) then
+		attack_anims[unit] = anim
+	end
 end
 
 -- Called from the BTBlockedAction.run hook, after before_recoil_run, for a recoil watched for its end: when its cue
@@ -1687,10 +1746,15 @@ end)
 
 mod:hook("BTStaggerAction", "enter", function (func, self, unit, blackboard, t)
 	local ok, record = pc.guard("host stagger enter", host_reactions.before_stagger_enter, self, unit, blackboard, t)
+	local flag_ok, saved_flag = pc.guard("host stagger speed flag", host_reactions.force_stagger_flag, self, unit, blackboard)
 
 	func(self, unit, blackboard, t)
 
 	pc.guard("host stagger timing", host_reactions.stagger_entered, self, unit, blackboard, t)
+
+	if flag_ok and saved_flag then
+		pc.guard("host stagger speed flag", host_reactions.restore_stagger_flag, saved_flag)
+	end
 
 	if ok and record then
 		pc.guard("host stagger entered", host_reactions.after_stagger_enter, unit, blackboard, t, record)
@@ -1731,6 +1795,20 @@ mod:hook("BTBlockedAction", "run", function (func, self, unit, blackboard, t, dt
 	end
 
 	return func(self, unit, blackboard, t, dt)
+end)
+
+-- Every animation the host plays on a unit, sent to the clients or not (animation_system.lua:119 and :139). Only an
+-- enemy's attack animations are noted.
+mod:hook_safe("AnimationSystem", "anim_event", function (self, unit, event_name)
+	if self.is_server and not pc.broken and BLACKBOARDS[unit] then
+		pc.guard("host attack animation", host_reactions.note_animation, unit, event_name)
+	end
+end)
+
+mod:hook_safe("AnimationSystem", "anim_event_with_variable_float", function (self, unit, event_name)
+	if self.is_server and not pc.broken and BLACKBOARDS[unit] then
+		pc.guard("host attack animation", host_reactions.note_animation, unit, event_name)
+	end
 end)
 
 -- Every recoil leaves through here: reason "done" when its run ended it, "aborted" when a higher branch of the

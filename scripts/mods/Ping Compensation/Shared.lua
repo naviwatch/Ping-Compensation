@@ -1,7 +1,7 @@
 local mod = get_mod("Ping Compensation")
 
 -- Host and client must run the same VERSION. Bump it whenever any message in CLAUDE.md's "Network messages" changes.
-local VERSION = 10
+local VERSION = 11
 
 -- Playtest builds write the debug log by default, so testers don't have to remember /pingcomp debug on. Set this to
 -- false for a public release: players who want the log can still switch it on, and their choice is remembered.
@@ -43,14 +43,18 @@ local pc = {
 		chaos_berzerker = true,
 		skaven_storm_vermin_with_shield = true,
 	},
-	-- Breeds whose stagger animations ignore the stagger_scale variable, though their stagger actions set
-	-- scale_animation_speeds (build 3: 68-78% of the speed asked, about normal speed). The host ends their client
-	-- staggers early on the timer instead (D42), and their stagger lengths are measured at normal speed.
-	FIXED_SPEED_STAGGER_BREEDS = {
-		chaos_marauder = true,
-		chaos_marauder_with_shield = true,
-		chaos_fanatic = true,
-		chaos_berzerker = true,
+	-- Covered breeds whose stagger animations play faster when the stagger_scale variable is raised (the calibration
+	-- probe, 2026-11-14: 2x asked, 2x reached). The host plays a client's stagger of these faster (D32, D38). The other
+	-- covered breeds' animations ignore the variable (Chaos enemies, gors, shielded stormvermin: 1x reached), so their
+	-- client staggers end early on the host's timer instead (D42, D47), and their lengths are timed at normal speed
+	-- whatever the variable says. The ungor's stagger action doesn't set scale_animation_speeds, so for ungors the host
+	-- sends the variable with every stagger itself (HostReactions.lua). No covered breed's recoil responds to it.
+	STAGGER_SCALE_BREEDS = {
+		skaven_slave = true,
+		skaven_clan_rat = true,
+		skaven_clan_rat_with_shield = true,
+		skaven_plague_monk = true,
+		beastmen_ungor = true,
 	},
 	-- Build 3.1 diagnostic: the clients decided "too weak to stagger" for hundreds of hits on these. For a client's
 	-- hits on them, the host still works out its own stagger, without applying it, and logs where it disagrees; both
@@ -86,6 +90,18 @@ end
 
 function pc.stagger_name(stagger_type)
 	return stagger_names[stagger_type] or tostring(stagger_type)
+end
+
+-- The speed a stagger animation of this breed really plays at when the stagger_scale variable asks for `asked`.
+-- Covered breeds: as asked for STAGGER_SCALE_BREEDS, normal speed for the others (the probe, D47). Every other enemy
+-- (timed since 3.2 for later steps): as asked, since the probe didn't try them; a reading at any speed but 1 isn't
+-- learned (Timings.lua), so a wrong guess costs nothing.
+function pc.stagger_speed(breed_name, asked)
+	if pc.REACTION_BREEDS[breed_name] and not pc.STAGGER_SCALE_BREEDS[breed_name] then
+		return 1
+	end
+
+	return asked
 end
 
 mod.pc = pc

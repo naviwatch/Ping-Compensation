@@ -294,6 +294,12 @@ def render(markdown):
 
 			continue
 
+		# An HTML comment on a line of its own, such as the tally's markers, isn't shown.
+		if line.strip().startswith("<!--") and line.strip().endswith("-->"):
+			i += 1
+
+			continue
+
 		if line.startswith("```"):
 			body = []
 			i += 1

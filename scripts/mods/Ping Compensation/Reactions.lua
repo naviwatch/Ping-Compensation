@@ -202,20 +202,6 @@ local function collect_attack_anims(node, lookup, depth)
 	end
 end
 
-local function collect_single_attacks(node, list, depth)
-	if type(node) ~= "table" or depth > 30 then
-		return
-	end
-
-	if node[1] == "BTAttackAction" and type(node.action_data) == "table" then
-		list[#list + 1] = node.action_data
-	end
-
-	for i = 2, #node do
-		collect_single_attacks(node[i], list, depth + 1)
-	end
-end
-
 -- Every animation a single attack can play. BTAttackAction picks one of its variants (default_attack, high_attack,
 -- mid_attack, ...) and plays a random one of that variant's anims (bt_attack_action.lua:41); attack_anim is only set on
 -- some attacks.
@@ -231,35 +217,62 @@ local function single_attack_anims(action, lookup)
 	end
 end
 
-local single_attack_lookup = {} -- breed name -> { [animation] = the single attack that plays it }
+-- Nodes whose animations a recoil never follows: a door, and the recoil and the stagger themselves.
+local NOT_ATTACKS = {
+	BTStaggerAction = true,
+	BTBlockedAction = true,
+	BTSmashDoorAction = true,
+}
 
--- The single attack an animation of this breed belongs to: the attack a recoil after it interrupted, which recoil
--- timings are kept by (Timings.lua, D43).
-local function single_attack_of(breed, anim)
-	local lookup = single_attack_lookup[breed.name]
+-- The fields an attack action names its animations in, besides a single attack's variants: the elites' sweeps also
+-- pick from the knocked-down and step lists (bt_storm_vermin_attack_action.lua:109).
+local ATTACK_ANIM_FIELDS = { "attack_anim", "knocked_down_attack_anim", "step_attack_anim" }
 
-	if not lookup then
-		local behaviors = rawget(_G, "BreedBehaviors")
-		local tree = behaviors and breed.behavior and behaviors[breed.behavior]
-		local actions = {}
-
-		lookup = {}
-
-		collect_single_attacks(tree, actions, 0)
-
-		for i = 1, #actions do
-			single_attack_anims(actions[i], lookup)
-		end
-
-		single_attack_lookup[breed.name] = lookup
+-- The attacks a block can make an enemy recoil from, each with the animations it plays: its single attacks
+-- (BTAttackAction) and, since every enemy is timed (D47), the other attack nodes of its tree, such as the elites'
+-- sweeps and shoves (BTStormVerminAttackAction, BTStormVerminPushAction). A blocked frenzy step recoils only when its
+-- combo goes on to "stagger" (bt_combo_attack_action.lua:313), which no covered enemy's does, so combos aren't listed.
+local function collect_attacks(node, list, depth)
+	if type(node) ~= "table" or depth > 30 then
+		return
 	end
 
-	return lookup[anim]
+	local action = node.action_data
+	local class = node[1]
+
+	if type(action) == "table" and type(class) == "string" and not NOT_ATTACKS[class] and action.combo_attacks == nil then
+		local anims = {}
+
+		if class == "BTAttackAction" then
+			single_attack_anims(action, anims)
+		else
+			for i = 1, #ATTACK_ANIM_FIELDS do
+				add_attack_anims(anims, action[ATTACK_ANIM_FIELDS[i]], action)
+			end
+		end
+
+		if next(anims) ~= nil then
+			list[#list + 1] = {
+				action = action,
+				anims = anims,
+			}
+		end
+	end
+
+	for i = 2, #node do
+		collect_attacks(node[i], list, depth + 1)
+	end
 end
 
--- The animations whose timings the host needs for this breed (/pingcomp missing, Probe.lua): its stagger animations
--- by stagger type, its recoil animations, and its single attacks (BTAttackAction), the only ones a block makes it
--- recoil from, each with its name and animations.
+local function breed_tree(breed)
+	local behaviors = rawget(_G, "BreedBehaviors")
+
+	return behaviors and breed.behavior and behaviors[breed.behavior]
+end
+
+-- The animations whose timings this breed needs (/pingcomp missing, Probe.lua): its stagger animations by stagger type,
+-- its recoil animations, and the attacks a block makes it recoil from (collect_attacks), each with its name and
+-- animations.
 function reactions.timing_animations(breed)
 	local staggers = {}
 
@@ -278,23 +291,16 @@ function reactions.timing_animations(breed)
 		end
 	end
 
-	local behaviors = rawget(_G, "BreedBehaviors")
-	local tree = behaviors and breed.behavior and behaviors[breed.behavior]
-	local actions = {}
+	local found = {}
 	local attacks = {}
 	local seen = {}
 
-	collect_single_attacks(tree, actions, 0)
+	collect_attacks(breed_tree(breed), found, 0)
 
-	for i = 1, #actions do
-		local action = actions[i]
-		local anims = {}
-
-		single_attack_anims(action, anims)
-
+	for i = 1, #found do
 		local list = {}
 
-		for anim in pairs(anims) do
+		for anim in pairs(found[i].anims) do
 			if not seen[anim] then
 				seen[anim] = true
 				list[#list + 1] = anim
@@ -305,7 +311,7 @@ function reactions.timing_animations(breed)
 
 		if #list > 0 then
 			attacks[#attacks + 1] = {
-				name = tostring(action.name),
+				name = tostring(found[i].action.name),
 				anims = list,
 			}
 		end
@@ -332,6 +338,37 @@ local function attack_actions_of(breed)
 	end
 
 	return lookup
+end
+
+local attack_anim_lookup = {} -- breed name -> { [animation] = true } for every attack animation of the breed
+
+-- Whether this animation of this breed is one of its attacks, of any kind: the attack a recoil after it interrupted,
+-- which recoil timings are kept by (Timings.lua, D43). Used on both sides, for every enemy (D47).
+function reactions.is_attack_anim(breed, anim)
+	local lookup = attack_anim_lookup[breed.name]
+
+	if not lookup then
+		local found = {}
+
+		lookup = {}
+
+		collect_attacks(breed_tree(breed), found, 0)
+
+		for i = 1, #found do
+			for name in pairs(found[i].anims) do
+				lookup[name] = true
+			end
+		end
+
+		-- The frenzy combos' steps too, which attack_actions_of knows.
+		for name in pairs(attack_actions_of(breed)) do
+			lookup[name] = true
+		end
+
+		attack_anim_lookup[breed.name] = lookup
+	end
+
+	return lookup[anim] == true
 end
 
 -- The attack the stand-in's enemy is in now, or nil. A frenzy combo (BTComboAttackAction) clears the aborted flag of
@@ -387,10 +424,8 @@ end
 -- speed it plays at: a stagger's length is kept at normal speed, and a reading not taken at normal speed isn't learned.
 -- after: for a recoil, the animation of the attack that was blocked, which its timings are kept by (D43).
 local function measure_start(unit, kind, anim, scale, breed, after)
-	-- These animations play at normal speed whatever the variable says.
-	if pc.FIXED_SPEED_STAGGER_BREEDS[breed.name] then
-		scale = 1
-	end
+	-- Some enemies' animations play at normal speed whatever the variable says (pc.STAGGER_SCALE_BREEDS).
+	scale = pc.stagger_speed(breed.name, scale or 1)
 
 	measuring[unit] = {
 		kind = kind,
@@ -421,8 +456,8 @@ local function measure_host_animation(unit, anim, variable_id, variable_value)
 		measure_start(unit, "length", anim, scale, breed)
 	elseif is_recoil_anim(breed, anim) then
 		measure_start(unit, "recoil", anim, 1, breed, last_attacks[unit])
-	elseif pc.REACTION_BREEDS[breed.name] and single_attack_of(breed, anim) then
-		-- The attack a recoil after it interrupted: the last single attack the enemy started.
+	elseif reactions.is_attack_anim(breed, anim) then
+		-- The attack a recoil after it interrupted: the last attack the enemy started. Every enemy is timed (D47).
 		last_attacks[unit] = anim
 	end
 end
@@ -1114,7 +1149,9 @@ local function enter_stagger(unit, breed, fake, attacker, stagger_type, duration
 		return nil
 	end
 
-	local variable_scale = action.scale_animation_speeds and (action.stagger_animation_scale or anim_scale or 1) or nil
+	-- The host sends the variable with every stagger of these enemies (for ungors as well, D47), so this client's copy
+	-- plays its own with it too, and a faster value the host sent earlier doesn't linger.
+	local variable_scale = (action.scale_animation_speeds or pc.STAGGER_SCALE_BREEDS[breed.name]) and (action.stagger_animation_scale or anim_scale or 1) or nil
 
 	return anim, idle_event or "idle", override_rotation or impact_rotation, variable_scale
 end

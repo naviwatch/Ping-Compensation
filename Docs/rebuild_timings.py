@@ -9,8 +9,9 @@ Readings come from the debug log's "[PingComp] timing length|cue|stunned breed=.
 for recoils, from the host's "host swing=... recoil=... ended: ..." lines (build 3.1 on): their cue= time when it isn't
 "(learned)", their stunned= time (3.2 on), and in 3.1 the time a recoil lasted when the behaviour tree ended it before
 its cue (only anim_cb_stunned_finished does that). Lines the mod marked " ignored:" are left out, and so are a host's
-readings of staggers it played faster (the "speed asked" line just before them). Only breeds in REACTION_BREEDS
-(Shared.lua) are kept. The values already in DEFAULTS are not counted: the rebuild starts clean.
+readings of staggers it played faster (the "speed asked" line just before them). Every enemy is kept, covered or not
+(D47: from build 3.2 every machine times every enemy, for later steps). The values already in DEFAULTS are not
+counted: the rebuild starts clean.
 
 Which readings count:
   * A reading that names its speed (3.2 on) counts only at normal speed (speed=1.00).
@@ -27,7 +28,8 @@ median (an earlier animation's callback). The rest are put in groups, a new grou
 row are more than max(0.03 s, 2.5%) apart. The value is the median of the lowest group with at least a twentieth of
 the readings, with how many readings it has. Higher groups are listed, and so is a chosen group wider than 8%, which
 may run into readings taken too fast. If the readings taken at normal speed split into groups of their own, the
-animation isn't shipped until the key it depends on is known, and is listed. Recoils are never played faster, so all
+animation isn't shipped until the key it depends on is known, and is listed; it is written as false, so no machine
+learns a blend of the two either (Timings.lua). Recoils are never played faster, so all
 their readings count as taken at normal speed. A stagger length needs --min-readings readings (default 2) in its
 group; a recoil timing needs --min-recoil-readings (default 1), since one recoil reading is exact to a frame or two.
 
@@ -36,12 +38,26 @@ if two or more attacks have values and they differ by more than 0.05 s, the valu
 agree, or the readings that don't name the attack (logs before 3.1) agree with the one attack that has a value, one
 value covers every attack. With only one attack known and nothing else to go by, it is shipped for that attack alone.
 
+Shared stagger lengths (D47): enemies that play the same stagger animations fill each other's gaps. Two enemies share
+when they have at least SHARE_MIN stagger lengths in common and every one of them agrees within SHARE_TOLERANCE; then
+each gets the other's lengths for the animations it has no value for, marked "from <enemy>". Only an enemy's own
+values are compared and passed on. Recoil timings stay per enemy: marauders' and shielded marauders' agree for every
+attack but their running attack.
+
+The tally (D47): for each enemy in the decompiled breed files (--source), how many of its stagger animations have a
+length and how many of its recoil animations have a cue or stunned cue for some attack, after sharing. Covered enemies
+get a row each, the others one per faction. --handout writes it into the handout between the TALLY_START and TALLY_END
+lines (rebuild the PDF afterwards); otherwise it is printed.
+
 --dry-run prints the new table instead of writing it. Then check that the comment above DEFAULTS still names the logs
 the numbers come from.
 """
 import argparse
 import collections
+import glob
 import io
+import itertools
+import os
 import re
 import statistics
 
@@ -57,6 +73,27 @@ WIDE_SHARE = 0.08  # a chosen group wider than this is flagged: it may run into 
 MIN_GROUP_SHARE = 0.05
 SPLIT_SHARE = 0.15  # a group of normal-speed readings this big beside the lowest one is a split
 ATTACK_TOLERANCE = 0.05
+SPLIT_NOTE = "split at normal speed"  # such an animation is written as false: no value, and none learned (Timings.lua)
+SHARE_MIN = 10  # stagger lengths two enemies must have in common, all agreeing, to share the rest
+SHARE_TOLERANCE = 0.035  # how far apart two of those may be and still agree (0.03 s, plus the rounding to 0.01 s)
+SOURCE = "../../reference/Vermintide-2-Source-Code/scripts/settings/breeds"
+STAGGER_TABLES = ("stagger_anims", "standard_stagger_anims", "shield_block_anims", "shield_stagger_anims", "shield_break_anims")
+TALLY_START = "<!-- tally start: written by Docs/rebuild_timings.py --handout -->"
+TALLY_END = "<!-- tally end -->"
+FACTIONS = (("skaven_", "Skaven"), ("chaos_", "Chaos"), ("beastmen_", "Beastmen"))
+NAMES = {
+    "skaven_slave": "Slave rat",
+    "skaven_clan_rat": "Clan rat",
+    "skaven_clan_rat_with_shield": "Shielded clan rat",
+    "skaven_plague_monk": "Plague monk",
+    "skaven_storm_vermin_with_shield": "Shielded stormvermin",
+    "chaos_marauder": "Marauder",
+    "chaos_marauder_with_shield": "Shielded marauder",
+    "chaos_fanatic": "Fanatic",
+    "chaos_berzerker": "Savage",
+    "beastmen_gor": "Gor",
+    "beastmen_ungor": "Ungor",
+}
 
 STAMP = r"^(\d\d:\d\d:\d\d\.\d+)"
 READING = re.compile(STAMP + r".*\[PingComp\] timing (length|cue|stunned) breed=([a-z_0-9]+) anim=([a-z_0-9]+) seconds=([0-9.]+)(?: after=([a-z_0-9]+))?(?: speed=([0-9.]+))?(.*)$")
@@ -84,7 +121,7 @@ def side_of(path):
     return "host" if host > client else "client"
 
 
-def read_log(path, breeds, normal_speed, no_host_cues, readings, counts):
+def read_log(path, normal_speed, no_host_cues, readings, counts):
     """Adds the log's readings to readings[(kind, breed, anim, attack)] as (seconds, trusted)."""
     side = side_of(path)
     last_speed = None
@@ -98,8 +135,6 @@ def read_log(path, breeds, normal_speed, no_host_cues, readings, counts):
             match = READING.search(line)
             if match:
                 stamp, kind, breed, anim, seconds, attack, speed, rest = match.groups()
-                if breed not in breeds:
-                    continue
                 # An earlier animation's callback. Readings the mod ignored as "far longer" than the shipped value
                 # (builds before 3.2) are kept: some were real, such as the marauder's cues after its slower attacks.
                 if " ignored: not this animation's own" in rest:
@@ -123,7 +158,7 @@ def read_log(path, breeds, normal_speed, no_host_cues, readings, counts):
             match = RECOIL_END.search(line)
             if match and side == "host" and not no_host_cues:
                 recoil, breed, why, kind, attack, lasted, cue, stunned = match.groups()
-                if breed not in breeds or attack == "nil":
+                if attack == "nil":
                     continue
                 trusted = True
                 time = TIME.match(cue)
@@ -170,7 +205,7 @@ def choose(entries, min_readings):
         trusted_groups = groups_of(trusted)
         big = [g for g in trusted_groups if len(g) >= max(2, SPLIT_SHARE * len(trusted))]
         if len(big) > 1:
-            return None, len(trusted), "split at normal speed: " + ", ".join("%d around %.2f" % (len(g), statistics.median(g)) for g in big)
+            return None, len(trusted), SPLIT_NOTE + ": " + ", ".join("%d around %.2f" % (len(g), statistics.median(g)) for g in big)
         values = trusted
     groups = groups_of(values)
     need = max(min(2, min_readings), MIN_GROUP_SHARE * len(values))
@@ -202,6 +237,8 @@ def build(readings, min_lengths, min_recoils, report):
             value, count, note = choose(by_attack[None], min_readings)
             if value is None:
                 report.append("not shipped  %s: %s" % (name, note))
+                if note.startswith(SPLIT_NOTE):
+                    table[kind].setdefault(breed, {})[anim] = (None, count, note)
                 continue
             table[kind].setdefault(breed, {})[anim] = (value, count, note)
             if note:
@@ -240,10 +277,118 @@ def build(readings, min_lengths, min_recoils, report):
         value, count, note = choose(everything, min_readings)
         if value is None:
             report.append("not shipped  %s (every attack): %s" % (name, note))
+            if note.startswith(SPLIT_NOTE):
+                table[kind].setdefault(breed, {})[anim] = (None, count, note)
             continue
         table[kind].setdefault(breed, {})[anim] = (value, count, note)
         report.append("every attack %s = %.2f (%d readings%s%s)" % (name, value, count, ", attacks: " + ", ".join(sorted(named)) if named else ", attacks not named in these logs", ", " + note if note else ""))
     return table
+
+
+def share(table, report):
+    """Fills each enemy's missing stagger lengths from the enemies whose lengths all agree with its own (D47)."""
+    lengths = table["length"]
+    own = {breed: {anim: entry for anim, entry in by_anim.items() if entry[0] is not None} for breed, by_anim in lengths.items()}
+    mates = collections.defaultdict(list)
+    for a, b in itertools.combinations(sorted(own), 2):
+        common = set(own[a]) & set(own[b])
+        if len(common) < SHARE_MIN:
+            continue
+        differ = sorted(anim for anim in common if abs(own[a][anim][0] - own[b][anim][0]) > SHARE_TOLERANCE)
+        report.append("compared     length %s and %s: %d agree, %d differ%s" % (a, b, len(common) - len(differ), len(differ), " (%s)" % ", ".join("%s %.2f/%.2f" % (anim, own[a][anim][0], own[b][anim][0]) for anim in differ[:4]) if differ else ""))
+        if not differ:
+            mates[a].append((len(common), b))
+            mates[b].append((len(common), a))
+    for breed in sorted(mates):
+        for _, mate in sorted(mates[breed], reverse=True):
+            added = 0
+            for anim, (value, count, note) in sorted(own[mate].items()):
+                if anim not in lengths[breed]:
+                    lengths[breed][anim] = (value, count, "from " + mate)
+                    added += 1
+            if added:
+                report.append("shared       length %s: %d from %s" % (breed, added, mate))
+
+
+def strings(text):
+    return re.findall(r'"([a-z_0-9]+)"', text)
+
+
+def block_at(text, start):
+    """The text of the {...} that starts at text[start] == '{'."""
+    depth = 0
+    in_string = False
+    i = start
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                in_string = False
+        elif c == '"':
+            in_string = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+        i += 1
+    return text[start:]
+
+
+def breed_animations(source):
+    """breed -> (stagger animations, recoil animations) from the decompiled breed files. A file's tables count for
+    every breed it defines (a stormvermin commander shares the stormvermin's). Rough, but it is only a tally."""
+    found = {}
+    for path in sorted(glob.glob(os.path.join(source, "breed_*.lua"))):
+        with io.open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        staggers, recoils = set(), set()
+        for key in STAGGER_TABLES:
+            for match in re.finditer(r"\b%s = \{" % key, text):
+                staggers.update(strings(block_at(text, match.end() - 1)))
+        for match in re.finditer(r"\bblocked_anims = \{", text):
+            recoils.update(strings(block_at(text, match.end() - 1)))
+        if not staggers and not recoils:
+            continue
+        for breed in set(re.findall(r"^Breeds\.([a-z_0-9]+) = ", text, re.M)):
+            found[breed] = (staggers, recoils)
+    return found
+
+
+def tally(table, source, covered):
+    """The Markdown tally of timed animations, or None if the breed files aren't there."""
+    animations = breed_animations(source)
+    if not animations:
+        return None
+    rows = []
+    groups = collections.OrderedDict((name, [0, 0, 0, 0, 0]) for _, name in FACTIONS)
+
+    def counts(breed):
+        staggers, recoils = animations[breed]
+        lengths = {anim for anim, entry in table["length"].get(breed, {}).items() if entry[0] is not None}
+        timed_recoils = {anim for kind in BY_ATTACK for anim, entry in table[kind].get(breed, {}).items() if isinstance(entry, dict) or entry[0] is not None}
+        return len(staggers & lengths), len(staggers), len(recoils & timed_recoils), len(recoils)
+
+    for breed in sorted(covered, key=lambda b: NAMES.get(b, b)):
+        if breed in animations:
+            a, b, c, d = counts(breed)
+            rows.append("| %s | %d of %d | %d of %d |" % (NAMES.get(breed, breed), a, b, c, d))
+    for breed in sorted(animations):
+        if breed in covered:
+            continue
+        for prefix, name in FACTIONS:
+            if breed.startswith(prefix):
+                totals = groups[name]
+                for i, n in enumerate(counts(breed)):
+                    totals[i] += n
+                totals[4] += 1
+    for name, (a, b, c, d, n) in groups.items():
+        if n:
+            rows.append("| Other %s (%d types) | %d of %d | %d of %d |" % (name, n, a, b, c, d))
+    return "\n".join(["| Enemy | Staggers timed | Recoils timed |", "|---|---|---|"] + rows)
 
 
 def comment(count, note):
@@ -266,7 +411,10 @@ def write_block(table):
                     lines.append("\t\t\t},")
                 else:
                     value, count, note = entry
-                    lines.append("\t\t\t%s = %.2f, %s" % (anim, value, comment(count, note)))
+                    if value is None:
+                        lines.append("\t\t\t%s = false, -- %s" % (anim, note.replace(SPLIT_NOTE, "split")))
+                    else:
+                        lines.append("\t\t\t%s = %.2f, %s" % (anim, value, comment(count, note)))
             lines.append("\t\t},")
         lines.append("\t},")
     lines.append("}")
@@ -282,28 +430,52 @@ def main():
     parser.add_argument("--min-recoil-readings", type=int, default=1, help="readings a recoil timing needs, per attack (default: %(default)s)")
     parser.add_argument("--timings", default=TIMINGS, help="path to Timings.lua (default: %(default)s)")
     parser.add_argument("--shared", default=SHARED, help="path to Shared.lua (default: %(default)s)")
+    parser.add_argument("--source", default=SOURCE, help="the decompiled breed files, for the tally (default: %(default)s)")
+    parser.add_argument("--handout", help="write the tally into this handout, between its tally lines")
     parser.add_argument("--dry-run", action="store_true", help="print the new table instead of writing it")
     args = parser.parse_args()
 
-    breeds = breed_set(args.shared, "REACTION_BREEDS")
+    covered = breed_set(args.shared, "REACTION_BREEDS")
     normal = {path.replace("\\", "/") for path in args.normal_speed}
     no_cues = {path.replace("\\", "/") for path in args.no_host_cues}
     readings = collections.defaultdict(list)
     counts = collections.Counter()
     for path in args.logs:
         key = path.replace("\\", "/")
-        side, found = read_log(path, breeds, key in normal, key in no_cues, readings, counts)
+        side, found = read_log(path, key in normal, key in no_cues, readings, counts)
         print("%s (%s%s%s): %d readings" % (path, side, ", normal speed" if key in normal else "", ", no host cues" if key in no_cues else "", found))
     for name, count in sorted(counts.items()):
         print("  %s: %d" % (name, count))
 
     report = []
     table = build(readings, args.min_readings, args.min_recoil_readings, report)
+    share(table, report)
     for line in report:
         print(line)
     for kind in KINDS:
-        values = sum(len(entry) if isinstance(entry, dict) else 1 for by_anim in table[kind].values() for entry in by_anim.values())
+        values = sum(len(entry) if isinstance(entry, dict) else int(entry[0] is not None) for by_anim in table[kind].values() for entry in by_anim.values())
         print("%s: %d values for %d breeds" % (kind, values, len(table[kind])))
+
+    tally_text = tally(table, args.source, covered)
+    if tally_text is None:
+        print("No tally: no breed files in %s" % args.source)
+    elif args.handout and not args.dry_run:
+        with io.open(args.handout, encoding="utf-8", newline="") as f:
+            handout = f.read()
+        handout_newline = "\r\n" if "\r\n" in handout else "\n"
+        handout = handout.replace("\r\n", "\n")
+        if TALLY_START not in handout or TALLY_END not in handout:
+            print("No tally lines in %s: add %s and %s around the table first." % (args.handout, TALLY_START, TALLY_END))
+        else:
+            before, rest = handout.split(TALLY_START, 1)
+            _, after = rest.split(TALLY_END, 1)
+            handout = before + TALLY_START + "\n" + tally_text + "\n" + TALLY_END + after
+            with io.open(args.handout, "w", encoding="utf-8", newline="") as f:
+                f.write(handout.replace("\n", handout_newline))
+            print("Wrote the tally into %s. Rebuild its PDF." % args.handout)
+    else:
+        print()
+        print(tally_text)
 
     with io.open(args.timings, encoding="utf-8", newline="") as f:
         source = f.read()

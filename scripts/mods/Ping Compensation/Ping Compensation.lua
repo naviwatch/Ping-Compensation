@@ -100,7 +100,7 @@ end
 -- looks like a client, so the summary written then uses this.
 local hosted_last = nil
 
-local USAGE = "Usage: /pingcomp version | stats | timings | missing [enemy] | debug on|off | attacks on|off | recoil off|anim|full | predict on|off | stagger speed|end|off | combowait on|off | echo on|off | facing on|off | dodgecount on|off | probe vars|speed|off | mark <note>"
+local USAGE = "Usage: /pingcomp version | stats | timings | missing [enemy] | debug on|off | attacks on|off | recoil off|anim|full | predict on|off | stagger speed|end|off | combowait on|off | echo on|off | facing on|off | dodgecount on|off | probe vars|speed|state|jump|off | mark <note>"
 
 local SWITCH_VALUES = {
 	on = true,
@@ -387,7 +387,7 @@ mod:command("pingcomp", mod:localize("pingcomp_command_description"), function (
 
 		pc.say("Wrote %d stagger lengths (%d learned here), %d recoil cues (%d learned here) and %d recoil stunned cues (%d learned here) to the console log.", lengths, own_lengths, cues, own_cues, stunned, own_stunned)
 	elseif action == "missing" then
-		-- For a calibration session (D46): what each covered enemy still lacks.
+		-- For calibration and playtests (D46, D47): what each covered enemy, or one enemy of any type, still lacks.
 		pc.guard("missing timings", pc.probe_tools.missing, value)
 	elseif action == "probe" then
 		pc.guard("probe", pc.probe_tools.command, args)

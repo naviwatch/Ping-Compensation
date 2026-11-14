@@ -32,7 +32,7 @@ Spawn one enemy at a time, or two or three of the same kind.
 |---|---|---|---|
 | Ungor | normal and running attacks | every kind | Nothing timed yet |
 | Gor | normal, running and headbutt attacks | every kind | Nothing timed yet |
-| Shielded stormvermin | none needed (its blocked attacks aren't predicted yet) | every kind, including hits on its shield and breaking it | Nothing timed yet |
+| Shielded stormvermin | its sweep (its frenzy never recoils; the sweep's recoil is predicted from step 4, but timed now) | every kind, including hits on its shield and breaking it | Nothing timed yet |
 | Savage | single swings and running attacks | every kind | Ends its recoils with the stunned cue; very few readings so far |
 | Plague monk | single swings | every kind | No recoils timed yet |
 | Fanatic | normal and running attacks | heavy, explosion, ranged | Recoils depend on the attack; none shipped yet |
@@ -53,3 +53,16 @@ This changes only your own game, so do it after Part 1.
 4. Type `/pingcomp probe off`.
 
 Readings taken while the probe is on are logged, not learned.
+
+Done on 2026-11-14. Only `stagger_scale` exists, and it speeds up Skaven and ungor staggers only, and no enemy's recoils (D47).
+
+## Part 3: animation state probe (build 3.2 stage 2)
+
+About ten minutes alone, on the stage 2 build, before testers get it (D47). It finds out whether the animation state the game sends to players who join mid-game holds the animation's time, which would let the host move a recoil or a stagger on for everyone.
+
+1. Spawn a marauder, a clan rat and a gor. Type `/pingcomp probe vars`.
+2. Type `/pingcomp probe state`. Block each enemy about 3 times, and stagger each about 3 times with light hits and 3 times with pushes.
+3. Type `/pingcomp probe jump 2` and do the same again. This one is an experiment: enemies may skip, jitter or freeze for a moment. One whose animation never reaches its end is let go after 4 seconds.
+4. Type `/pingcomp probe off`, then `/pingcomp missing` once, and send the log.
+
+Use `/pingcomp mark <note>` before each step, and to note anything that looked odd.
