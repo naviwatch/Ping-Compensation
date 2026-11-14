@@ -48,7 +48,8 @@ local SETTINGS = {
 
 -- Seconds, with how many readings each value came from, rebuilt from scratch for build 3.2 (D43, D47) by
 -- Docs/rebuild_timings.py from the playtests of steps 2.1 and 2.2 and of builds 3 and 3.1 (2026-11-12 and -13) and
--- Lance's two calibration logs (2026-11-14: build 3.1's ungor tests and the stage 1 session), without the 2.1 and 2.2
+-- Lance's three calibration logs (2026-11-14: build 3.1's ungor tests, the stage 1 session and the stage 2 animation
+-- state probe), without the 2.1 and 2.2
 -- hosts' recoil cues (timed from the wrong start), and with the build 3.1 logs' readings counted as taken at normal
 -- speed. "lowest of N groups": that animation's readings in the older logs fell into groups a speed factor apart, from
 -- staggers timed at a speed they didn't reach, and only the lowest counts. "from <enemy>": a stagger length taken from
@@ -67,12 +68,12 @@ local DEFAULTS = {
 			stagger_left_heavy_2 = 1.08, -- 2
 			stagger_right = 1.08, -- 8
 			stagger_right_heavy_2 = 1.08, -- 6
-			stun_bwd_sword = 0.81, -- 25
-			stun_bwd_sword_2 = 0.81, -- 26
-			stun_bwd_sword_3 = 0.81, -- 19
+			stun_bwd_sword = 0.81, -- 29
+			stun_bwd_sword_2 = 0.81, -- 28
+			stun_bwd_sword_3 = 0.81, -- 21
 			stun_fwd_sword_2 = 0.78, -- 4
-			stun_left_sword = 0.74, -- 8
-			stun_left_sword_2 = 0.74, -- 18
+			stun_left_sword = 0.74, -- 10
+			stun_left_sword_2 = 0.74, -- 21
 			stun_right_sword = 0.74, -- 12
 			stun_right_sword_2 = 0.74, -- 11
 			stun_right_sword_3 = 0.74, -- 10
@@ -230,14 +231,14 @@ local DEFAULTS = {
 			stagger_bwd_heavy = 2.52, -- 3, from chaos_fanatic
 			stagger_bwd_heavy_3 = 2.48, -- 4, from chaos_fanatic
 			stagger_bwd_heavy_4 = 2.56, -- 2, from chaos_fanatic
-			stagger_bwd_light = 0.73, -- 49
+			stagger_bwd_light = 0.73, -- 50
 			stagger_bwd_light_2 = 0.70, -- 49
-			stagger_bwd_light_3 = 0.68, -- 41
-			stagger_bwd_light_4 = 0.66, -- 45
+			stagger_bwd_light_3 = 0.68, -- 43
+			stagger_bwd_light_4 = 0.66, -- 46
 			stagger_bwd_light_5 = 0.73, -- 48
-			stagger_bwd_light_6 = 0.87, -- 36
+			stagger_bwd_light_6 = 0.87, -- 37
 			stagger_bwd_light_7 = 0.80, -- 56
-			stagger_bwd_light_8 = 0.70, -- 43
+			stagger_bwd_light_8 = 0.70, -- 44
 			stagger_bwd_shield_light = 2.59, -- 9, from chaos_marauder_with_shield
 			stagger_fwd = 1.17, -- 4, lowest of 3 groups
 			stagger_fwd_2 = 1.19, -- 3
@@ -260,7 +261,7 @@ local DEFAULTS = {
 			stagger_left_light = 0.72, -- 12
 			stagger_left_light_2 = 0.87, -- 13
 			stagger_left_light_3 = 0.87, -- 13
-			stagger_left_light_4 = 0.85, -- 7
+			stagger_left_light_4 = 0.84, -- 9
 			stagger_left_shield_light = 2.63, -- 2, from chaos_marauder_with_shield
 			stagger_medium_downward_2 = 1.86, -- 3, from chaos_marauder_with_shield
 			stagger_right = 1.09, -- 5
@@ -381,14 +382,14 @@ local DEFAULTS = {
 			stagger_right_heavy_3 = 1.42, -- 4, from skaven_slave
 			stagger_right_heavy_4 = 1.81, -- 2, from beastmen_ungor
 			stagger_right_heavy_5 = 1.51, -- 3
-			stun_bwd_sword = 0.61, -- 6
+			stun_bwd_sword = 0.61, -- 7
 			stun_down = 0.62, -- 6, lowest of 4 groups
-			stun_fwd_sword = 0.61, -- 58
-			stun_left_sword = 0.61, -- 11
-			stun_left_sword_2 = 0.61, -- 12
+			stun_fwd_sword = 0.61, -- 61
+			stun_left_sword = 0.61, -- 12
+			stun_left_sword_2 = 0.61, -- 14
 			stun_left_sword_3 = 0.61, -- 13
 			stun_right_sword = 0.61, -- 6
-			stun_right_sword_2 = 0.61, -- 12
+			stun_right_sword_2 = 0.61, -- 13
 			stun_right_sword_3 = 0.61, -- 9
 		},
 		skaven_clan_rat_with_shield = {
@@ -543,11 +544,11 @@ local DEFAULTS = {
 		chaos_marauder = {
 			blocked = {
 				attack_move = 2.34, -- 5
-				attack_move_2 = 2.04, -- 3
+				attack_move_2 = 2.04, -- 4
 				attack_move_3 = 1.27, -- 2
 				attack_move_4 = 1.64, -- 3
-				attack_pounce = 0.95, -- 16
-				attack_pounce_2 = 1.44, -- 5
+				attack_pounce = 0.95, -- 17
+				attack_pounce_2 = 1.44, -- 6
 				attack_pounce_3 = 0.95, -- 8
 				attack_pounce_4 = 1.22, -- 3
 				attack_pounce_5 = 1.27, -- 3
@@ -573,7 +574,7 @@ local DEFAULTS = {
 		},
 		skaven_clan_rat = {
 			blocked = 0.81, -- 136
-			blocked_2 = 1.01, -- 168
+			blocked_2 = 1.01, -- 169
 			blocked_3 = 0.68, -- 166
 		},
 		skaven_slave = {
@@ -588,16 +589,17 @@ local DEFAULTS = {
 	stunned = {
 		beastmen_gor = {
 			blocked = {
-				attack_1h = 1.40, -- 1
-				attack_1h_2 = 1.41, -- 1
-				attack_1h_3 = 1.40, -- 2
+				attack_1h = 1.40, -- 2
+				attack_1h_2 = 1.40, -- 2
+				attack_1h_3 = 1.40, -- 3
+				attack_headbutt_2 = 1.41, -- 1
 				attack_punch = 1.30, -- 1
 				attack_run = 1.40, -- 1
 				attack_step = 1.40, -- 2
 				attack_step_2 = 1.40, -- 3
 				attack_step_head = 1.40, -- 2
 			},
-			blocked_2 = 1.40, -- 21
+			blocked_2 = 1.40, -- 28
 		},
 		beastmen_ungor = {
 			blocked = 2.40, -- 17
@@ -637,11 +639,11 @@ local DEFAULTS = {
 		chaos_marauder = {
 			blocked = {
 				attack_move = 2.35, -- 5
-				attack_move_2 = 2.05, -- 3
+				attack_move_2 = 2.05, -- 4
 				attack_move_3 = 1.28, -- 2
 				attack_move_4 = 1.65, -- 3
-				attack_pounce = 0.95, -- 3
-				attack_pounce_2 = 1.45, -- 3
+				attack_pounce = 0.95, -- 4
+				attack_pounce_2 = 1.45, -- 4
 				attack_pounce_3 = 0.95, -- 2
 				attack_pounce_4 = 1.22, -- 1
 				attack_pounce_5 = 1.29, -- 2
@@ -667,7 +669,7 @@ local DEFAULTS = {
 		},
 		skaven_clan_rat = {
 			blocked = 0.82, -- 8
-			blocked_2 = 1.02, -- 2
+			blocked_2 = 1.02, -- 3
 			blocked_3 = 0.69, -- 2, lowest of 2 groups
 		},
 		skaven_clan_rat_with_shield = {

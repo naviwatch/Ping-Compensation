@@ -114,9 +114,10 @@ def side_of(path):
     host = client = 0
     with io.open(path, encoding="utf-8", errors="replace") as log:
         for line in log:
-            if "[PingComp] host " in line:
+            # A solo host has no host swing lines: its typed commands and stats lines name its side too.
+            if "[PingComp] host " in line or " role=host" in line or "started (host," in line:
                 host += 1
-            elif "[PingComp] client " in line:
+            elif "[PingComp] client " in line or " role=client" in line or "started (client," in line:
                 client += 1
     return "host" if host > client else "client"
 
