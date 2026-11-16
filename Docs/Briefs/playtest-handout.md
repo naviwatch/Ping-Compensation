@@ -114,18 +114,18 @@ Every player's game times every enemy's staggers and recoils, so every playtest 
 |---|---|---|
 | Clan rat | 47 of 74 | 3 of 3 |
 | Fanatic | 52 of 83 | 1 of 1 |
-| Gor | 18 of 36 | 2 of 2 |
+| Gor | 22 of 36 | 2 of 2 |
 | Marauder | 52 of 83 | 1 of 1 |
 | Plague monk | 7 of 15 | 3 of 3 |
-| Savage | 33 of 79 | 3 of 3 |
+| Savage | 36 of 79 | 3 of 3 |
 | Shielded clan rat | 40 of 74 | 3 of 3 |
 | Shielded marauder | 56 of 86 | 1 of 1 |
 | Shielded stormvermin | 10 of 33 | 2 of 2 |
 | Slave rat | 47 of 74 | 3 of 3 |
 | Ungor | 47 of 83 | 3 of 3 |
-| Other Skaven (16 types) | 8 of 394 | 1 of 9 |
+| Other Skaven (16 types) | 8 of 394 | 2 of 9 |
 | Other Chaos (20 types) | 0 of 496 | 0 of 9 |
-| Other Beastmen (8 types) | 0 of 330 | 0 of 15 |
+| Other Beastmen (8 types) | 2 of 330 | 2 of 15 |
 <!-- tally end -->
 
 **For developers:** the message version is 11 (`VERSION` in `Shared.lua`), so build 3.2 can't play with build 3.1 or earlier. `CLAUDE.md` lists every hook, message and log line, and the design brief's "Checking the build 3.2 playtest" says what to look for in the logs.
