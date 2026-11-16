@@ -311,8 +311,8 @@ local function stagger_procs(unit, blackboard, attacker, profile_name, target_in
 	end
 end
 
--- Copy of action_ignores_stagger (damage_utils.lua:3537), without the side effect of its "reset_attack" case, which
--- none of CHECK_BREEDS use.
+-- Copy of action_ignores_stagger (damage_utils.lua:3537), without the side effect of its "reset_attack" case: its
+-- second value is that case's entry, for host_would to apply.
 local function action_ignores(blackboard, attack_template, stagger_type)
 	if blackboard.anim_cb_stagger_immune then
 		return true
@@ -338,7 +338,11 @@ local function action_ignores(blackboard, attack_template, stagger_type)
 			return percent > ignore.health.min and percent <= ignore.health.max
 		end
 
-		return ignore.type == "reset_attack"
+		if ignore.type == "reset_attack" then
+			return true, ignore
+		end
+
+		return false
 	end
 
 	return ignore == true
@@ -346,8 +350,10 @@ end
 
 -- What DamageUtils.stagger_ai (damage_utils.lua:3578) would have decided here for a hit whose stagger the client
 -- decides, without applying it. Its maths, DamageUtils.calculate_stagger_player, runs as it would have in vanilla, procs
--- included. The one thing it leaves on the enemy, a shield's blocked_previous_attack, is put back (CHECK_BREEDS carry no
--- shield). Not copied: the stagger immunity of elites and bosses, which CHECK_BREEDS don't have.
+-- included. The one thing it leaves on the enemy, a shield's blocked_previous_attack, is put back. One thing the skipped
+-- stagger_ai would have done is done here: an attack that ignores this stagger by restarting its wind-up (an elite's
+-- "reset_attack", damage_utils.lua:3565) is reset, as in vanilla, since the client sends nothing for a stagger its
+-- enemy ignores. Not copied: a grudge mark's stagger immunity (T15).
 -- Returns the stagger type (0 for none), why there is none, and the stagger strength the maths worked out.
 local function host_would(damage_profile, target_index, power_level, target_unit, attacker_unit, hit_zone_name, boost_curve_multiplier, is_critical_strike, blocked, damage_source)
 	local blackboard = BLACKBOARDS[target_unit]
@@ -386,7 +392,19 @@ local function host_would(damage_profile, target_index, power_level, target_unit
 		return 0, stagger_value == 0 and duration == 0 and "its action ignores this stagger" or "too weak to stagger", strength
 	end
 
-	if action_ignores(blackboard, attack_template, stagger_type) then
+	local ignores, reset = action_ignores(blackboard, attack_template, stagger_type)
+
+	if ignores then
+		if reset and not blackboard.anim_cb_stagger_immune then
+			blackboard.reset_attack = true
+			blackboard.reset_attack_delay = reset.delay
+
+			pc.count("host_attack_reset")
+			pc.log("host check enemy=%s: a client's hit reset its attack (%s), as vanilla would", blackboard.breed.name, type(blackboard.action) == "table" and tostring(blackboard.action.name) or "?")
+
+			return 0, "its attack restarts its wind-up instead", strength
+		end
+
 		return 0, blackboard.anim_cb_stagger_immune and "stagger immune (animation cue)" or "its action ignores this stagger", strength
 	end
 
@@ -1310,6 +1328,13 @@ end
 -- Called from the BTAttackAction.enter hook in Host.lua for every single attack.
 function host_reactions.note_attack(unit, anim)
 	attack_anims[unit] = anim
+end
+
+-- The attack animation the host last played on this enemy. The elites' sweeps and shoves (BTStormVerminAttackAction,
+-- BTStormVerminPushAction) play theirs without writing it to the blackboard, so Host.lua announces families C and D
+-- with this (D49).
+function host_reactions.last_attack_anim(unit)
+	return attack_anims[unit]
 end
 
 -- Called for every animation the host plays on an enemy (AnimationSystem.anim_event): an attack animation is the attack

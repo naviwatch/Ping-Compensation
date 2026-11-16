@@ -2,8 +2,10 @@ local mod = get_mod("Ping Compensation")
 local pc = mod.pc
 
 -- Client side. For every swing the host announces at this player, the client:
---   1. turns its copy of the enemy itself, by the game's own rules, from the player's live position and dodge,
---   2. judges the swing on the frame its copy of the enemy fires the damage animation event,
+--   1. turns its copy of the enemy itself, by the game's own rules, from the player's live position and dodge (for an
+--      elite's sweep, only if this player is the one it attacks),
+--   2. judges the swing on the frame its copy of the enemy fires the damage animation event: reach and cone for single
+--      swings, frenzy steps and shoves, the game's box for an elite's sweep or overhead,
 --   3. plays its own block at once if it blocked, and sends the result to the host,
 --   4. shows the result at once: the enemy's recoil after a block (Reactions.lua) and, for a hit, the feedback,
 --      knockback and HP estimate (HitResults.lua).
@@ -23,11 +25,23 @@ local FACING_HOLD = 1 -- seconds the facing stays ours after the damage frame, u
 local CUT_MEMORY = 2 -- seconds a cut swing is remembered, only so that a damage event that still fires gets logged
 local MAX_FRAMES = 8
 
+-- The damage frame of each family: A, single swings; B, frenzy combo steps; C, elites' sweeps and overheads; D,
+-- elites' shoves.
+local FRAME_CALLBACKS = {
+	A = "anim_cb_damage",
+	B = "anim_cb_frenzy_damage",
+	C = "anim_cb_damage",
+	D = "anim_cb_stormvermin_push",
+}
+
 local swings = {} -- swing id -> record, kept for the stats and the debug log
 local by_unit = {} -- enemy unit -> its newest record
 local by_go_id = {} -- enemy network id -> the same record
 local recently_cut = {} -- enemy unit -> { id, by, t } for swings cut in the last CUT_MEMORY seconds
 local hello_timer = 0
+local host_answered = false -- the host has replied to a hello since this mission started
+local contact_lost = false -- the player has been told the host went quiet
+local reping_timer = 0
 
 local local_player_unit = pc.local_player_unit
 
@@ -244,6 +258,74 @@ local function update_combo_facing(swing, unit, target, t, dt)
 	end
 end
 
+-- For the debug log, as for family A: did the player dodge during this swing, and was any of those dodges over the
+-- dodge count?
+local function note_dodges(swing, status)
+	if status and not swing.past_damage and status.is_dodging then
+		swing.dodged = true
+
+		if not status:get_is_dodging() then
+			swing.dodge_over_count = true
+		end
+	end
+end
+
+-- The host's AI locomotion eases an enemy towards its wanted rotation at ROTATION_SPEED and snaps once a frame's step
+-- reaches 1 (locomotion_templates_ai.lua:156). Do the same here, so it turns no faster.
+local function ease_facing(swing, unit, dt)
+	local rotation = Quaternion.lerp(swing.current:unbox(), swing.wanted:unbox(), math.min(ROTATION_SPEED * dt, 1))
+
+	swing.current:store(rotation)
+
+	if pc.facing then
+		Unit.set_local_rotation(unit, 0, rotation)
+	end
+end
+
+-- Family C: copy of BTStormVerminAttackAction.attack (bt_storm_vermin_attack_action.lua:349), fed from this player's
+-- live state. The enemy tracks the player until the attack's rotation time runs out, and a dodge stops the tracking
+-- for good. Only on the screen of the player the enemy attacks; others in the box see the host's facing.
+local function update_box_facing(swing, unit, target, t, dt)
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	note_dodges(swing, status)
+
+	if status and not swing.past_damage then
+		if is_dodging(status) then
+			swing.track_until = t
+			swing.frozen = true
+		end
+
+		if t < swing.track_until then
+			local rotation = flat_rotation(Unit.local_position(unit, 0), Unit.local_position(target, 0))
+
+			if rotation then
+				swing.wanted:store(rotation)
+			end
+		end
+	end
+
+	ease_facing(swing, unit, dt)
+end
+
+-- Family D: copy of BTStormVerminPushAction.attack (bt_storm_vermin_push_action.lua:88). The enemy turns towards the
+-- player the whole time; a dodge doesn't stop it.
+local function update_shove_facing(swing, unit, target, t, dt)
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	note_dodges(swing, status)
+
+	if not swing.past_damage then
+		local rotation = flat_rotation(Unit.local_position(unit, 0), Unit.local_position(target, 0))
+
+		if rotation then
+			swing.wanted:store(rotation)
+		end
+	end
+
+	ease_facing(swing, unit, dt)
+end
+
 -- Runs after LocomotionSystem.update, which is where the engine has just eased every enemy copy towards the facing
 -- the host sent. Setting the rotation here, every frame, is what makes the facing ours.
 function client.after_locomotion(t, dt)
@@ -260,6 +342,12 @@ function client.after_locomotion(t, dt)
 			forget(swing)
 		elseif swing.family == "B" then
 			update_combo_facing(swing, unit, target, t, dt)
+		elseif swing.family == "C" then
+			if swing.aimed then
+				update_box_facing(swing, unit, target, t, dt)
+			end
+		elseif swing.family == "D" then
+			update_shove_facing(swing, unit, target, t, dt)
 		else
 			update_facing(swing, unit, target, t, dt)
 		end
@@ -301,13 +389,58 @@ local function play_block(swing, unit, status, multiplier, improved, direction)
 	status:blocked_attack(pc.fatigue_type(swing.action, swing.step), unit, multiplier, improved, direction)
 end
 
--- Called from the AnimationSystem.animation_callback hook when an enemy copy fires anim_cb_damage (family A) or
--- anim_cb_frenzy_damage (family B) on this client.
+local own_hit_boxes = {} -- player unit -> whether the game's overlap finds that unit's own hit boxes on this machine
+
+-- Whether the overlap an elite's box test uses can see this player's own hit boxes on this machine. It is checked
+-- once per player unit, with a small box around the player, and logged.
+local function overlap_sees(target)
+	local known = own_hit_boxes[target]
+
+	if known == nil then
+		local units = pc.geometry.units_in_box(Unit.world(target), position(target) + Vector3(0, 0, 0.9), Quaternion.identity(), Vector3(0.5, 0.5, 0.9))
+
+		known = units[target] == true
+		own_hit_boxes[target] = known
+
+		pc.log("client: the game's overlap %s this player's own hit boxes, so elites' sweeps are judged %s", known and "finds" or "doesn't find", known and "with it" or "by shape")
+	end
+
+	return known
+end
+
+-- Family C: whether this player is in the elite's box at its damage frame on this screen (Geometry.lua), with the
+-- game's own overlap where it sees this player's hit boxes, else with plain shapes. Also returns the distance and
+-- the angle from the enemy's facing, for the log.
+local function judge_box(swing, unit, target, rotation)
+	local centre, box_rotation, size = pc.geometry.elite_box(swing.action, Unit.local_position(unit, 0), rotation)
+	local inside
+
+	if overlap_sees(target) then
+		inside = pc.geometry.units_in_box(Unit.world(unit), centre, box_rotation, size)[target] == true
+		swing.box_method = "overlap"
+
+		pc.count("client_box_overlap")
+	else
+		inside = pc.geometry.player_in_box(position(target), centre, box_rotation, size)
+		swing.box_method = "shape"
+
+		pc.count("client_box_shape")
+	end
+
+	local offset = position(target) - position(unit)
+	local flat = Vector3.flat(offset)
+	local forward = Quaternion.forward(rotation)
+	local cosine = Vector3.length_squared(flat) > 0 and Vector3.dot(Vector3.normalize(flat), Vector3.normalize(Vector3.flat(forward))) or 1
+
+	return inside, Vector3.length(offset), math.deg(math.acos(math.max(-1, math.min(1, cosine))))
+end
+
+-- Called from the AnimationSystem.animation_callback hook when an enemy copy fires the damage frame of the swing it
+-- has open at this player: anim_cb_damage (families A and C), anim_cb_frenzy_damage (B) or anim_cb_stormvermin_push (D).
 function client.damage_frame(unit, callback_name)
 	local swing = by_unit[unit]
 
-	-- A frenzy step's damage frame is anim_cb_frenzy_damage, a single swing's anim_cb_damage.
-	if swing and (callback_name == "anim_cb_frenzy_damage") ~= (swing.family == "B") then
+	if swing and FRAME_CALLBACKS[swing.family] ~= callback_name then
 		return
 	end
 
@@ -347,21 +480,32 @@ function client.damage_frame(unit, callback_name)
 
 	local action = swing.action
 	local breed = swing.breed
-	local combo = swing.family == "B"
-	local use_our_facing = pc.facing
+	local family = swing.family
+	local combo = family == "B"
+	-- Only the screen of the player the enemy attacks turns it; others in an elite's box see the host's facing.
+	local use_our_facing = pc.facing and swing.aimed
 	local rotation = use_our_facing and swing.current:unbox() or Unit.local_rotation(unit, 0)
-	local forward = Quaternion.forward(rotation)
-	local offset = position(target) - position(unit)
-	-- The game tightens the reach and cone after a dodge: family A while its facing is frozen, family B once the player
-	-- has dodged during the step (target_dodged_during_attack, damage_utils.lua:2642).
-	local tightened = combo and swing.dodged_during_attack or not combo and swing.frozen
-	local in_reach, in_front, distance, reach, angle, cone = pc.geometry.single_target(offset.x, offset.y, offset.z, forward.x, forward.y, tightened, action, breed, swing.box_up, swing.box_down, swing.box_flat)
+	local in_reach, in_front, distance, reach, angle, cone, tightened
+
+	if family == "C" then
+		in_reach, distance, angle = judge_box(swing, unit, target, rotation)
+		in_front, reach, cone, tightened = true, 0, 0, swing.frozen
+	else
+		local forward = Quaternion.forward(rotation)
+		local offset = position(target) - position(unit)
+
+		-- The game tightens the reach and cone after a dodge: family A while its facing is frozen, family B once the
+		-- player has dodged during the step (target_dodged_during_attack, damage_utils.lua:2642). A shove never does.
+		tightened = combo and swing.dodged_during_attack or family == "A" and swing.frozen
+		in_reach, in_front, distance, reach, angle, cone = pc.geometry.single_target(offset.x, offset.y, offset.z, forward.x, forward.y, tightened, action, breed, swing.box_up, swing.box_down, swing.box_flat)
+	end
+
 	local status = ScriptUnit.has_extension(target, "status_system")
 	local result, reason = "hit", "landed"
 	local multiplier, improved, direction, through_block
 
 	if not in_reach then
-		result, reason = "miss", "reach"
+		result, reason = "miss", family == "C" and "box" or "reach"
 	elseif not in_front then
 		result, reason = "miss", "cone"
 	else
@@ -378,6 +522,14 @@ function client.damage_frame(unit, callback_name)
 
 	pc.count("client_judged")
 	pc.count(result == "miss" and "client_miss_" .. reason or "client_" .. result)
+
+	if family == "C" or family == "D" then
+		pc.count("client_judged_" .. family)
+
+		if not swing.aimed then
+			pc.count("client_judged_C_not_aimed")
+		end
+	end
 
 	local reactions = pc.reactions
 	local recoil_anim, recoil_position, recoil_yaw
@@ -403,11 +555,20 @@ function client.damage_frame(unit, callback_name)
 			pc.guard("client recoil", reactions.play_recoil, swing, unit, recoil_anim)
 		end
 
-		if not combo then
+		-- An elite's sweep still does its blocked damage and push; a single swing pushes the blocker back.
+		if family == "C" then
+			pc.guard("client box results", pc.hit_results.box, swing, unit, target, true)
+		elseif not combo then
 			pc.guard("client blocked push", pc.hit_results.blocked, swing, unit, target)
 		end
 	elseif result == "hit" then
-		pc.guard("client hit results", pc.hit_results.hit, swing, unit, target)
+		if family == "C" then
+			pc.guard("client box results", pc.hit_results.box, swing, unit, target, false)
+		elseif family == "D" then
+			pc.guard("client shove results", pc.hit_results.shove, swing, unit, target, rotation)
+		else
+			pc.guard("client hit results", pc.hit_results.hit, swing, unit, target)
+		end
 	end
 
 	if result == "hit" and swing.dodge_over_count then
@@ -418,10 +579,10 @@ function client.damage_frame(unit, callback_name)
 		local dodging_now = status ~= nil and status.is_dodging == true
 		local effective_now = status ~= nil and status:get_is_dodging() and true or false
 
-		pc.log("client swing=%d enemy=%s attack=%s%s frame=%d verdict=%s reason=%s distance=%.2f reach=%.2f angle=%.1f cone=%.1f frozen=%s facing=%s since_begin=%.3fs dodging=%s effective=%s dodges=%s/%s dodged_in_swing=%s over_count_in_swing=%s dodgecount=%s recoil=%s",
-			swing.id, breed.name, swing.action_name, combo and "/" .. tostring(swing.step_name) or "", frame, result, reason, distance, reach, angle, cone, tostring(tightened), use_our_facing and "client" or "host", t - swing.begin_t,
+		pc.log("client swing=%d enemy=%s attack=%s%s frame=%d verdict=%s reason=%s distance=%.2f reach=%.2f angle=%.1f cone=%.1f frozen=%s facing=%s since_begin=%.3fs dodging=%s effective=%s dodges=%s/%s dodged_in_swing=%s over_count_in_swing=%s dodgecount=%s recoil=%s family=%s aimed=%s%s",
+			swing.id, breed.name, swing.action_name, combo and "/" .. tostring(swing.step_name) or "", frame, result, reason, distance, reach, angle, cone, tostring(tightened == true), use_our_facing and "client" or "host", t - swing.begin_t,
 			tostring(dodging_now), tostring(effective_now), tostring(status and status.dodge_cooldown), tostring(status and status.dodge_count), tostring(swing.dodged == true), tostring(swing.dodge_over_count == true), pc.dodgecount and "on" or "off",
-			tostring(recoil_anim or "host"))
+			tostring(recoil_anim or "host"), family, tostring(swing.aimed == true), family == "C" and " box=" .. tostring(swing.box_method) or "")
 	end
 end
 
@@ -429,6 +590,22 @@ end
 -- always by a stagger, and the player now sees the enemy stop swinging. On the host a staggered enemy's damage event
 -- does nothing, so here the swing is cut at once (decision D22). The first playtests showed the damage event can still
 -- fire during the blend into the stagger; damage_frame logs that instead of judging it.
+local function names(list, name)
+	if type(list) == "string" then
+		return list == name
+	end
+
+	if type(list) == "table" then
+		for i = 1, #list do
+			if list[i] == name then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
 function client.animation_changed(go_id, anim_id)
 	local swing = by_go_id[go_id]
 
@@ -439,6 +616,14 @@ function client.animation_changed(go_id, anim_id)
 	local event = NetworkLookup.anims[anim_id]
 
 	if event == swing.attack_anim then
+		return
+	end
+
+	-- An elite whose attack shrugs off a stagger restarts the attack's wind-up (reset_attack, bt_storm_vermin_attack_action
+	-- .lua:321): the swing goes on, and its damage frame comes later.
+	if names(swing.action.reset_attack_animations, event) then
+		pc.log("client swing=%d enemy=%s: the attack was reset (%s), the swing goes on", swing.id, swing.breed.name, tostring(event))
+
 		return
 	end
 
@@ -486,13 +671,15 @@ function client.reaction_started(unit, reason)
 end
 
 -- family: "A" for a single swing (BTAttackAction), "B" for one step of a frenzy combo (BTComboAttackAction), whose
--- step_name finds the step in action.combo_attacks. Each step of a combo is announced as its own swing.
-mod:network_register("pc_swing_begin", function (sender, version, id, attacker_go_id, family, set_name, action_name, attack_anim, box_up, box_down, box_flat, damage_scale, step_name)
+-- step_name finds the step in action.combo_attacks, "C" for an elite's sweep or overhead (BTStormVerminAttackAction)
+-- and "D" for an elite's shove (BTStormVerminPushAction). Each step of a combo is announced as its own swing. aimed:
+-- whether this player is the one the enemy attacks; a family C swing goes to every modded player (D50).
+mod:network_register("pc_swing_begin", function (sender, version, id, attacker_go_id, family, set_name, action_name, attack_anim, box_up, box_down, box_flat, damage_scale, step_name, aimed)
 	if pc.broken or pc.is_server() or not pc.in_game() or sender ~= pc.host_peer() or version ~= pc.VERSION then
 		return
 	end
 
-	if type(id) ~= "number" or type(attacker_go_id) ~= "number" or family ~= "A" and family ~= "B" or type(set_name) ~= "string" or type(action_name) ~= "string" or type(attack_anim) ~= "string" then
+	if type(id) ~= "number" or type(attacker_go_id) ~= "number" or not FRAME_CALLBACKS[family] or type(set_name) ~= "string" or type(action_name) ~= "string" or type(attack_anim) ~= "string" then
 		return
 	end
 
@@ -552,6 +739,14 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 	local window_duration = type(durations) == "table" and durations[difficulty] or DEFAULT_DODGE_ROTATION_TIME
 	local wanted_rotation = flat_rotation(Unit.local_position(unit, 0), Unit.local_position(target, 0)) or current_rotation
 
+	-- Family C: how long the enemy tracks the player (BTStormVerminAttackAction._init_attack,
+	-- bt_storm_vermin_attack_action.lua:150): a moving or step attack uses its own time, if it has one.
+	local rotation_time = action.rotation_time
+
+	if family == "C" and (action.moving_attack or names(action.step_attack_anim, attack_anim)) and action.rotation_time_step then
+		rotation_time = action.rotation_time_step
+	end
+
 	local swing = {
 		id = id,
 		family = family,
@@ -585,6 +780,8 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 		box_flat = type(box_flat) == "number" and box_flat or 0,
 		wanted = QuaternionBox(wanted_rotation),
 		current = QuaternionBox(current_rotation),
+		aimed = family ~= "C" or aimed == true,
+		track_until = t + (type(rotation_time) == "number" and rotation_time or 0), -- family C
 	}
 
 	swings[id] = swing
@@ -658,9 +855,62 @@ end)
 mod:network_register("pc_hello_reply", function (sender, version, fingerprint, toggles, matched)
 	if not pc.is_server() and version == pc.VERSION and sender == pc.host_peer() then
 		pc.heard_host()
+
+		host_answered = true
+
 		pc.guard("client difficulty mods", pc.compat.on_host_reply, fingerprint, toggles, matched)
 	end
 end)
+
+-- VMF's hook on PlayerManager.remove_player (vmf/scripts/mods/vmf/modules/core/network.lua:375) drops a peer from its
+-- list of VMF users whenever any player of that peer is removed, and bots share the host's peer id. So each bot the
+-- host removes, for example when a player joins and takes its place, cuts this client off from the host: VMF sends
+-- nothing to a peer off its list, and adds one back only when one of its players is added (the build 3.2 playtest).
+-- A ping from VMF itself puts the host back, because the host answers it with VMF's own pong.
+local function ping_vmf()
+	local vmf = get_mod("VMF")
+
+	if vmf and type(vmf.ping_vmf_users) == "function" then
+		vmf.ping_vmf_users()
+		pc.count("client_vmf_ping")
+		pc.log("client asked VMF to ping every player again: the host has stopped answering")
+	end
+end
+
+-- While a host that has answered in this mission stays quiet, ask VMF to ping again every pc.REPING_INTERVAL, and tell
+-- the player when contact goes and when it comes back, since everything is vanilla for them in between.
+local function keep_in_touch(dt)
+	if not host_answered then
+		return
+	end
+
+	if pc.host_fresh() then
+		if contact_lost then
+			contact_lost = false
+
+			pc.say("Ping Compensation is back in touch with the host: swings at you and your own hits are decided on your screen again.")
+		end
+
+		reping_timer = 0
+
+		return
+	end
+
+	if not contact_lost then
+		contact_lost = true
+
+		pc.count("client_contact_lost")
+		pc.say("Ping Compensation lost touch with the host, so the game is vanilla for you until it is back. Reconnecting...")
+	end
+
+	reping_timer = reping_timer - dt
+
+	if reping_timer <= 0 then
+		reping_timer = pc.REPING_INTERVAL
+
+		pc.guard("client vmf ping", ping_vmf)
+	end
+end
 
 -- The next update sends a hello at once, so the host hears about a changed /pingcomp attacks switch straight away.
 function client.hello_now()
@@ -698,6 +948,8 @@ function client.update(dt)
 			mod:network_send("pc_hello", host_peer, pc.VERSION, pc.attacks and true or false, pc.compat.fingerprint())
 		end
 	end
+
+	keep_in_touch(dt)
 end
 
 function client.clear()
@@ -706,6 +958,10 @@ function client.clear()
 	by_go_id = {}
 	recently_cut = {}
 	hello_timer = 0
+	host_answered = false
+	contact_lost = false
+	reping_timer = 0
+	own_hit_boxes = {}
 
 	pc.forget_host()
 	pc.reactions.clear()

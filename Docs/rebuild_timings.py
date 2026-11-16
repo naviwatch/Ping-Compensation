@@ -30,8 +30,13 @@ the readings, with how many readings it has. Higher groups are listed, and so is
 may run into readings taken too fast. If the readings taken at normal speed split into groups of their own, the
 animation isn't shipped until the key it depends on is known, and is listed; it is written as false, so no machine
 learns a blend of the two either (Timings.lua). Recoils are never played faster, so all
-their readings count as taken at normal speed. A stagger length needs --min-readings readings (default 2) in its
-group; a recoil timing needs --min-recoil-readings (default 1), since one recoil reading is exact to a frame or two.
+their readings count as taken at normal speed, and none comes out too long from a speed it didn't reach. So for a
+recoil (D51) the value is the median of the biggest group instead, the longer one when the biggest groups tie, even
+when its readings split (a recoil is never written as false): a lone low reading is an earlier animation's callback,
+and between two times the slower is preferred, so that the enemy isn't left standing still, staring at its opponent. Before that, a recoil reading under half the median of the same recoil
+animation's values after every attack (each attack's own median counting once) is dropped as such a callback too, and
+listed. A stagger length needs --min-readings readings (default 2) in its group; a recoil timing needs
+--min-recoil-readings (default 1), since one recoil reading is exact to a frame or two.
 
 A recoil's timings (cue, stunned) depend on the attack it interrupted for some enemies. For each recoil animation:
 if two or more attacks have values and they differ by more than 0.05 s, the values are shipped per attack; if they
@@ -93,6 +98,14 @@ NAMES = {
     "chaos_berzerker": "Savage",
     "beastmen_gor": "Gor",
     "beastmen_ungor": "Ungor",
+    "skaven_storm_vermin": "Stormvermin",
+    "skaven_storm_vermin_commander": "Stormvermin patrol",
+    "chaos_raider": "Mauler",
+    "chaos_raider_tutorial": "Mauler (tutorial)",
+    "chaos_warrior": "Chaos warrior",
+    "beastmen_bestigor": "Bestigor",
+    "beastmen_standard_bearer": "Standard bearer",
+    "beastmen_standard_bearer_crater": "Standard bearer (crater)",
 }
 
 STAMP = r"^(\d\d:\d\d:\d\d\.\d+)"
@@ -194,8 +207,9 @@ def groups_of(values):
     return groups
 
 
-def choose(entries, min_readings):
-    """(value, count, note) for one key's readings, or (None, count, why not)."""
+def choose(entries, min_readings, biggest=False):
+    """(value, count, note) for one key's readings, or (None, count, why not). biggest: take the group with the most
+    readings, the longer one on a tie, instead of the lowest group (recoil timings, D51)."""
     values = [seconds for seconds, _ in entries if seconds >= FLOOR]
     if not values:
         return None, 0, "no readings over %.1f s" % FLOOR
@@ -205,11 +219,26 @@ def choose(entries, min_readings):
     if len(trusted) >= min_readings:
         trusted_groups = groups_of(trusted)
         big = [g for g in trusted_groups if len(g) >= max(2, SPLIT_SHARE * len(trusted))]
-        if len(big) > 1:
+        if len(big) > 1 and not biggest:
             return None, len(trusted), SPLIT_NOTE + ": " + ", ".join("%d around %.2f" % (len(g), statistics.median(g)) for g in big)
         values = trusted
     groups = groups_of(values)
     need = max(min(2, min_readings), MIN_GROUP_SHARE * len(values))
+    if biggest:
+        candidates = [g for g in groups if len(g) >= need]
+        if not candidates:
+            return None, len(values), "no group of %d readings" % need
+        group = max(candidates, key=lambda g: (len(g), statistics.median(g)))
+        others = [g for g in groups if g is not group]
+        notes = []
+        if others:
+            tie = any(len(g) == len(group) for g in others)
+            notes.append("%s of %d groups (also %s)" % ("longer of the biggest" if tie else "biggest", len(groups), ", ".join("%d around %.2f" % (len(g), statistics.median(g)) for g in others)))
+        if group[-1] > group[0] * (1 + WIDE_SHARE):
+            notes.append("wide group %.2f to %.2f" % (group[0], group[-1]))
+        if len(group) < min_readings:
+            return None, len(group), "only %d readings" % len(group)
+        return statistics.median(group), len(group), "; ".join(notes)
     for index, group in enumerate(groups):
         if len(group) >= need:
             higher = groups[index + 1:]
@@ -223,6 +252,26 @@ def choose(entries, min_readings):
                 return None, len(group), "only %d readings" % len(group)
             return statistics.median(group), len(group), note
     return None, len(values), "no group of %d readings" % need
+
+
+def drop_stale(name, by_attack, report):
+    """A recoil animation's readings by attack, without those under half the median of its attacks' own medians (D51):
+    that far under what the same recoil takes after the other attacks, a reading is an earlier animation's callback, as
+    within one attack (choose). Each attack's median counts once, so attacks with many readings don't decide it, and an
+    animation whose values differ by attack keeps them (the marauder's run from 0.95 to 2.34 s)."""
+    medians = [statistics.median(s for s, _ in entries if s >= FLOOR) for entries in by_attack.values() if any(s >= FLOOR for s, _ in entries)]
+    if len(medians) < 2:
+        return by_attack
+    limit = statistics.median(medians) * SHARE
+    kept = {}
+    for attack, entries in by_attack.items():
+        low = sorted(s for s, _ in entries if FLOOR <= s < limit)
+        rest = [(s, ok) for s, ok in entries if not FLOOR <= s < limit]
+        if low:
+            report.append("dropped      %s after=%s: %s, under half of %.2f, the median of every attack's own%s" % (name, attack, ", ".join("%.2f" % s for s in low), limit / SHARE, "" if rest else " (no readings left)"))
+        if rest:
+            kept[attack] = rest
+    return kept
 
 
 def build(readings, min_lengths, min_recoils, report):
@@ -246,17 +295,18 @@ def build(readings, min_lengths, min_recoils, report):
                 report.append("shipped      %s = %.2f (%d readings, %s)" % (name, value, count, note))
             continue
 
+        by_attack = drop_stale(name, by_attack, report)
         named = {}
         for attack, entries in sorted(by_attack.items(), key=lambda item: item[0] or ""):
             if attack is None:
                 continue
-            value, count, note = choose(entries, min_readings)
+            value, count, note = choose(entries, min_readings, biggest=True)
             if value is None:
                 report.append("not shipped  %s after=%s: %s" % (name, attack, note))
             else:
                 named[attack] = (value, count, note)
         unnamed = by_attack.get(None, [])
-        unnamed_value = choose(unnamed, min_readings) if unnamed else (None, 0, "")
+        unnamed_value = choose(unnamed, min_readings, biggest=True) if unnamed else (None, 0, "")
         everything = [entry for entries in by_attack.values() for entry in entries]
 
         if len(named) >= 2:
@@ -275,7 +325,7 @@ def build(readings, min_lengths, min_recoils, report):
             report.append("not shipped  %s: %s" % (name, unnamed_value[2] or "no readings"))
             continue
 
-        value, count, note = choose(everything, min_readings)
+        value, count, note = choose(everything, min_readings, biggest=True)
         if value is None:
             report.append("not shipped  %s (every attack): %s" % (name, note))
             if note.startswith(SPLIT_NOTE):

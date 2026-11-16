@@ -38,30 +38,42 @@ local MIN_SHARE = 0.5 -- a reading under half of the value already known is take
 local LEARN_WEIGHT = 0.3 -- how far a new reading moves a value this machine learned
 local SPEED_TOLERANCE = 0.01 -- a reading counts as taken at normal speed within this much of 1
 -- The saved timings move to new keys whenever the shipped ones are rebuilt from scratch, so every machine starts from
--- the new values (build 3.2). Earlier builds saved under "stagger_lengths", "stagger_lengths_2", "recoil_cues",
--- "recoil_cues_2" and "recoil_cues_3", which are no longer read.
+-- the new values (build 3.2, and build 4 with D51, which also drops values machines learned from a stale callback, such
+-- as a mauler recoil of 0.42 s). Earlier builds saved under "stagger_lengths", "stagger_lengths_2",
+-- "stagger_lengths_3", "recoil_cues", "recoil_cues_2", "recoil_cues_3", "recoil_cues_4" and "recoil_stunned_1", which
+-- are no longer read.
 local SETTINGS = {
-	length = "stagger_lengths_3",
-	cue = "recoil_cues_4",
-	stunned = "recoil_stunned_1",
+	length = "stagger_lengths_4",
+	cue = "recoil_cues_5",
+	stunned = "recoil_stunned_2",
 }
 
--- Seconds, with how many readings each value came from, rebuilt from scratch (D43, D47) by Docs/rebuild_timings.py
--- from the playtests of steps 2.1 and 2.2 and of builds 3, 3.1 and 3.2 (2026-11-12, -13 and -15) and Lance's three
--- calibration logs (2026-11-14: build 3.1's ungor tests, the stage 1 session and the stage 2 animation state probe),
--- without the 2.1 and 2.2 hosts' recoil cues (timed from the wrong start), and with the build 3.1 logs' readings
--- counted as taken at normal speed. The 3.2 playtest ran as vanilla (VMF dropped the host, "Playtest results" in the
--- brief), so its readings are all of the host's own staggers and recoils and of the client's copies of them. "lowest of N groups": that animation's readings in the older logs fell into groups a speed factor apart, from
--- staggers timed at a speed they didn't reach, and only the lowest counts. "from <enemy>": a stagger length taken from
--- an enemy whose shared lengths all agree with this one's (D47): slave rats, clan rats and ungors; marauders, shielded
--- marauders and fanatics. Not shipped: 63 stagger lengths with a single reading, one animation whose readings at
--- normal speed split (false), and the berzerker's two recoil stunned cues after attack_pounce_2, which split too and
--- are left out of their by-attack tables.
+-- Seconds, with how many readings each value came from, rebuilt from scratch (D43, D47, D51) by
+-- Docs/rebuild_timings.py from the playtests of steps 2.1 and 2.2 and of builds 3, 3.1 and 3.2 (2026-11-12, -13 and
+-- -15), Lance's three calibration logs (2026-11-14: build 3.1's ungor tests, the stage 1 session and the stage 2
+-- animation state probe) and his two solo runs as host against elites (2026-11-16: the first on build 3.2, which Steam
+-- had put back at launch, the second on build 4), without the 2.1 and 2.2 hosts' recoil cues (timed from the wrong
+-- start), and with the build 3.1 logs' readings counted as taken at normal speed. The 3.2 playtest ran as vanilla (VMF
+-- dropped the host, "Playtest results" in the brief), so its readings are all of the host's own staggers and recoils
+-- and of the client's copies of them, as are the solo runs'. "lowest of N groups": that stagger's readings in the older
+-- logs fell into groups a speed factor apart, from staggers timed at a speed they didn't reach, and only the lowest
+-- counts. "biggest of N groups" and "longer of the biggest of N groups": a recoil's readings fell into groups, and the
+-- biggest counts, the longer one on a tie (D51), since a lone low reading is an earlier animation's callback and the
+-- slower of two times leaves the enemy playing its recoil rather than standing still. "from <enemy>": a stagger length
+-- taken from an enemy whose shared lengths all agree with this one's (D47): slave rats, clan rats and ungors;
+-- marauders, shielded marauders and fanatics. Not shipped: 79 stagger lengths with a single reading, one animation
+-- whose readings at normal speed split (false), and the mauler's recoil stunned cue after attack_pounce_3, whose one
+-- reading (0.42 s) was under half of what the same recoil takes after its other attack (D51).
 local DEFAULTS = {
 	length = {
 		beastmen_bestigor = {
-			stagger_left_exp = 2.75, -- 2
-			stagger_right_exp = 2.82, -- 2
+			stagger_bwd = 1.08, -- 5
+			stagger_bwd_2 = 0.81, -- 3
+			stagger_bwd_3 = 0.81, -- 2
+			stagger_bwd_4 = 0.81, -- 3
+			stagger_left_exp = 2.75, -- 4
+			stagger_right = 1.07, -- 3
+			stagger_right_exp = 2.81, -- 5
 		},
 		beastmen_gor = {
 			stagger_bwd = 1.08, -- 10
@@ -236,14 +248,14 @@ local DEFAULTS = {
 			stun_down = 0.69, -- 7, from chaos_marauder
 		},
 		chaos_marauder = {
-			stagger_bwd = 1.15, -- 11
+			stagger_bwd = 1.15, -- 12
 			stagger_bwd_2 = 1.26, -- 2
 			stagger_bwd_3 = 1.17, -- 7
 			stagger_bwd_4 = 1.11, -- 5
 			stagger_bwd_heavy = 2.52, -- 3, from chaos_fanatic
 			stagger_bwd_heavy_3 = 2.48, -- 4, from chaos_fanatic
 			stagger_bwd_heavy_4 = 2.56, -- 2, from chaos_fanatic
-			stagger_bwd_light = 0.73, -- 64
+			stagger_bwd_light = 0.73, -- 65
 			stagger_bwd_light_2 = 0.70, -- 55
 			stagger_bwd_light_3 = 0.68, -- 53
 			stagger_bwd_light_4 = 0.66, -- 60
@@ -354,6 +366,20 @@ local DEFAULTS = {
 			stagger_shield_medium_break = 1.18, -- 5
 			stagger_up_heavy_2 = 3.41, -- 2, from chaos_fanatic
 			stun_down = 0.69, -- 7, from chaos_marauder
+		},
+		chaos_raider = {
+			stagger_bwd = 1.14, -- 4
+			stagger_bwd_2 = 1.26, -- 5
+			stagger_bwd_3 = 1.16, -- 9
+			stagger_bwd_4 = 1.11, -- 9
+			stagger_left_5 = 1.14, -- 3
+			stagger_right = 1.08, -- 2
+			stagger_right_3 = 1.34, -- 2
+		},
+		chaos_warrior = {
+			hit_react_bwd = 0.48, -- 23
+			stagger_light_bwd = 0.58, -- 20
+			stagger_light_right = 0.61, -- 8
 		},
 		skaven_clan_rat = {
 			stagger_bwd = 0.98, -- 4
@@ -509,6 +535,14 @@ local DEFAULTS = {
 			stun_right_sword_2 = 0.61, -- 6
 			stun_right_sword_3 = 0.61, -- 5
 		},
+		skaven_storm_vermin = {
+			stagger_bwd = 1.07, -- 12
+			stagger_bwd_2 = 0.81, -- 7
+			stagger_bwd_3 = 0.81, -- 12
+			stagger_bwd_4 = 0.81, -- 11
+			stun_bwd_sword_2 = 0.81, -- 3
+			stun_bwd_sword_3 = 0.81, -- 2
+		},
 		skaven_storm_vermin_commander = {
 			stagger_bwd_2 = 0.81, -- 3
 			stagger_bwd_4 = 0.81, -- 5
@@ -536,11 +570,13 @@ local DEFAULTS = {
 		beastmen_bestigor = {
 			blocked = {
 				attack_move = 1.18, -- 2
-				attack_move_2 = 1.19, -- 2
+				attack_move_2 = 1.18, -- 6
 				attack_special = 1.05, -- 2
 			},
 			blocked_2 = {
 				attack_move = 1.18, -- 2
+				attack_move_2 = 1.18, -- 1
+				attack_special = 1.04, -- 2
 			},
 		},
 		beastmen_ungor = {
@@ -604,6 +640,10 @@ local DEFAULTS = {
 			blocked_2 = 1.02, -- 17
 			blocked_3 = 0.68, -- 23
 		},
+		skaven_storm_vermin = {
+			blocked = 0.88, -- 5
+			blocked_2 = 0.98, -- 2
+		},
 		skaven_storm_vermin_commander = {
 			blocked = 0.88, -- 9
 			blocked_2 = 0.98, -- 6
@@ -612,12 +652,14 @@ local DEFAULTS = {
 	stunned = {
 		beastmen_bestigor = {
 			blocked = {
-				attack_move = 1.07, -- 1, lowest of 2 groups
-				attack_move_2 = 1.20, -- 2
-				attack_special = 1.03, -- 1, lowest of 2 groups
+				attack_move = 1.21, -- 1, longer of the biggest of 2 groups
+				attack_move_2 = 1.19, -- 6
+				attack_special = 1.07, -- 1, longer of the biggest of 2 groups
 			},
 			blocked_2 = {
-				attack_move = 1.16, -- 1, lowest of 2 groups
+				attack_move = 1.21, -- 1, longer of the biggest of 2 groups
+				attack_move_2 = 1.19, -- 1
+				attack_special = 1.05, -- 2
 			},
 		},
 		beastmen_gor = {
@@ -632,16 +674,7 @@ local DEFAULTS = {
 				attack_step_2 = 1.40, -- 3
 				attack_step_head = 1.40, -- 2
 			},
-			blocked_2 = {
-				attack_1h = 1.40, -- 11
-				attack_1h_2 = 1.40, -- 6
-				attack_1h_3 = 1.40, -- 4
-				attack_headbutt = 1.35, -- 1, lowest of 2 groups
-				attack_run = 1.40, -- 2
-				attack_step = 1.40, -- 4
-				attack_step_2 = 1.40, -- 5
-				attack_step_head = 1.40, -- 4
-			},
+			blocked_2 = 1.40, -- 38
 		},
 		beastmen_ungor = {
 			blocked = 2.40, -- 17
@@ -650,11 +683,13 @@ local DEFAULTS = {
 		},
 		chaos_berzerker = {
 			blocked = {
-				attack_pounce = 1.09, -- 1, lowest of 2 groups
+				attack_pounce = 1.62, -- 7, biggest of 2 groups
+				attack_pounce_2 = 2.13, -- 4, biggest of 2 groups
 			},
 			blocked_2 = {
-				attack_lunge = 1.51, -- 1, lowest of 2 groups
+				attack_lunge = 1.62, -- 1, longer of the biggest of 2 groups
 				attack_pounce = 1.62, -- 4
+				attack_pounce_2 = 2.13, -- 6, biggest of 2 groups
 			},
 			blocked_3 = {
 				attack_pounce = 1.62, -- 4
@@ -683,7 +718,7 @@ local DEFAULTS = {
 				attack_move_3 = 1.28, -- 2
 				attack_move_4 = 1.65, -- 3
 				attack_pounce = 0.95, -- 4
-				attack_pounce_2 = 1.41, -- 1, lowest of 2 groups
+				attack_pounce_2 = 1.45, -- 5, biggest of 2 groups
 				attack_pounce_3 = 0.95, -- 2
 				attack_pounce_4 = 1.22, -- 1
 				attack_pounce_5 = 1.30, -- 4
@@ -707,10 +742,24 @@ local DEFAULTS = {
 				attack_run_3 = 1.22, -- 3
 			},
 		},
+		chaos_raider = {
+			blocked = {
+				attack_pounce_2 = 1.91, -- 1
+			},
+			blocked_2 = {
+				attack_move = 1.55, -- 1
+			},
+		},
+		chaos_warrior = {
+			blocked = 0.86, -- 6
+		},
 		skaven_clan_rat = {
 			blocked = 0.82, -- 8
 			blocked_2 = 1.02, -- 3
-			blocked_3 = 0.69, -- 2, lowest of 2 groups
+			blocked_3 = {
+				attack_move_1 = 0.69, -- 1
+				attack_move_2 = 0.75, -- 1, longer of the biggest of 2 groups
+			},
 		},
 		skaven_clan_rat_with_shield = {
 			blocked = 2.40, -- 6
@@ -724,10 +773,10 @@ local DEFAULTS = {
 				attack_pounce = 0.97, -- 7
 			},
 			blocked_2 = {
-				attack_pounce = 0.92, -- 1, lowest of 2 groups
+				attack_pounce = 0.97, -- 10, biggest of 2 groups
 			},
 			blocked_3 = {
-				attack_pounce = 0.93, -- 1, lowest of 2 groups
+				attack_pounce = 0.97, -- 7, biggest of 2 groups
 			},
 		},
 		skaven_slave = {
@@ -739,11 +788,19 @@ local DEFAULTS = {
 				attack_pounce = 0.69, -- 3
 				attack_pounce_2 = 0.73, -- 4
 				attack_pounce_3 = 0.68, -- 3
-				attack_pounce_4 = 0.69, -- 1, lowest of 2 groups
+				attack_pounce_4 = 0.74, -- 1, longer of the biggest of 2 groups
 			},
 		},
+		skaven_storm_vermin = {
+			blocked = 0.89, -- 5, biggest of 2 groups
+			blocked_2 = 0.99, -- 2
+		},
 		skaven_storm_vermin_commander = {
-			blocked = 0.91, -- 5, lowest of 2 groups
+			blocked = {
+				attack_move = 1.00, -- 1, longer of the biggest of 2 groups
+				attack_move_2 = 0.91, -- 1, longer of the biggest of 2 groups
+				attack_pounce = 0.90, -- 2
+			},
 			blocked_2 = 1.00, -- 6
 		},
 		skaven_storm_vermin_with_shield = {

@@ -60,4 +60,52 @@ function geometry.single_target(dx, dy, dz, fx, fy, frozen, action, breed, box_u
 	return in_reach, cosine > cone_cosine, distance, reach, degrees(cosine), degrees(cone_cosine)
 end
 
+-- Family C: the box an elite's sweep or overhead hits at its damage frame, built from the enemy's position and facing
+-- as BTStormVerminAttackAction.anim_cb_damage builds it (bt_storm_vermin_attack_action.lua:374). If a game patch
+-- changes that, change this to match. Returns the box's centre, rotation and half-size.
+function geometry.elite_box(action, position, rotation)
+	local range = action.range or 0
+	local height = action.height or 0
+	local half_range = range * 0.5
+	local half_height = height * 0.5
+	local size = Vector3((action.width or 0) * 0.5, half_range, half_height)
+	local forward = Quaternion.rotate(rotation, Vector3.forward()) * ((action.offset_forward or 0) + half_range)
+	local up = Vector3.up() * (half_height + (action.offset_up or 0))
+
+	return position + forward + up, rotation, size
+end
+
+-- The units whose player hit boxes lie in that box, by the game's own query (the same filter the enemy's damage frame
+-- uses), as a set.
+function geometry.units_in_box(world, centre, rotation, size)
+	local physics_world = World.get_data(world, "physics_world")
+	local actors = PhysicsWorld.immediate_overlap(physics_world, "position", centre, "rotation", rotation, "size", size, "shape", "oobb", "types", "dynamics", "collision_filter", "filter_player_hit_box_check")
+	local units = {}
+
+	for _, actor in ipairs(actors or {}) do
+		local unit = Actor.unit(actor)
+
+		if unit then
+			units[unit] = true
+		end
+	end
+
+	return units
+end
+
+local PLAYER_BOX_RADIUS = 0.35 -- about the width of a player's hit boxes
+local PLAYER_BOX_HEIGHT = 1.8
+
+-- The same box test on plain shapes, for when the overlap can't see this player's own hit boxes: an upright cylinder
+-- for the player, standing at feet, against the box. Returns whether they meet.
+function geometry.player_in_box(feet, centre, rotation, size)
+	local offset = feet - centre
+	local x = Vector3.dot(offset, Quaternion.right(rotation))
+	local y = Vector3.dot(offset, Quaternion.forward(rotation))
+	local bottom = offset.z
+	local top = offset.z + PLAYER_BOX_HEIGHT
+
+	return math.abs(x) <= size.x + PLAYER_BOX_RADIUS and math.abs(y) <= size.y + PLAYER_BOX_RADIUS and top >= -size.z and bottom <= size.z
+end
+
 mod.pc.geometry = geometry

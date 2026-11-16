@@ -38,6 +38,17 @@ local FINGERPRINT_BREEDS = {
 	"skaven_plague_monk",
 	"skaven_slave",
 	"skaven_storm_vermin_with_shield",
+	-- Build 4 (D49): the elites, whose sweeps and shoves the client judges (the bulwark's too) and whose reactions it
+	-- decides (all but the bulwark's).
+	"beastmen_bestigor",
+	"beastmen_standard_bearer",
+	"beastmen_standard_bearer_crater",
+	"chaos_bulwark",
+	"chaos_raider",
+	"chaos_raider_tutorial",
+	"chaos_warrior",
+	"skaven_storm_vermin",
+	"skaven_storm_vermin_commander",
 }
 
 local BREED_FIELDS = {
@@ -86,14 +97,19 @@ local ACTION_NODES = {
 	BTBlockedAction = true,
 	BTComboAttackAction = true,
 	BTStaggerAction = true,
+	BTStormVerminAttackAction = true,
+	BTStormVerminPushAction = true,
 }
 
 -- The fields of those action tables that the client's maths reads. Only these are fingerprinted, so state the host's
 -- AI might keep in an action table can't make two machines look different.
 local ACTION_FIELDS = {
+	"attack_anim",
 	"attack_directions",
 	"blocked_anim",
 	"blocked_anims",
+	"blocked_damage",
+	"catapult",
 	"combo_attacks",
 	"damage",
 	"damage_type",
@@ -101,16 +117,28 @@ local ACTION_FIELDS = {
 	"dodge_window_duration",
 	"dodge_window_start",
 	"fatigue_type",
+	"height",
 	"hit_react_type",
 	"ignore_staggers",
+	"impact_push_speed",
+	"knocked_down_attack_anim",
+	"max_impact_push_speed",
 	"max_player_push_speed",
+	"moving_attack",
 	"moving_stagger_minimum_destination_distance",
 	"moving_stagger_threshold",
 	"no_block_stagger",
+	"offset_forward",
+	"offset_up",
 	"player_dodged_cone",
 	"player_dodged_radius",
 	"player_push_speed",
 	"player_push_speed_blocked",
+	"push",
+	"range",
+	"reset_attack_animations",
+	"rotation_time",
+	"rotation_time_step",
 	"scale_animation_speeds",
 	"shield_block_anims",
 	"shield_break_anims",
@@ -119,9 +147,11 @@ local ACTION_FIELDS = {
 	"stagger_anims",
 	"stagger_reduction",
 	"standard_stagger_anims",
+	"step_attack_anim",
 	"unblockable",
 	"use_box_range",
 	"weapon_reach",
+	"width",
 }
 
 local SECTIONS = {

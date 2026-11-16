@@ -28,6 +28,14 @@ local TRACKED_CALLBACKS = {
 	anim_cb_stunned_finished = true,
 }
 
+-- The damage frames of the attack families: anim_cb_damage (A, single swings, and C, elites' sweeps and overheads),
+-- anim_cb_frenzy_damage (B, frenzy combo steps) and anim_cb_stormvermin_push (D, elites' shoves).
+local DAMAGE_CALLBACKS = {
+	anim_cb_damage = true,
+	anim_cb_frenzy_damage = true,
+	anim_cb_stormvermin_push = true,
+}
+
 -- The one place where both sides meet the game's damage frame. An enemy's attack animation fires anim_cb_damage on
 -- every machine that plays it: on the host, where vanilla judges the swing, and on each client, where vanilla does
 -- nothing with it.
@@ -48,8 +56,8 @@ mod:hook("AnimationSystem", "animation_callback", function (func, self, unit, ca
 		return func(self, unit, callback_name, param)
 	end
 
-	-- The frenzy combos' damage frame (family B) is handled like family A's.
-	if callback_name ~= "anim_cb_damage" and callback_name ~= "anim_cb_frenzy_damage" then
+	-- Every family's damage frame is handled the same way.
+	if not DAMAGE_CALLBACKS[callback_name] then
 		if TRACKED_CALLBACKS[callback_name] then
 			if not self.is_server then
 				pc.guard("client animation cue", pc.reactions.animation_callback, unit, callback_name)
@@ -78,10 +86,14 @@ mod:hook("AnimationSystem", "animation_callback", function (func, self, unit, ca
 		return func(self, unit, callback_name, param)
 	end
 
-	-- Host: if this swing was announced to a modded client, let vanilla do its bookkeeping but skip its hit test.
+	-- Host: if this swing was announced to a modded client, let vanilla do its bookkeeping but skip its hit test. For
+	-- an elite's sweep (family C), before_damage_frame has set pc.host.box_skip instead: vanilla's box test then
+	-- leaves out the players whose screens judge it.
 	local ok, swing = pc.guard("host damage frame", pc.host.before_damage_frame, unit, callback_name)
 
 	if not ok or not swing then
+		pc.host.box_skip = nil
+
 		return func(self, unit, callback_name, param)
 	end
 
@@ -90,6 +102,7 @@ mod:hook("AnimationSystem", "animation_callback", function (func, self, unit, ca
 	func(self, unit, callback_name, param)
 
 	pc.host.suppress = nil
+	pc.host.box_skip = nil
 end)
 
 local function role()
@@ -263,7 +276,8 @@ local function print_stats(to_chat, as_host)
 
 		local waits = stat("host_combo_wait_n")
 
-		out("Frenzy combo steps announced %d. Next moves that waited for the answer %d (average %.0f ms), went by the host's guess %d (%d after the wait ran out).", stat("host_announced_combo"), stat("host_combo_waited"), waits > 0 and stat("host_combo_wait_sum") / waits * 1000 or 0, stat("host_combo_guessed"), stat("host_combo_wait_ran_out"))
+		out("Frenzy combo steps announced %d. Next moves that waited for the answer %d (average %.0f ms), went by the host's guess %d (%d after the wait ran out).", stat("host_announced_B"), stat("host_combo_waited"), waits > 0 and stat("host_combo_wait_sum") / waits * 1000 or 0, stat("host_combo_guessed"), stat("host_combo_wait_ran_out"))
+		out("Elite sweeps and overheads sent %d (one per modded player), elite shoves %d.", stat("host_announced_C"), stat("host_announced_D"))
 		local modded, matching = pc.host.modded_peer_count()
 
 		out("Judged by the host after a client went quiet %d. Answers ignored %d, rejected %d. Modded clients now: %d, %d of them with your enemy data.", stat("host_judged_quiet_client"), stat("host_ignored"), stat("host_rejected"), modded, matching)
@@ -273,7 +287,7 @@ local function print_stats(to_chat, as_host)
 		out("Client recoils applied %d, own animation %d, refused %d, never entered %d, cue brought forward %d, early cues ignored %d, leftover cues cleared %d. Stunned cues brought forward %d, held back %d, late ones dropped %d. Moved to the client's spot %d times, average %.2f m.", stat("host_recoil_applied"), stat("host_recoil_own_animation"), stat("host_recoil_refused"), stat("host_recoil_not_entered"), stat("host_recoil_cue_brought_forward"), stat("host_recoil_early_cue_ignored"), stat("host_recoil_stale_cue_cleared"),
 			stat("host_recoil_stunned_brought_forward"), stat("host_recoil_stunned_held"), stat("host_recoil_late_stunned_dropped"), teleports, teleports > 0 and stat("host_teleport_distance_sum") / teleports or 0)
 		out("Recoils from clients' blocks ended by their timer and cue %d (the cue last %d), by their stunned cue %d, by a stagger %d (%d of them not the blocker's), by death %d, otherwise %d.", stat("host_recoil_end_done"), stat("host_recoil_end_cue_last"), stat("host_recoil_end_stunned"), stat("host_recoil_end_stagger"), stat("host_recoil_end_stagger_other"), stat("host_recoil_end_death"), stat("host_recoil_end_other"))
-		out("Client hits on plague monks and savages checked against the host's own stagger maths %d: agreed %d, the host would have staggered and the client didn't %d, the client staggered and the host wouldn't have %d, a different stagger %d. Killed first %d.", stat("host_check_compared"), stat("host_check_agreed"), stat("host_check_host_only"), stat("host_check_client_only"), stat("host_check_different"), stat("host_check_killed"))
+		out("Client hits on plague monks, savages and elites checked against the host's own stagger maths %d: agreed %d, the host would have staggered and the client didn't %d, the client staggered and the host wouldn't have %d, a different stagger %d. Killed first %d. Attacks reset as in vanilla %d.", stat("host_check_compared"), stat("host_check_agreed"), stat("host_check_host_only"), stat("host_check_client_only"), stat("host_check_different"), stat("host_check_killed"), stat("host_attack_reset"))
 
 		local sped_up = stat("host_stagger_sped_up")
 		local checked = stat("host_stagger_speed_checked")
@@ -298,7 +312,8 @@ local function print_stats(to_chat, as_host)
 		out("Hits on you shown at once %d (average estimate %.1f), host copies dropped %d, never booked %d. Knockbacks shown %d, host copies dropped %d.", shown, shown > 0 and stat("client_hit_estimate_sum") / shown or 0, stat("client_hit_message_dropped"), stat("client_hit_never_booked"), stat("client_push_shown"), stat("client_push_message_dropped"))
 		out("Host messages dropped for enemies dead here: damage %d, animations %d, voice lines %d.", stat("client_damage_after_kill"), stat("client_dropped_after_kill"), stat("client_dialogue_dropped"))
 		out("Your blasts worked out here %d, covered enemies in them %d, blasts left to the host %d.", stat("client_blasts"), stat("client_blast_targets"), stat("client_blast_not_followed"))
-		out("Host runs this build: %s. Enemy data: %s.", pc.host_fresh() and "yes" or "no (nothing is shown early)", pc.compat.state())
+		out("Elite sweeps and overheads judged %d (%d where you weren't the one attacked; hit boxes found by the game's overlap %d, by shape %d), elite shoves judged %d.", stat("client_judged_C"), stat("client_judged_C_not_aimed"), stat("client_box_overlap"), stat("client_box_shape"), stat("client_judged_D"))
+		out("Host runs this build: %s. Enemy data: %s. Contact with the host lost %d times, VMF asked to ping again %d times.", pc.host_fresh() and "yes" or "no (nothing is shown early)", pc.compat.state(), stat("client_contact_lost"), stat("client_vmf_ping"))
 	end
 
 	local lengths, own_lengths = pc.timings.count("length")

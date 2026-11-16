@@ -162,6 +162,10 @@ end
 
 local attack_lookup = {} -- breed name -> { [animation] = the attack action that plays it }
 
+-- The fields an attack action names its animations in, besides a single attack's variants: the elites' sweeps also
+-- pick from the knocked-down and step lists (bt_storm_vermin_attack_action.lua:109).
+local ATTACK_ANIM_FIELDS = { "attack_anim", "knocked_down_attack_anim", "step_attack_anim" }
+
 local function add_attack_anims(lookup, anims, action)
 	if type(anims) == "string" then
 		lookup[anims] = lookup[anims] or action
@@ -193,7 +197,11 @@ local function collect_attack_anims(node, lookup, depth)
 				end
 			end
 		else
-			add_attack_anims(lookup, action.attack_anim, action)
+			-- An elite's sweep can play any of these, so this client knows the attack (and its ignore_staggers) from
+			-- whichever the host played, even when the swing wasn't sent to this player (D49).
+			for i = 1, #ATTACK_ANIM_FIELDS do
+				add_attack_anims(lookup, action[ATTACK_ANIM_FIELDS[i]], action)
+			end
 		end
 	end
 
@@ -223,10 +231,6 @@ local NOT_ATTACKS = {
 	BTBlockedAction = true,
 	BTSmashDoorAction = true,
 }
-
--- The fields an attack action names its animations in, besides a single attack's variants: the elites' sweeps also
--- pick from the knocked-down and step lists (bt_storm_vermin_attack_action.lua:109).
-local ATTACK_ANIM_FIELDS = { "attack_anim", "knocked_down_attack_anim", "step_attack_anim" }
 
 -- The attacks a block can make an enemy recoil from, each with the animations it plays: its single attacks
 -- (BTAttackAction) and, since every enemy is timed (D47), the other attack nodes of its tree, such as the elites'
@@ -964,7 +968,8 @@ end
 -- What DamageUtils.stagger_ai (damage_utils.lua:3578) and AiUtils.stagger decide for this hit, on this client's
 -- stand-in for the host's blackboard. The stagger maths itself is the game's own DamageUtils.calculate_stagger_player,
 -- which reads BLACKBOARDS[unit]; enemies have none on a client, so the stand-in is put there for the call.
--- Not copied: the stagger immunity of elites and bosses, which none of pc.REACTION_BREEDS have.
+-- Not copied: is_stagger_immune (damage_utils.lua:3496), which only enemies with a grudge mark's stagger immunity
+-- have (blackboard.stagger_immunity, buff_settings_grudge_marks.lua:674), mostly monsters and lords (T15).
 local function work_out_stagger(unit, breed, fake, attacker, damage_profile, target_index, hit_zone_name, attack_direction, damage_source, t, profile_name)
 	local target_settings = damage_profile.targets and damage_profile.targets[target_index] or damage_profile.default_target
 	local attack_template = target_settings and DamageUtils.get_attack_template(target_settings.attack_template)

@@ -48,9 +48,9 @@ end
 -- AiUtils.damage_target (ai_utils.lua:258) as far as this client can follow it. The crowd scaling comes from the
 -- host with the swing. Of the host's damage buffs (DamageUtils.apply_buffs_to_damage) only the common ones are
 -- applied, so this is an estimate, and the bar settles on the host's number when it arrives.
-local function estimate_damage(swing, attacker, target)
+local function estimate_damage(swing, attacker, target, damage)
 	local action = swing.action
-	local amount = DamageUtils.calculate_damage(swing.damage or action.damage, target, attacker)
+	local amount = DamageUtils.calculate_damage(damage or swing.damage or action.damage, target, attacker)
 
 	if type(amount) ~= "number" then
 		return 0
@@ -185,22 +185,17 @@ local function showing()
 	return pc.predict and not pc.broken and pc.host_fresh()
 end
 
--- Called by Client.lua at a damage frame judged "hit", after the answer has gone out.
-function hit_results.hit(swing, unit, target)
-	if not showing() then
-		return
-	end
-
+-- The hit's feedback and HP estimate, as the host's damage message would show them. damage: the attack's own number
+-- to estimate from, if not the swing's. Returns the estimate.
+local function show_damage(swing, unit, target, damage, direction, t)
 	local health = ScriptUnit.has_extension(target, "health_system")
 
 	if not health then
-		return
+		return 0
 	end
 
 	local action = swing.action
-	local amount = estimate_damage(swing, unit, target)
-	local direction = Vector3.normalize(position(target) - position(unit))
-	local t = pc.now()
+	local amount = estimate_damage(swing, unit, target, damage)
 
 	if amount > 0 then
 		health:add_damage(unit, amount, "torso", action.damage_type or "cutting", position(target), direction, swing.breed.name, nil, unit, action.hit_react_type or "light", false, false, false, 1, "n/a", 1, 1)
@@ -216,8 +211,71 @@ function hit_results.hit(swing, unit, target)
 		pc.count("client_hit_estimate_sum", amount)
 	end
 
+	return amount
+end
+
+-- Called by Client.lua at a damage frame judged "hit", after the answer has gone out.
+function hit_results.hit(swing, unit, target)
+	if not showing() then
+		return
+	end
+
+	local action = swing.action
+	local direction = Vector3.normalize(position(target) - position(unit))
+	local t = pc.now()
+	local amount = show_damage(swing, unit, target, nil, direction, t)
+
 	push(target, action.player_push_speed, action.max_player_push_speed, direction, t)
 	pc.log("client swing=%d hit shown at once: estimate=%.1f push=%s", swing.id, amount, tostring(action.player_push_speed))
+end
+
+-- Called by Client.lua at an elite's sweep or overhead (family C) judged "hit" or "blocked": what the box test does to
+-- this player (bt_storm_vermin_attack_action.lua:420), as the host will book it. The damage, or through a block the
+-- blocked damage, and the push, which a block doesn't stop. A catapult still comes from the host, a ping late.
+function hit_results.box(swing, unit, target, blocked)
+	if not showing() then
+		return
+	end
+
+	local action = swing.action
+	local direction = Vector3.normalize(position(target) - position(unit))
+	local t = pc.now()
+	local damage = nil
+	local amount = 0
+
+	if action.damage then
+		if not blocked then
+			damage = swing.damage or action.damage
+		elseif action.blocked_damage then
+			damage = action.blocked_damage
+		end
+	end
+
+	if damage then
+		amount = show_damage(swing, unit, target, damage, direction, t)
+	end
+
+	if action.push then
+		push(target, action.player_push_speed, action.max_player_push_speed, direction, t)
+	end
+
+	pc.log("client swing=%d box %s shown at once: estimate=%.1f push=%s", swing.id, blocked and "block" or "hit", amount, tostring(action.push and action.player_push_speed))
+end
+
+-- Called by Client.lua at an elite's shove (family D) judged "hit": the damage and the knockback along the enemy's
+-- facing on this screen (bt_storm_vermin_push_action.lua:104). The pushed state comes from the host, a ping late.
+function hit_results.shove(swing, unit, target, rotation)
+	if not showing() then
+		return
+	end
+
+	local action = swing.action
+	local forward = Quaternion.forward(rotation)
+	local t = pc.now()
+	local amount = show_damage(swing, unit, target, nil, forward, t)
+
+	push(target, action.impact_push_speed, action.max_impact_push_speed, forward, t)
+	pc.log("client swing=%d shove shown at once: estimate=%.1f push=%s", swing.id, amount, tostring(action.impact_push_speed))
 end
 
 -- Called by Client.lua at a damage frame judged "blocked": the push a blocked swing gives (BTAttackAction.attack_blocked).

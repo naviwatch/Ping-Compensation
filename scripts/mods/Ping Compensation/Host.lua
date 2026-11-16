@@ -5,10 +5,14 @@ local pc = mod.pc
 --   1. announces the swing to that player when the attack starts,
 --   2. skips its own hit test when its copy of the swing reaches the damage frame,
 --   3. books whatever the player's client answers: damage for a hit, the block for a block, nothing for a miss.
+-- Families: A, single swings (BTAttackAction); B, frenzy combo steps (BTComboAttackAction); C, elites' sweeps and
+-- overheads (BTStormVerminAttackAction), which reach every modded player near their box; D, elites' shoves
+-- (BTStormVerminPushAction).
 -- Bots, the host's own hero and players without the mod never get a record here, so they stay vanilla.
 
 local host = {
 	suppress = nil, -- the swing whose vanilla hit test is being skipped right now
+	box_skip = nil, -- family C: the player units the next box overlap leaves out, during an elite's damage frame
 }
 
 pc.host = host
@@ -27,7 +31,8 @@ local RESULTS = {
 local peers = {} -- peer id -> { t = main-clock time of that client's last hello, attacks = its /pingcomp attacks switch }
 local mismatched = {} -- peer id -> true once we've said their build differs
 local swings = {} -- swing id -> record
-local by_attacker = {} -- enemy unit -> its newest record
+local by_attacker = {} -- enemy unit -> its newest record of families A, B and D
+local boxes = {} -- enemy unit -> its newest family C attack: { action, blackboard, swings = { one per modded player } }
 local action_sets = {} -- action table -> name of the BreedActions set it lives in, or false
 local next_id = 0
 
@@ -98,12 +103,74 @@ local function in_combo_step(swing, blackboard)
 		and combo.attack_start_time == swing.step_start_t and combo.attacking_target == swing.target
 end
 
--- Runs once per attack, on the host: after BTAttackAction.enter for family A, and after every
--- BTComboAttackAction._start_attack for family B, whose combos announce each step as its own swing.
+-- One swing aimed at, or reaching, one modded player.
+local function new_swing(unit, blackboard, family, action, breed, target, peer, attacker_go_id, set_name, attack_anim, t, step, step_name)
+	local combo = blackboard.combo_attack_data
+
+	next_id = next_id + 1
+
+	local swing = {
+		id = next_id,
+		peer = peer,
+		family = family,
+		attacker = unit,
+		attacker_go_id = attacker_go_id,
+		target = target,
+		action = action,
+		set_name = set_name,
+		step = step, -- family B: the combo step, which has its own damage, block cost and follow-ups
+		step_name = step_name,
+		attack_anim = attack_anim, -- for the log lines of the recoil that a block of it causes
+		step_start_t = combo and step and combo.attack_start_time or nil,
+		damage = pc.attack_damage(action, step),
+		blackboard = blackboard,
+		breed_name = breed.name,
+		start_t = t,
+		expires = t + pc.SWING_LIFETIME,
+		frames = 0, -- damage frames the host's own copy has reached
+		frame_t = {},
+		would = {}, -- what the host would have judged at each of those frames, for the debug log
+		answers = {}, -- the client's answer per damage frame
+		answered = false,
+		host_judged = false,
+	}
+
+	swings[swing.id] = swing
+
+	return swing
+end
+
+-- aimed: whether the swing's player is the one the enemy attacks, whose screen turns the enemy. Only a family C swing
+-- also reaches players it isn't aimed at.
+local function send_begin(swing, blackboard, aimed)
+	local action = swing.action
+	local box_up, box_down, box_flat = 0, 0, 0
+
+	if action.use_box_range then
+		box_up = blackboard.attack_range_up or 0
+		box_down = blackboard.attack_range_down or 0
+		box_flat = blackboard.attack_range_flat or 0
+	end
+
+	local ok, scale = pcall(damage_scale, action, swing.target)
+
+	pc.count("host_announced")
+
+	if swing.family ~= "A" then
+		pc.count("host_announced_" .. swing.family)
+	end
+
+	mod:network_send("pc_swing_begin", swing.peer, pc.VERSION, swing.id, swing.attacker_go_id, swing.family, swing.set_name, action.name, swing.attack_anim, box_up, box_down, box_flat, pc.finite(ok and scale or 1, 3), swing.step_name or "", aimed and true or false)
+end
+
+-- Runs once per attack, on the host: after BTAttackAction.enter for family A, after every
+-- BTComboAttackAction._start_attack for family B, whose combos announce each step as its own swing, and after
+-- BTStormVerminPushAction.enter for family D, an elite's shove.
 local function announce(unit, blackboard, family, step_name)
 	local action = blackboard.action
 	local breed = blackboard.breed
 	local combo = blackboard.combo_attack_data
+	local attack_anim = blackboard.attack_anim
 	local target, step
 
 	if family == "B" then
@@ -117,8 +184,13 @@ local function announce(unit, blackboard, family, step_name)
 		target = blackboard.attacking_target
 	end
 
+	-- A shove plays its animation without writing it to the blackboard; the host noted it as it played (D47).
+	if family == "D" then
+		attack_anim = pc.host_reactions.last_attack_anim(unit)
+	end
+
 	-- The vanilla damage frame does nothing without action.damage, and monsters and lords stay vanilla for now.
-	if not target or not action or not action.damage or not breed or breed.boss or not blackboard.attack_anim then
+	if not target or not action or not action.damage or not breed or breed.boss or not attack_anim then
 		return
 	end
 
@@ -136,55 +208,64 @@ local function announce(unit, blackboard, family, step_name)
 		return
 	end
 
-	local t = pc.now()
+	local swing = new_swing(unit, blackboard, family, action, breed, target, peer, attacker_go_id, set_name, attack_anim, pc.now(), step, step_name)
 
-	next_id = next_id + 1
-
-	local swing = {
-		id = next_id,
-		peer = peer,
-		family = family,
-		attacker = unit,
-		attacker_go_id = attacker_go_id,
-		target = target,
-		action = action,
-		step = step, -- family B: the combo step, which has its own damage, block cost and follow-ups
-		step_name = step_name,
-		attack_anim = blackboard.attack_anim, -- for the log lines of the recoil that a block of it causes
-		step_start_t = combo and step and combo.attack_start_time or nil,
-		damage = pc.attack_damage(action, step),
-		blackboard = blackboard,
-		breed_name = breed.name,
-		start_t = t,
-		expires = t + pc.SWING_LIFETIME,
-		frames = 0, -- damage frames the host's own copy has reached
-		frame_t = {},
-		would = {}, -- what the host would have judged at each of those frames, for the debug log
-		answers = {}, -- the client's answer per damage frame
-		answered = false,
-		host_judged = false,
-	}
-
-	swings[swing.id] = swing
 	by_attacker[unit] = swing
 
-	local box_up, box_down, box_flat = 0, 0, 0
+	send_begin(swing, blackboard, true)
+end
 
-	if action.use_box_range then
-		box_up = blackboard.attack_range_up or 0
-		box_down = blackboard.attack_range_down or 0
-		box_flat = blackboard.attack_range_flat or 0
+-- Family C (D49, D50): an elite's sweep or overhead hits every player in a box in front of the enemy at its damage
+-- frame (BTStormVerminAttackAction.anim_cb_damage, bt_storm_vermin_attack_action.lua:374). Every modded player gets a
+-- swing of their own when the attack starts, wherever they are, and their own screen judges whether the box reaches
+-- them (a far-off player's answer is a miss). So the host never judges a modded player's part in a sweep: its own box
+-- test leaves them all out (the PhysicsWorld.immediate_overlap hook) and still hits bots, the host's own hero and
+-- players without the mod. Runs after BTStormVerminAttackAction.enter.
+local function announce_box(unit, blackboard)
+	local action = blackboard.action
+	local breed = blackboard.breed
+	local attack_anim = pc.host_reactions.last_attack_anim(unit)
+
+	boxes[unit] = nil
+
+	-- The game's damage frame reaches the node only with action.damage (animation_callback_templates.lua:141).
+	if not action or not action.damage or not breed or breed.boss or not attack_anim or blackboard.attacking_target_is_ai_breed then
+		return
 	end
 
-	local ok, scale = pcall(damage_scale, action, target)
+	local attacker_go_id = pc.network():unit_game_object_id(unit)
+	local set_name = action_set_name(action, breed)
 
-	pc.count("host_announced")
-
-	if family == "B" then
-		pc.count("host_announced_combo")
+	if not attacker_go_id or not set_name then
+		return
 	end
 
-	mod:network_send("pc_swing_begin", peer, pc.VERSION, swing.id, attacker_go_id, family, set_name, action.name, blackboard.attack_anim, box_up, box_down, box_flat, pc.finite(ok and scale or 1, 3), step_name or "")
+	local aimed_at = blackboard.attacking_target
+	local group = {
+		action = action,
+		blackboard = blackboard,
+		swings = {},
+	}
+	local t = pc.now()
+
+	for _, player in pairs(Managers.player:human_players()) do
+		local peer = player.remote and not player.bot_player and player.peer_id
+		local player_unit = player.player_unit
+
+		if peer and peer_is_fresh(peer) and player_unit and Unit.alive(player_unit) then
+			local swing = new_swing(unit, blackboard, "C", action, breed, player_unit, peer, attacker_go_id, set_name, attack_anim, t)
+
+			swing.group = group
+			swing.aimed = player_unit == aimed_at
+			group.swings[#group.swings + 1] = swing
+
+			send_begin(swing, blackboard, swing.aimed)
+		end
+	end
+
+	if #group.swings > 0 then
+		boxes[unit] = group
+	end
 end
 
 -- What vanilla would have decided at this frame. Nothing here has side effects.
@@ -197,8 +278,9 @@ local function would_have_judged(swing, blackboard, unit)
 	local action = swing.action
 	local combo = swing.family == "B"
 
-	-- A frenzy combo's damage frame checks neither line of sight nor unblockable (bt_combo_attack_action.lua:524).
-	if not Unit.alive(target) or not combo and blackboard.has_line_of_sight == false then
+	-- A frenzy combo's damage frame checks neither line of sight nor unblockable (bt_combo_attack_action.lua:524), and
+	-- a shove doesn't check line of sight (bt_storm_vermin_push_action.lua:99).
+	if not Unit.alive(target) or swing.family == "A" and blackboard.has_line_of_sight == false then
 		return "miss"
 	end
 
@@ -250,10 +332,99 @@ local function follow_up_depends(step)
 	return step.next_hit ~= nil and step.next_hit ~= step.next or step.next_blocked ~= nil and step.next_blocked ~= step.next
 end
 
--- Called from the AnimationSystem.animation_callback hook when an enemy's anim_cb_damage (family A) or
--- anim_cb_frenzy_damage (family B) fires on the host. Returns the swing whose vanilla hit test must be skipped, or nil
--- to leave this frame to vanilla. Everything here is plain table work, so it can't realistically fail halfway.
+-- Family C: what vanilla's box test would do at this frame for each player the attack was sent to, without its
+-- effects: "hit", "blocked" or "miss" by player unit. The overlap goes through the hook below before host.box_skip is
+-- set, so it sees everyone.
+local function box_would(unit, blackboard, group)
+	local centre, rotation, size = pc.geometry.elite_box(group.action, Unit.local_position(unit, 0), Unit.local_rotation(unit, 0))
+	local inside = pc.geometry.units_in_box(Unit.world(unit), centre, rotation, size)
+	local verdicts = {}
+
+	for i = 1, #group.swings do
+		local swing = group.swings[i]
+		local target = swing.target
+		local verdict = "miss"
+
+		if Unit.alive(target) and inside[target] then
+			verdict = "hit"
+
+			local status = ScriptUnit.has_extension(target, "status_system")
+
+			if status and status:is_blocking() and not group.action.unblockable then
+				local direction = group.action.attack_directions and group.action.attack_directions[swing.attack_anim]
+				local buff_extension = ScriptUnit.has_extension(target, "buff_system")
+				local invulnerable = buff_extension and buff_extension:has_buff_perk("invulnerable")
+
+				if status:can_block(unit, direction) and not invulnerable then
+					verdict = "blocked"
+				end
+			end
+		end
+
+		verdicts[target] = verdict
+	end
+
+	return verdicts
+end
+
+-- Family C at the host's damage frame: notes the frame on each player's swing, and sets host.box_skip to the players
+-- whose screens judge it. Returns the group, or nil to leave the whole frame to vanilla.
+local function box_frame(unit, blackboard)
+	local group = boxes[unit]
+
+	if not group or blackboard ~= group.blackboard or blackboard.active_node ~= BTStormVerminAttackAction or blackboard.action ~= group.action then
+		return nil
+	end
+
+	local ok, verdicts = pcall(box_would, unit, blackboard, group)
+	local t = pc.now()
+	local skip = nil
+
+	for i = 1, #group.swings do
+		local swing = group.swings[i]
+
+		if not swing.host_judged and swing.frames < MAX_FRAMES then
+			if peer_is_fresh(swing.peer) then
+				local frame = swing.frames + 1
+
+				swing.frames = frame
+				swing.frame_t[frame] = t
+				swing.expires = math.max(swing.expires, t + pc.SWING_LIFETIME)
+				swing.would[frame] = ok and verdicts[swing.target] or "unknown"
+
+				skip = skip or {}
+				skip[swing.target] = true
+			else
+				-- That client has gone quiet, so the host's box test reaches them as in vanilla.
+				swing.host_judged = true
+
+				pc.count("host_judged_quiet_client")
+			end
+		end
+	end
+
+	if not skip then
+		return nil
+	end
+
+	host.box_skip = skip
+
+	return group
+end
+
+-- Called from the AnimationSystem.animation_callback hook when an enemy's anim_cb_damage (families A and C),
+-- anim_cb_frenzy_damage (family B) or anim_cb_stormvermin_push (family D) fires on the host. Returns the swing whose
+-- vanilla hit test must be skipped (for family C, the attack's group, with host.box_skip set), or nil to leave this
+-- frame to vanilla. Everything here is plain table work, so it can't realistically fail halfway.
 function host.before_damage_frame(unit, callback_name)
+	if callback_name == "anim_cb_damage" and boxes[unit] then
+		local blackboard = BLACKBOARDS[unit]
+
+		if blackboard and blackboard.active_node == BTStormVerminAttackAction then
+			return box_frame(unit, blackboard)
+		end
+	end
+
 	local swing = by_attacker[unit]
 
 	if not swing or swing.host_judged then
@@ -268,6 +439,10 @@ function host.before_damage_frame(unit, callback_name)
 
 	if swing.family == "B" then
 		if callback_name ~= "anim_cb_frenzy_damage" or not in_combo_step(swing, blackboard) then
+			return nil
+		end
+	elseif swing.family == "D" then
+		if callback_name ~= "anim_cb_stormvermin_push" or blackboard.active_node ~= BTStormVerminPushAction or blackboard.action ~= swing.action or blackboard.attacking_target ~= swing.target then
 			return nil
 		end
 	elseif callback_name ~= "anim_cb_damage" or blackboard.active_node ~= BTAttackAction or blackboard.action ~= swing.action or blackboard.attacking_target ~= swing.target then
@@ -495,6 +670,119 @@ local function book_block(swing, multiplier, improved, direction, recoil)
 	return "booked, " .. recoil_outcome
 end
 
+-- Whether the enemy that swung is still the one that started the swing: alive or freshly dead, with the network id
+-- it had. A pooled unit recycled into a new enemy has a new id.
+local function same_attacker(swing)
+	local attacker = swing.attacker
+
+	return Unit.alive(attacker) and pc.network():unit_game_object_id(attacker) == swing.attacker_go_id
+end
+
+-- Family C: what the box test does for one player it reached (bt_storm_vermin_attack_action.lua:420), for that
+-- player's answer: the damage or, through a block, the blocked damage, the guard-break line, the catapult (which also
+-- damages a player who didn't block, bt_storm_vermin_attack_action.lua:531) and the push. A block itself is booked
+-- first by book_block.
+local function book_box(swing, blocked, through_block)
+	local target = swing.target
+	local attacker = swing.attacker
+	local action = swing.action
+
+	if not Unit.alive(target) then
+		return "target gone"
+	end
+
+	if not same_attacker(swing) then
+		if blocked then
+			return "attacker gone"
+		end
+
+		local ok, message = pcall(book_hit_without_attacker, swing)
+
+		if not ok then
+			pc.print("host swing=%d could not book a hit without its attacker: %s", swing.id, tostring(message))
+
+			return "failed"
+		end
+
+		return "booked without attacker"
+	end
+
+	local blackboard = BLACKBOARDS[attacker]
+
+	if through_block and blackboard and blackboard == swing.blackboard then
+		blackboard.hit_through_block = true
+	end
+
+	if action.damage then
+		if not blocked then
+			AiUtils.damage_target(target, attacker, action, action.damage)
+		elseif action.blocked_damage then
+			AiUtils.damage_target(target, attacker, action, action.blocked_damage)
+		end
+
+		if blocked and action.fatigue_type == "complete" then
+			pcall(function ()
+				SurroundingAwareSystem.add_event(target, "breaking_hit", DialogueSettings.grabbed_broadcast_range, "profile_name", ScriptUnit.extension(target, "dialogue_system").context.player_profile)
+			end)
+		end
+	end
+
+	if action.catapult and blackboard then
+		BTStormVerminAttackAction.catapult_enemy(attacker, blackboard, action, target, blocked)
+	end
+
+	local push_speed = action.push and action.player_push_speed
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local locomotion = ScriptUnit.has_extension(target, "locomotion_system")
+
+	if push_speed and status and not status.knocked_down and locomotion then
+		local direction = Vector3.normalize(POSITION_LOOKUP[target] - POSITION_LOOKUP[attacker])
+
+		locomotion:add_external_velocity(push_speed * direction, action.max_player_push_speed)
+	end
+
+	return blocked and "blocked damage booked" or "booked"
+end
+
+-- Family D: what an elite's shove does after its reach and cone test (bt_storm_vermin_push_action.lua:104): the
+-- damage, the pushed state and the knockback along the enemy's facing.
+local function book_shove(swing)
+	local target = swing.target
+	local attacker = swing.attacker
+	local action = swing.action
+
+	if not Unit.alive(target) then
+		return "target gone"
+	end
+
+	if not same_attacker(swing) then
+		local ok, message = pcall(book_hit_without_attacker, swing)
+
+		if not ok then
+			pc.print("host swing=%d could not book a shove without its attacker: %s", swing.id, tostring(message))
+
+			return "failed"
+		end
+
+		return "booked without attacker"
+	end
+
+	AiUtils.damage_target(target, attacker, action, action.damage)
+
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local locomotion = ScriptUnit.has_extension(target, "locomotion_system")
+
+	if status and not status:is_disabled() and locomotion then
+		StatusUtils.set_pushed_network(target, true)
+
+		if action.impact_push_speed then
+			locomotion:add_external_velocity(Quaternion.forward(Unit.local_rotation(attacker, 0)) * action.impact_push_speed, action.max_impact_push_speed)
+		end
+	end
+
+	return "booked"
+end
+
 local function valid_answer(id, frame, result, multiplier, improved, direction, through_block, distance, angle, recoil_anim, has_position, x, y, z, yaw)
 	return type(id) == "number" and type(frame) == "number" and frame >= 1 and frame <= MAX_FRAMES and frame == math.floor(frame)
 		and RESULTS[result] == true and type(multiplier) == "number" and multiplier == multiplier and multiplier >= 0 and multiplier <= 100
@@ -588,7 +876,13 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 	local outcome = "nothing to book"
 
 	if result == "hit" then
-		outcome = book_hit(swing, through_block)
+		if swing.family == "C" then
+			outcome = book_box(swing, false, through_block)
+		elseif swing.family == "D" then
+			outcome = book_shove(swing)
+		else
+			outcome = book_hit(swing, through_block)
+		end
 	elseif result == "blocked" then
 		local recoil = recoil_anim ~= "" and {
 			anim = recoil_anim,
@@ -600,6 +894,11 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 		-- For the log line of a recoil left to the host (HostReactions.recoil_ended).
 		swing.blocked_frame_t = swing.frame_t[frame]
 		outcome = book_block(swing, multiplier, improved, direction, recoil)
+
+		-- An elite's sweep still does its blocked damage, catapult and push after a block.
+		if swing.family == "C" then
+			outcome = outcome .. ", " .. book_box(swing, true, false)
+		end
 	end
 
 	local t = pc.now()
@@ -662,6 +961,66 @@ mod:hook_safe("BTComboAttackAction", "_start_attack", function (self, unit, blac
 	announce(unit, blackboard, "B", attack_name)
 end)
 
+-- Family C (D49): an elite's sweep or overhead starts here, with its animation already played and noted.
+mod:hook_safe("BTStormVerminAttackAction", "enter", function (self, unit, blackboard, t)
+	if pc.broken or not pc.is_server() or not pc.in_game() then
+		return
+	end
+
+	announce_box(unit, blackboard)
+end)
+
+-- Family D (D49): an elite's shove.
+mod:hook_safe("BTStormVerminPushAction", "enter", function (self, unit, blackboard, t)
+	if pc.broken or not pc.is_server() or not pc.in_game() then
+		return
+	end
+
+	announce(unit, blackboard, "D")
+end)
+
+local function without_skipped(actors, skip)
+	local kept = {}
+
+	for i = 1, #actors do
+		local unit = Actor.unit(actors[i])
+
+		if not unit or not skip[unit] then
+			kept[#kept + 1] = actors[i]
+		end
+	end
+
+	return kept, #kept
+end
+
+-- Family C: while host.box_skip is set, an elite's box test is running (bt_storm_vermin_attack_action.lua:393), and
+-- its overlap leaves out the players whose own screens judge the swing. Only that one overlap, the one that looks for
+-- player hit boxes (its 13th argument): host.box_skip is cleared as it is used. A mod:hook on an engine function the
+-- whole game calls, so every other call goes straight through, and its own work runs through pc.guard.
+mod:hook(PhysicsWorld, "immediate_overlap", function (func, ...)
+	local skip = host.box_skip
+
+	if not skip or select(13, ...) ~= "filter_player_hit_box_check" then
+		return func(...)
+	end
+
+	host.box_skip = nil
+
+	local actors, count = func(...)
+
+	if type(actors) ~= "table" then
+		return actors, count
+	end
+
+	local ok, kept, kept_count = pc.guard("host box filter", without_skipped, actors, skip)
+
+	if ok then
+		return kept, kept_count
+	end
+
+	return actors, count
+end)
+
 -- D15: while the step's next move waits for the client's answer, vanilla's run must not see that the step's
 -- animation has ended. This is a mod:hook, so everything except the original call runs through pc.guard.
 mod:hook("BTComboAttackAction", "run", function (func, self, unit, blackboard, t, dt)
@@ -698,6 +1057,7 @@ end)
 
 function host.update()
 	host.suppress = nil
+	host.box_skip = nil
 
 	if not pc.is_server() or not pc.in_game() then
 		return
@@ -726,6 +1086,12 @@ function host.update()
 			if by_attacker[swing.attacker] == swing then
 				by_attacker[swing.attacker] = nil
 			end
+
+			local group = boxes[swing.attacker]
+
+			if group and swing.group == group and group.swings[1] == swing then
+				boxes[swing.attacker] = nil
+			end
 		end
 	end
 end
@@ -735,7 +1101,9 @@ function host.clear()
 	mismatched = {}
 	swings = {}
 	by_attacker = {}
+	boxes = {}
 	host.suppress = nil
+	host.box_skip = nil
 
 	pc.host_reactions.clear()
 	pc.blasts.clear()

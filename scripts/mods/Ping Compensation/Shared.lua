@@ -1,7 +1,7 @@
 local mod = get_mod("Ping Compensation")
 
 -- Host and client must run the same VERSION. Bump it whenever any message in CLAUDE.md's "Network messages" changes.
-local VERSION = 11
+local VERSION = 12
 
 -- Playtest builds write the debug log by default, so testers don't have to remember /pingcomp debug on. Set this to
 -- false for a public release: players who want the log can still switch it on, and their choice is remembered.
@@ -15,6 +15,10 @@ local pc = {
 	HELLO_INTERVAL = 1, -- seconds between a client's hellos
 	PEER_EXPIRY = 4, -- seconds without a hello before the host judges that player as vanilla
 	SWING_LIFETIME = 5, -- seconds a swing is remembered, on both machines
+	-- Seconds between a client's requests to VMF to ping every player again while a host that has answered in this
+	-- mission stays quiet. VMF drops the host from a client's user list whenever the host removes a bot (the build 3.2
+	-- playtest, Client.lua).
+	REPING_INTERVAL = 3,
 	debug = PLAYTEST_BUILD, -- /pingcomp debug, remembered once a player sets it
 	echo = false, -- /pingcomp echo, on the host: disagreements and unanswered swings also show in chat
 	facing = true, -- /pingcomp facing
@@ -42,6 +46,16 @@ local pc = {
 		skaven_plague_monk = true,
 		chaos_berzerker = true,
 		skaven_storm_vermin_with_shield = true,
+		-- Build 4 (D49): the elites. The bulwark's shield runs stagger rules of its own (a stagger that builds and
+		-- regenerates, then opens the shield), so its reactions stay with the host for now (T14).
+		skaven_storm_vermin = true,
+		skaven_storm_vermin_commander = true,
+		chaos_raider = true,
+		chaos_raider_tutorial = true,
+		chaos_warrior = true,
+		beastmen_bestigor = true,
+		beastmen_standard_bearer = true,
+		beastmen_standard_bearer_crater = true,
 	},
 	-- Covered breeds whose stagger animations play faster when the stagger_scale variable is raised (the calibration
 	-- probe, 2026-11-14: 2x asked, 2x reached). The host plays a client's stagger of these faster (D32, D38). The other
@@ -58,10 +72,19 @@ local pc = {
 	},
 	-- Build 3.1 diagnostic: the clients decided "too weak to stagger" for hundreds of hits on these. For a client's
 	-- hits on them, the host still works out its own stagger, without applying it, and logs where it disagrees; both
-	-- sides log what their stagger maths used for every hit on them (pc.stagger_inputs, D45).
+	-- sides log what their stagger maths used for every hit on them (pc.stagger_inputs, D45). Build 4 checks the elites
+	-- the same way, to show where the client's stand-in falls short for them.
 	CHECK_BREEDS = {
 		skaven_plague_monk = true,
 		chaos_berzerker = true,
+		skaven_storm_vermin = true,
+		skaven_storm_vermin_commander = true,
+		chaos_raider = true,
+		chaos_raider_tutorial = true,
+		chaos_warrior = true,
+		beastmen_bestigor = true,
+		beastmen_standard_bearer = true,
+		beastmen_standard_bearer_crater = true,
 	},
 	broken = false, -- set after repeated errors; the mod then leaves everything to vanilla
 	stats = {},
