@@ -121,17 +121,27 @@ local ACTION_NODES = {
 	BTSuicideRunAction = true,
 	BTTargetPouncedAction = true,
 	BTWarpfireThrowerShootAction = true,
+	-- Build 5.1 (D52): the archer's arrows (family G) and the globadier's throw, whose impact the client judges (family H).
+	BTFireProjectileAction = true,
+	BTThrowPoisonGlobeAction = true,
 }
 
 -- The fields of those action tables that the client's maths reads. Only these are fingerprinted, so state the host's
 -- AI might keep in an action table can't make two machines look different.
 local ACTION_FIELDS = {
+	"aim_animation",
+	"aim_cooldown",
+	"aim_rotation_override_distance",
+	"aoe_init_damage",
 	"attack_anim",
 	"attack_directions",
 	"blocked_anim",
 	"blocked_anims",
 	"blocked_damage",
+	"buff_name",
 	"catapult",
+	"close_attack_cooldown",
+	"close_attack_range",
 	"combo_attacks",
 	"damage",
 	"damage_type",
@@ -141,14 +151,18 @@ local ACTION_FIELDS = {
 	"dodge_window_duration",
 	"dodge_window_start",
 	"fatigue_type",
+	"firing_time",
 	"grab_delay",
 	"grabbing_stagger_anims",
 	"height",
+	"hit_radius",
 	"hit_react_type",
 	"ignore_dodge",
 	"ignore_staggers",
 	"impact_push_speed",
+	"initial_radius",
 	"knocked_down_attack_anim",
+	"light_weight_projectile_template_name",
 	"max_distance_squared",
 	"max_impact_push_speed",
 	"max_player_push_speed",
@@ -156,6 +170,7 @@ local ACTION_FIELDS = {
 	"moving_attack",
 	"moving_stagger_minimum_destination_distance",
 	"moving_stagger_threshold",
+	"muzzle_node",
 	"no_block_stagger",
 	"offset_forward",
 	"offset_up",
@@ -163,8 +178,12 @@ local ACTION_FIELDS = {
 	"player_dodged_radius",
 	"player_push_speed",
 	"player_push_speed_blocked",
+	"projectile_gravity",
 	"projectile_speed",
 	"push",
+	"radial_speed_feet_shooting",
+	"radial_speed_upper_body_shooting",
+	"radius",
 	"range",
 	"reset_attack_animations",
 	"rotation_time",
@@ -173,6 +192,8 @@ local ACTION_FIELDS = {
 	"shield_block_anims",
 	"shield_break_anims",
 	"shield_stagger_anims",
+	"shoot_animation",
+	"shoot_cooldown",
 	"stagger_animation_scale",
 	"stagger_anims",
 	"stagger_reduction",
@@ -392,6 +413,22 @@ local SECTION_FEEDERS = {
 	actions = function (out)
 		for i = 1, #FINGERPRINT_BREEDS do
 			feed_breed_actions(out, FINGERPRINT_BREEDS[i])
+		end
+
+		-- Build 5.1 (D52): the shots' and areas' own data, which the client's judging reads (Shots.lua, Areas.lua).
+		local blobs = rawget(_G, "DamageBlobTemplates")
+
+		feed(out, rawget(_G, "LightWeightProjectiles"), 0)
+		feed(out, rawget(_G, "VortexTemplates"), 0)
+		feed(out, blobs and blobs.templates, 0)
+
+		-- D58: the burnings the client ticks itself, from its own copy of their buffs (Areas.lua).
+		local buffs = rawget(_G, "BuffTemplates")
+
+		if type(buffs) == "table" then
+			feed(out, buffs.warpfire_thrower_ground_base, 0)
+			feed(out, buffs.warpfire_thrower_face_base, 0)
+			feed(out, buffs.warpfire_thrower_face_base_mutator, 0)
 		end
 	end,
 	difficulty = function (out)

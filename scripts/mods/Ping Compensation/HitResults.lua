@@ -45,19 +45,22 @@ local function raw_health(health)
 	return GameSession.game_object_field(game, id, "current_health"), GameSession.game_object_field(game, id, "current_temporary_health"), GameSession.game_object_field(game, id, "max_health")
 end
 
--- AiUtils.damage_target (ai_utils.lua:258) as far as this client can follow it. The crowd scaling comes from the
--- host with the swing. Of the host's damage buffs (DamageUtils.apply_buffs_to_damage) only the common ones are
--- applied, so this is an estimate, and the bar settles on the host's number when it arrives.
-local function estimate_damage(swing, attacker, target, damage)
-	local action = swing.action
-	local amount = DamageUtils.calculate_damage(damage or swing.damage or action.damage, target, attacker)
+-- The game's own immunity to poison (is_immune_to_damage, damage_utils.lua:37).
+local POISON_TYPES = {
+	aoe_poison_dot = true,
+	arrow_poison = true,
+	arrow_poison_dot = true,
+	poison = true,
+}
+local POISON_SOURCES = {
+	poison_dot = true,
+	skaven_poison_wind_globadier = true,
+}
 
-	if type(amount) ~= "number" then
-		return 0
-	end
-
-	amount = amount * (swing.damage_scale or 1)
-
+-- What the host does to a hit's damage on a player after working it out: the low difficulties' caps and multipliers,
+-- and the player's protection and damage-taken buffs (DamageUtils.apply_buffs_to_damage, only the common ones). An
+-- area's damage type also gets the player's protection from areas (:2169).
+local function adjusted_damage(amount, target, race, damage_type)
 	local difficulty = Managers.state.difficulty
 	local settings = difficulty:get_difficulty_settings()
 	local rank = difficulty:get_difficulty_rank()
@@ -84,18 +87,36 @@ local function estimate_damage(swing, attacker, target, damage)
 			return 0
 		end
 
-		local race = swing.breed.race
-
 		if race == "skaven" then
 			amount = buffs:apply_buffs_to_value(amount, "protection_skaven")
 		elseif race == "chaos" or race == "beastmen" then
 			amount = buffs:apply_buffs_to_value(amount, "protection_chaos")
 		end
 
+		local area_types = rawget(_G, "DAMAGE_TYPES_AOE")
+
+		if damage_type and area_types and area_types[damage_type] then
+			amount = buffs:apply_buffs_to_value(amount, "protection_aoe")
+		end
+
 		amount = buffs:apply_buffs_to_value(amount, "damage_taken")
 	end
 
 	return DamageUtils.networkify_damage(math.max(amount, 0))
+end
+
+-- AiUtils.damage_target (ai_utils.lua:258) as far as this client can follow it. The crowd scaling comes from the
+-- host with the swing. Of the host's damage buffs (DamageUtils.apply_buffs_to_damage) only the common ones are
+-- applied, so this is an estimate, and the bar settles on the host's number when it arrives.
+local function estimate_damage(swing, attacker, target, damage)
+	local action = swing.action
+	local amount = DamageUtils.calculate_damage(damage or swing.damage or action.damage, target, attacker)
+
+	if type(amount) ~= "number" then
+		return 0
+	end
+
+	return adjusted_damage(amount * (swing.damage_scale or 1), target, swing.breed.race)
 end
 
 local function start_estimate(health, amount, t)
@@ -276,6 +297,96 @@ function hit_results.shove(swing, unit, target, rotation)
 
 	push(target, action.impact_push_speed, action.max_impact_push_speed, forward, t)
 	pc.log("client swing=%d shove shown at once: estimate=%.1f push=%s", swing.id, amount, tostring(action.impact_push_speed))
+end
+
+-- Called by Shots.lua for an enemy's bullet or arrow judged "hit" on this player (family G): the feedback and HP
+-- estimate that the host's damage message would show. action_data is the shot's own (power level and damage profile,
+-- bt_ratling_gunner_shoot_action.lua:601, bt_fire_projectile_action.lua:316). The push is the shot's business, since
+-- the host doesn't send one for a shot this screen judged. Returns the estimate.
+function hit_results.shot(shooter, shooter_go_id, breed, target, action_data, zone, direction)
+	if not showing() then
+		return 0
+	end
+
+	local health = ScriptUnit.has_extension(target, "health_system")
+	local profile = DamageProfileTemplates[action_data.damage_profile]
+
+	if not health or not profile then
+		return 0
+	end
+
+	local target_settings = profile.targets and profile.targets[1] or profile.default_target
+	local boost_curve = target_settings and BoostCurves[target_settings.boost_curve_type]
+	local _, boost = ActionUtils.get_ranged_boost(shooter)
+	local amount = DamageUtils.calculate_damage(DamageOutput, target, shooter, zone, action_data.power_level, boost_curve, boost, false, profile, 1, nil, breed.name)
+
+	if type(amount) ~= "number" then
+		return 0
+	end
+
+	amount = adjusted_damage(amount, target, breed.race)
+
+	if amount > 0 then
+		local t = pc.now()
+
+		health:add_damage(shooter, amount, zone, DamageUtils.get_damage_type(profile, 1) or "cutting", position(target), direction, breed.name, nil, shooter, "light", false, false, false, 1, "n/a", 1, 1)
+
+		pending_hits[#pending_hits + 1] = {
+			go_id = shooter_go_id,
+			source = breed.name,
+			t = t,
+		}
+
+		start_estimate(health, amount, t)
+		pc.count("client_hit_shown")
+		pc.count("client_hit_estimate_sum", amount)
+	end
+
+	return amount
+end
+
+-- Called by Areas.lua for damage an area or a burning does to this player, judged on this screen (family H, D58): a gas
+-- cloud's tick or impact, or a tick of the ground fire's or the jet's burning. The feedback and HP estimate that the
+-- host's damage message would show (DamageUtils.add_damage_network, damage_utils.lua:1745, which the host books it
+-- with). attacker: the cloud, the fire or the thrower, whose network id that message carries. Returns the estimate.
+function hit_results.area(attacker, attacker_go_id, damage_source, source_attacker, damage, damage_type)
+	if not showing() or type(damage) ~= "number" then
+		return 0
+	end
+
+	local target = pc.local_player_unit()
+	local health = target and ScriptUnit.has_extension(target, "health_system")
+	local buffs = target and ScriptUnit.has_extension(target, "buff_system")
+
+	if not health then
+		return 0
+	end
+
+	if buffs and buffs:has_buff_perk("poison_proof") and (POISON_TYPES[damage_type] or POISON_SOURCES[damage_source]) then
+		return 0
+	end
+
+	local source_breed = damage_source and Breeds[damage_source]
+	local amount = adjusted_damage(damage, target, source_breed and source_breed.race, damage_type)
+
+	if amount > 0 then
+		local t = pc.now()
+		local shown_attacker = attacker and Unit.alive(attacker) and attacker or target
+
+		health:add_damage(shown_attacker, amount, "torso", damage_type, position(target), Vector3(1, 0, 0), damage_source, nil, source_attacker, "light", false, false, false, 1, "n/a", 1, 1)
+
+		pending_hits[#pending_hits + 1] = {
+			go_id = attacker_go_id,
+			source = damage_source,
+			t = t,
+		}
+
+		start_estimate(health, amount, t)
+		pc.count("client_hit_shown")
+		pc.count("client_hit_estimate_sum", amount)
+	end
+
+	return amount
 end
 
 -- Called by Client.lua at a damage frame judged "blocked": the push a blocked swing gives (BTAttackAction.attack_blocked).

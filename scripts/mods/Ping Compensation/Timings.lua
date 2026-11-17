@@ -897,9 +897,9 @@ end
 
 -- One reading on this machine: seconds from the animation's start to its cue, for a stagger played faster multiplied
 -- back to normal speed. after: for a recoil, the blocked attack's animation. speed: how fast the animation was asked to
--- play (1 for normal). Every reading is logged; only one taken at normal speed, of a timing that isn't shipped, is
--- learned.
-function timings.learn(kind, breed_name, anim, seconds, after, speed)
+-- play (1 for normal). go_id: the enemy's network id, so a reading can be traced to the enemy's other lines (T16).
+-- Every reading is logged; only one taken at normal speed, of a timing that isn't shipped, is learned.
+function timings.learn(kind, breed_name, anim, seconds, after, speed, go_id)
 	if not SETTINGS[kind] or type(breed_name) ~= "string" or type(anim) ~= "string" or type(seconds) ~= "number" then
 		return
 	end
@@ -908,7 +908,7 @@ function timings.learn(kind, breed_name, anim, seconds, after, speed)
 
 	local attack = BY_ATTACK[kind] and type(after) == "string" and after or nil
 	local known, shipped = timings.get(kind, breed_name, anim, attack)
-	local reading = string.format("timing %s breed=%s anim=%s seconds=%.3f%s speed=%.2f", kind, breed_name, anim, seconds, attack and " after=" .. attack or "", speed)
+	local reading = string.format("timing %s breed=%s anim=%s seconds=%.3f%s speed=%.2f%s", kind, breed_name, anim, seconds, attack and " after=" .. attack or "", speed, type(go_id) == "number" and string.format(" go=%d", go_id) or "")
 
 	if not valid_seconds(seconds) or known and seconds < known * MIN_SHARE then
 		pc.count("timings_ignored_" .. kind)

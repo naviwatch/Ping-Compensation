@@ -17,7 +17,7 @@ pc.client = client
 
 local DODGE_DISTANCE = 4 -- DEFAULT_DODGE_DISTANCE_THRESHOLD in bt_attack_action.lua
 local DEFAULT_DODGE_ROTATION_TIME = 1.5 -- also from bt_attack_action.lua
-local ROTATION_SPEED = 10 -- DEFAULT_ROTATION_SPEED in ai_locomotion_extension.lua
+local ROTATION_SPEED = pc.DEFAULT_TURN_SPEED -- DEFAULT_ROTATION_SPEED in ai_locomotion_extension.lua; per attack, pc.turn_speed (T18)
 local COMBO_ROTATION_SPEED = 20 -- DEFAULT_ROTATION_SPEED in bt_combo_attack_action.lua, set at every combo step
 local COMBO_DODGED_ROTATION_SPEED = 2 -- what a dodge drops it to for the rest of the step (bt_combo_attack_action.lua:417)
 local COMBO_DODGE_TIMER = 0.3 -- seconds the enemy aims where the player was when they dodged, unless the breed says (:421)
@@ -200,8 +200,8 @@ local function update_facing(swing, unit, target, t, dt)
 		swing.frozen = false
 	end
 
-	-- The host eases an enemy towards its wanted rotation at ROTATION_SPEED. Do the same, so it turns no faster here.
-	local rotation = Quaternion.lerp(swing.current:unbox(), swing.wanted:unbox(), math.min(ROTATION_SPEED * dt, 1))
+	-- The host eases an enemy towards its wanted rotation at its turn speed (T18). Do the same, so it turns no faster here.
+	local rotation = Quaternion.lerp(swing.current:unbox(), swing.wanted:unbox(), math.min((swing.turn_speed or ROTATION_SPEED) * dt, 1))
 
 	swing.current:store(rotation)
 
@@ -297,10 +297,11 @@ local function note_dodges(swing, status)
 	end
 end
 
--- The host's AI locomotion eases an enemy towards its wanted rotation at ROTATION_SPEED and snaps once a frame's step
--- reaches 1 (locomotion_templates_ai.lua:156). Do the same here, so it turns no faster.
+-- The host's AI locomotion eases an enemy towards its wanted rotation at its turn speed and snaps once a frame's step
+-- reaches 1 (locomotion_templates_ai.lua:156). Do the same here, so it turns no faster. The turn speed is the one the
+-- host's locomotion has during this attack, worked out from this client's own copy of the behaviour tree (T18).
 local function ease_facing(swing, unit, dt)
-	local rotation = Quaternion.lerp(swing.current:unbox(), swing.wanted:unbox(), math.min(ROTATION_SPEED * dt, 1))
+	local rotation = Quaternion.lerp(swing.current:unbox(), swing.wanted:unbox(), math.min((swing.turn_speed or ROTATION_SPEED) * dt, 1))
 
 	swing.current:store(rotation)
 
@@ -884,10 +885,10 @@ function client.damage_frame(unit, callback_name)
 		local dodging_now = status ~= nil and status.is_dodging == true
 		local effective_now = status ~= nil and status:get_is_dodging() and true or false
 
-		pc.log("client swing=%d enemy=%s attack=%s%s frame=%d verdict=%s reason=%s distance=%.2f reach=%.2f angle=%.1f cone=%.1f frozen=%s facing=%s since_begin=%.3fs dodging=%s effective=%s dodges=%s/%s dodged_in_swing=%s over_count_in_swing=%s dodgecount=%s recoil=%s family=%s aimed=%s%s",
+		pc.log("client swing=%d enemy=%s attack=%s%s frame=%d verdict=%s reason=%s distance=%.2f reach=%.2f angle=%.1f cone=%.1f frozen=%s facing=%s since_begin=%.3fs dodging=%s effective=%s dodges=%s/%s dodged_in_swing=%s over_count_in_swing=%s dodgecount=%s recoil=%s family=%s aimed=%s turn=%s%s",
 			swing.id, breed.name, swing.action_name, combo and "/" .. tostring(swing.step_name) or "", frame, result, reason, distance, reach, angle, cone, tostring(tightened == true), use_our_facing and "client" or "host", t - swing.begin_t,
 			tostring(dodging_now), tostring(effective_now), tostring(status and status.dodge_cooldown), tostring(status and status.dodge_count), tostring(swing.dodged == true), tostring(swing.dodge_over_count == true), pc.dodgecount and "on" or "off",
-			tostring(recoil_anim or "host"), family .. (swing.kind and ":" .. swing.kind or ""), tostring(swing.aimed == true), family == "C" and " box=" .. tostring(swing.box_method) or "")
+			tostring(recoil_anim or "host"), family .. (swing.kind and ":" .. swing.kind or ""), tostring(swing.aimed == true), combo and "combo" or tostring(swing.turn_speed), family == "C" and " box=" .. tostring(swing.box_method) or "")
 	end
 end
 
@@ -988,12 +989,21 @@ function client.pushed(attacker_go_id, hit_go_id, shield_blocked)
 	cut(swing, "pushed")
 end
 
--- This player's hit staggered or killed the enemy on their screen (Reactions.lua), so a swing it had started is over.
+-- This player's hit staggered or killed the enemy on their screen (Reactions.lua), so a swing it had started is over,
+-- and a shooter or a warpfire thrower stops turning here (Shots.lua, Areas.lua).
 function client.reaction_started(unit, reason)
 	local swing = by_unit[unit]
 
 	if swing and not swing.past_damage then
 		cut(swing, reason)
+	end
+
+	if pc.shots then
+		pc.guard("client shooter reaction", pc.shots.stop_turning, unit, reason)
+	end
+
+	if pc.areas then
+		pc.guard("client jet reaction", pc.areas.stop_turning, unit, reason)
 	end
 end
 
@@ -1088,6 +1098,7 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 		step_name = step and step_name or nil,
 		damage = pc.attack_damage(action, step),
 		rotation_speed = COMBO_ROTATION_SPEED, -- family B: the step's turning speed, until a dodge drops it
+		turn_speed = pc.turn_speed(breed, action), -- families A, C, D and F: the host's turn speed during this attack (T18)
 		dodged_during_attack = false, -- family B: the player dodged during this step
 		dodge_timer = 0,
 		last_target_position = Vector3Box(Unit.local_position(target, 0)),
@@ -1134,6 +1145,17 @@ mod:hook_safe("LocomotionSystem", "update", function (self, context, t)
 
 	if pc.disablers and pc.disablers.active() then
 		pc.guard("client grabs", pc.disablers.after_locomotion, t)
+	end
+
+	-- Family H: the warpfire's jet on this player's screen turns the thrower by its own rule (Areas.lua), so after the
+	-- engine has turned every enemy copy by the host's numbers, as the swings' facing does.
+	if pc.areas and pc.areas.has_jets() then
+		pc.guard("client jets", pc.areas.after_locomotion, t, context.dt)
+	end
+
+	-- Family G (D59): a ratling gunner's stream and an archer aimed at this player turn the shooter the same way (Shots.lua).
+	if pc.shots and pc.shots.has_turning() then
+		pc.guard("client shooters", pc.shots.after_locomotion, t, context.dt)
 	end
 end)
 
@@ -1260,8 +1282,17 @@ function client.update(dt)
 
 	pc.guard("client reactions upkeep", pc.reactions.update, dt)
 	pc.guard("client hit results upkeep", pc.hit_results.update)
+
 	if pc.disablers then
 		pc.guard("client grabs upkeep", pc.disablers.update)
+	end
+
+	if pc.shots then
+		pc.guard("client shots upkeep", pc.shots.update, dt)
+	end
+
+	if pc.areas then
+		pc.guard("client areas upkeep", pc.areas.update, dt)
 	end
 
 	if next(recently_cut) ~= nil then
@@ -1307,6 +1338,14 @@ function client.clear()
 
 	if pc.disablers then
 		pc.disablers.clear()
+	end
+
+	if pc.shots then
+		pc.shots.clear()
+	end
+
+	if pc.areas then
+		pc.areas.clear()
 	end
 end
 

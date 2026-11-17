@@ -15,6 +15,7 @@ local host = {
 	suppress = nil, -- the swing whose vanilla hit test is being skipped right now
 	box_skip = nil, -- family C: the player units the next box overlap leaves out, during an elite's damage frame
 	leap_skip = nil, -- family F: the player units the next leap overlap leaves out, during a gutter runner's leap
+	booking = false, -- true while the host books what a client reported, so the damage-alone log leaves it out (D56)
 }
 
 pc.host = host
@@ -49,6 +50,16 @@ end
 -- client makes the same check from the host's replies, so both sides agree on who decides.
 function host.peer_decides_attacks(peer)
 	return peer_is_fresh(peer) and peers[peer].attacks == true and peers[peer].matched == true
+end
+
+-- The peer whose own screen judges what reaches this player unit, if any: a remote human player whose client has said
+-- hello in the last pc.PEER_EXPIRY seconds. Families G and H (Shots.lua, Areas.lua) leave such players out of the
+-- host's own tests, as the other families do.
+function host.client_judges(unit)
+	local owner = unit and Managers.player:unit_owner(unit)
+	local peer = owner and owner.remote and not owner.bot_player and owner.peer_id
+
+	return peer and peer_is_fresh(peer) and peer or nil
 end
 
 -- The enemy's damage against this target is scaled down by how many enemies surround the target. Only the host has
@@ -1185,6 +1196,8 @@ local function player_name(peer)
 	return player and player:name() or tostring(peer)
 end
 
+host.player_name = player_name
+
 -- fingerprint: the client's fingerprint of its enemy data (Compat.lua). Only a client whose enemy data is the host's
 -- decides its own hits (D34); the host and that player are told when that changes.
 mod:network_register("pc_hello", function (sender, version, attacks, fingerprint)
@@ -1261,6 +1274,9 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 
 	local outcome = "nothing to book"
 
+	-- What follows books what the client reported, which the damage-alone log leaves out (host.damage_alone).
+	host.booking = true
+
 	if result == "hit" then
 		if swing.family == "C" then
 			outcome = book_box(swing, false, through_block)
@@ -1289,6 +1305,8 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 			outcome = outcome .. ", " .. book_box(swing, true, false)
 		end
 	end
+
+	host.booking = false
 
 	local t = pc.now()
 	local frame_t = swing.frame_t[frame]
@@ -1552,10 +1570,43 @@ mod:hook("DamageUtils", "check_distance", function (func, action, blackboard, at
 	return func(action, blackboard, attacker, target)
 end)
 
+-- D56: damage the host books on a modded player that didn't come from that player's own report. Every attack the
+-- mod doesn't judge on the player's screen yet shows up here (monsters until build 6, damage over time, falls), and so
+-- does what follows a grab a client reported, such as the packmaster's drag and the leech's drain: the attacker's
+-- action tells them apart. So one session's logs show every gap that is left.
+function host.damage_alone(unit, attacker, amount, damage_type, source)
+	local peer = host.client_judges(unit)
+
+	if not peer or type(amount) ~= "number" or amount <= 0 then
+		return
+	end
+
+	pc.count("host_damage_alone")
+	pc.count("host_damage_alone_" .. tostring(source))
+
+	if pc.debug then
+		local breed = attacker and Unit.alive(attacker) and Unit.get_data(attacker, "breed")
+		local blackboard = attacker and BLACKBOARDS[attacker]
+		local action = blackboard and type(blackboard.action) == "table" and blackboard.action.name
+
+		pc.log("host damage alone target=%s amount=%.2f type=%s source=%s attacker=%s action=%s", player_name(peer), amount, tostring(damage_type), tostring(source), breed and breed.name or attacker and "unit" or "none", tostring(action))
+	end
+end
+
+-- The host books every player's damage on its own copy of their health (player_unit_health_extension.lua:530).
+mod:hook_safe("PlayerUnitHealthExtension", "add_damage", function (self, attacker_unit, damage_amount, hit_zone_name, damage_type, hit_position, damage_direction, damage_source_name)
+	if host.booking or pc.broken or not pc.is_server() or not pc.in_game() then
+		return
+	end
+
+	pc.guard("host damage alone", host.damage_alone, self.unit, attacker_unit, damage_amount, damage_type, damage_source_name)
+end)
+
 function host.update()
 	host.suppress = nil
 	host.box_skip = nil
 	host.leap_skip = nil
+	host.booking = false
 
 	if not pc.is_server() or not pc.in_game() then
 		return
@@ -1610,9 +1661,14 @@ function host.clear()
 	host.suppress = nil
 	host.box_skip = nil
 	host.leap_skip = nil
+	host.booking = false
 
 	pc.host_reactions.clear()
 	pc.blasts.clear()
+
+	if pc.areas then
+		pc.areas.host_clear()
+	end
 end
 
 function host.modded_peer_count()

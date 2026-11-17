@@ -881,7 +881,7 @@ function reactions.animation_callback(unit, callback_name)
 		if Managers.state.unit_storage:go_id(unit) == measure.go_id then
 			local elapsed = pc.now() - measure.t
 
-			pc.timings.learn(timing_kind, measure.breed_name, measure.anim, timing_kind == "length" and elapsed * measure.scale or elapsed, measure.after, measure.scale)
+			pc.timings.learn(timing_kind, measure.breed_name, measure.anim, timing_kind == "length" and elapsed * measure.scale or elapsed, measure.after, measure.scale, measure.go_id)
 		end
 	end
 
@@ -1998,6 +1998,15 @@ mod:network_register("pc_reaction_ack", function (sender, version, kind, id, res
 		return
 	end
 
+	-- A vortex's catch this screen showed at once (D53, Areas.lua).
+	if kind == "catch" then
+		if pc.areas then
+			pc.guard("client catch ack", pc.areas.acknowledged, id, result)
+		end
+
+		return
+	end
+
 	local prediction = by_key[tostring(kind) .. ":" .. tostring(id)]
 
 	if not prediction then
@@ -2078,6 +2087,16 @@ mod:hook("AnimationSystem", "rpc_anim_event", function (func, self, channel_id, 
 		pc.guard("client swing animation", pc.client.animation_changed, go_id, anim_id)
 	end
 
+	-- A warpfire thrower's jet ends with its shooting (Areas.lua), and an archer's aim at this player with its node
+	-- (Shots.lua).
+	if pc.areas and pc.areas.has_jets() then
+		pc.guard("client jet animation", pc.areas.animation_changed, go_id, anim_id)
+	end
+
+	if pc.shots and pc.shots.has_turning() then
+		pc.guard("client shooter animation", pc.shots.animation_changed, go_id, anim_id)
+	end
+
 	return func(self, channel_id, anim_id, go_id)
 end)
 
@@ -2094,6 +2113,14 @@ mod:hook("AnimationSystem", "rpc_anim_event_variable_float", function (func, sel
 
 	if pc.client.has_open_swings() then
 		pc.guard("client swing animation", pc.client.animation_changed, go_id, anim_id)
+	end
+
+	if pc.areas and pc.areas.has_jets() then
+		pc.guard("client jet animation", pc.areas.animation_changed, go_id, anim_id)
+	end
+
+	if pc.shots and pc.shots.has_turning() then
+		pc.guard("client shooter animation", pc.shots.animation_changed, go_id, anim_id)
 	end
 
 	return func(self, channel_id, anim_id, go_id, variable_id, variable_value)

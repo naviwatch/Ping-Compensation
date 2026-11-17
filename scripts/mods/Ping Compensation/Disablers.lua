@@ -245,6 +245,16 @@ mod:hook("StatusSystem", "rpc_status_change_bool", function (func, self, channel
 		end
 	end
 
+	-- A vortex's catch this screen shows (Areas.lua, D53): the host's echo is dropped, and its own vortex statuses for
+	-- this player are those this screen sets itself.
+	if not pc.broken and pc.areas and not pc.is_server() then
+		local ok, drop = pc.guard("client vortex echo", pc.areas.status_message, status_id, status_bool, game_object_id, other_object_id)
+
+		if ok and drop then
+			return
+		end
+	end
+
 	return func(self, channel_id, status_id, status_bool, game_object_id, other_object_id)
 end)
 

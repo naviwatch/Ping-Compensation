@@ -13,6 +13,8 @@ mod:dofile("scripts/mods/Ping Compensation/Reactions")
 mod:dofile("scripts/mods/Ping Compensation/HitResults")
 mod:dofile("scripts/mods/Ping Compensation/Disablers")
 mod:dofile("scripts/mods/Ping Compensation/Blasts")
+mod:dofile("scripts/mods/Ping Compensation/Shots")
+mod:dofile("scripts/mods/Ping Compensation/Areas")
 mod:dofile("scripts/mods/Ping Compensation/Probe")
 mod:dofile("scripts/mods/Ping Compensation/Version")
 
@@ -254,6 +256,35 @@ local function stat(name)
 	return pc.stats[name] or 0
 end
 
+-- "name n, name n" for every stat whose name starts with prefix, largest first, or "none".
+local function stats_by(prefix)
+	local entries = {}
+
+	for name, value in pairs(pc.stats) do
+		local rest = string.sub(name, 1, #prefix) == prefix and string.sub(name, #prefix + 1) or nil
+
+		if rest and rest ~= "" then
+			entries[#entries + 1] = { rest, value }
+		end
+	end
+
+	if #entries == 0 then
+		return "none"
+	end
+
+	table.sort(entries, function (a, b)
+		return a[2] > b[2] or a[2] == b[2] and a[1] < b[1]
+	end)
+
+	local parts = {}
+
+	for i = 1, #entries do
+		parts[i] = string.format("%s %d", entries[i][1], entries[i][2])
+	end
+
+	return table.concat(parts, ", ")
+end
+
 -- Everything here also goes to the console log (pc.say), because some players' VMF settings send echoes to chat only.
 -- to_chat false writes the same lines to the console log only.
 -- as_host: which side's lines to write, if not this machine's role now.
@@ -280,6 +311,10 @@ local function print_stats(to_chat, as_host)
 		out("Frenzy combo steps announced %d. Next moves that waited for the answer %d (average %.0f ms), went by the host's guess %d (%d after the wait ran out).", stat("host_announced_B"), stat("host_combo_waited"), waits > 0 and stat("host_combo_wait_sum") / waits * 1000 or 0, stat("host_combo_guessed"), stat("host_combo_wait_ran_out"))
 		out("Elite sweeps and overheads sent %d (one per modded player), elite shoves %d.", stat("host_announced_C"), stat("host_announced_D"))
 		out("Disablers' hooks, grabs and pounces sent %d (a pounce to every modded player). Clients' grabs and pins booked %d, refused %d. Held open for the answer %d.", stat("host_announced_F"), stat("host_grab_booked"), stat("host_grab_refused"), stat("host_grab_waited"))
+		out("Enemy shots: streams aimed at a modded player %d, archers aiming at one %d. Arrows %d, %d of them rolled a miss; the others sent to %d modded players in all. Own shots stopped at modded players %d. Clients' shots %d (bullets %d, arrows %d): booked %d, blocked on their screen %d, ignored from a client gone quiet %d.", stat("host_streams_aimed"), stat("host_archers_aimed"), stat("host_arrows"), stat("host_arrows_missed_roll"), stat("host_arrows_sent"), stat("host_shot_stopped"), stat("host_shots"), stat("host_shot_bullet"), stat("host_shot_arrow"), stat("host_shot_booked"), stat("host_shot_blocked"), stat("host_shot_ignored_stale"))
+		out("Enemy areas: jets sent to modded players %d (one per player; new targets %d), modded players left out of the host's jet sweeps %d and of gas clouds' tests %d. Clients' reports %d: ticks %d (booked: gas %d, ground fire %d, jet %d; late %d, lost %d), impacts %d (booked %d), ground fire %d (entered %d, left %d), jet hits %d (booked %d), vortex catches %d (booked %d). Host burning ticks left to clients %d. Ignored from a client gone quiet %d.", stat("host_jets_aimed"), stat("host_jets_retargeted"), stat("host_jet_left_out"), stat("host_gas_left_to_client"), stat("host_area_reports"), stat("host_area_tick"), stat("host_gas_ticks"), stat("host_fire_ticks"), stat("host_jet_ticks"), stat("host_ticks_late"), stat("host_ticks_lost"),
+			stat("host_area_impact"), stat("host_gas_impacts"), stat("host_area_fire"), stat("host_fire_entered"), stat("host_fire_left"), stat("host_area_jet"), stat("host_jet_hits"), stat("host_area_vortex"), stat("host_vortex_catches"), stat("host_burn_ticks_left_to_client"), stat("host_area_ignored_stale"))
+		out("Damage booked on modded players by the host alone %d, by source: %s.", stat("host_damage_alone"), stats_by("host_damage_alone_"))
 		local modded, matching = pc.host.modded_peer_count()
 
 		out("Judged by the host after a client went quiet %d. Answers ignored %d, rejected %d. Modded clients now: %d, %d of them with your enemy data.", stat("host_judged_quiet_client"), stat("host_ignored"), stat("host_rejected"), modded, matching)
@@ -316,8 +351,15 @@ local function print_stats(to_chat, as_host)
 		out("Your blasts worked out here %d, covered enemies in them %d, blasts left to the host %d.", stat("client_blasts"), stat("client_blast_targets"), stat("client_blast_not_followed"))
 		out("Elite sweeps and overheads judged %d (%d where you weren't the one attacked; hit boxes found by the game's overlap %d, by shape %d), elite shoves judged %d.", stat("client_judged_C"), stat("client_judged_C_not_aimed"), stat("client_box_overlap"), stat("client_box_shape"), stat("client_judged_D"))
 		out("Disablers' hooks, grabs and pounces judged %d: dodged %d, out of sight %d, landed without reaching you %d. Grabs and pins shown at once %d: confirmed by the host %d, refused %d, never confirmed %d, undone %d.", stat("client_judged_F"), stat("client_miss_dodged"), stat("client_miss_line of sight"), stat("client_miss_landed"), stat("client_grab_shown"), stat("client_grab_confirmed"), stat("client_grab_refused"), stat("client_grab_timeout"), stat("client_grab_undone"))
+		out("Enemy shots judged on you %d (bullets %d, arrows %d): hit %d, blocked %d. Streams aimed at you %d (%d ran here). Archers aiming at you %d (ended %d). Arrows told of %d, aimed again at you %d; hit something else first %d, lost %d, never seen %d; host removals held back %d.", stat("client_shot_bullet") + stat("client_shot_arrow"), stat("client_shot_bullet"), stat("client_shot_arrow"), stat("client_shot_hit"), stat("client_shot_blocked"), stat("client_streams_announced"), stat("client_streams_aimed"),
+			stat("client_archers_aimed"), stat("client_archers_ended"), stat("client_arrows"), stat("client_arrows_aimed"), stat("client_arrow_stopped"), stat("client_arrow_lost"), stat("client_arrow_never_seen"), stat("client_arrow_despawn_held"))
+		out("Enemy areas on you: gas ticks %d, impacts %d; ground fire entered %d, left %d; jets judged here %d (aimed at you %d, new targets %d; hits %d, blocked %d, their target off the gun %d, ended %d); burnings started here %d, their ticks shown and sent %d (ground fire %d, jet %d; blocked %d, outside the fire %d, lost %d), host copies dropped %d, own copies released %d; vortex pulls %d, catches shown %d: confirmed %d, refused %d, never confirmed %d, undone %d.", stat("client_gas_ticks"), stat("client_gas_impacts"), stat("client_fire_entered"), stat("client_fire_left"),
+			stat("client_jets_announced"), stat("client_jets_aimed"), stat("client_jets_retargeted"), stat("client_jet_hits"), stat("client_jet_blocked"), stat("client_jet_off_target"), stat("client_jets_ended"), stat("client_burns_started"), stat("client_burn_ticks"), stat("client_burn_ticks_fire"), stat("client_burn_ticks_jet"), stat("client_burn_ticks_blocked"), stat("client_burn_ticks_outside"), stat("client_burn_ticks_lost"),
+			stat("client_burn_echo_dropped"), stat("client_burns_released"), stat("client_vortex_pulled"), stat("client_vortex_caught"), stat("client_vortex_confirmed") + stat("client_vortex_applied"), stat("client_vortex_refused"), stat("client_vortex_timeout"), stat("client_vortex_undone"))
 		out("Host runs this build: %s. Enemy data: %s. Contact with the host lost %d times, VMF asked to ping again %d times.", pc.host_fresh() and "yes" or "no (nothing is shown early)", pc.compat.state(), stat("client_contact_lost"), stat("client_vmf_ping"))
 	end
+
+	out("Mod messages sent: %s. Received: %s.", stats_by("msg_sent_"), stats_by("msg_received_"))
 
 	local lengths, own_lengths = pc.timings.count("length")
 	local cues, own_cues = pc.timings.count("cue")

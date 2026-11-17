@@ -51,6 +51,7 @@ local kills = {} -- enemy unit -> client kill waiting to be finished off
 local stagger_watch = {} -- enemy unit -> the stagger animation the host is playing for it, until its end cue
 local playable = {} -- stagger action table -> set of every animation it can play
 local cue_watch = {} -- enemy unit -> the recoil animation the host is playing for it, until its cue
+local own_recoils = {} -- enemy unit -> the host's own recoil, for its start and end lines in the debug log (T16)
 local late_recoils = {} -- enemy unit -> a client's block booked with the recoil left to the host, until its recoil starts
 local left_to_client = {} -- enemy unit -> a stagger skipped here, until that client's stagger or kill for it arrives
 local answered = {} -- enemy unit -> when a client's stagger or kill for it arrived with no skipped stagger waiting for it
@@ -877,7 +878,7 @@ function host_reactions.push_finished(unit)
 
 	if timing.probe then
 		pc.probe_tools.reaction_timed(unit, "length", timing.breed_name, timing.anim, elapsed, nil, timing.probe)
-		pc.timings.learn("length", timing.breed_name, timing.anim, elapsed, nil, timing.probe)
+		pc.timings.learn("length", timing.breed_name, timing.anim, elapsed, nil, timing.probe, Managers.state.unit_storage:go_id(unit))
 
 		return
 	end
@@ -906,7 +907,7 @@ function host_reactions.push_finished(unit)
 		end
 	end
 
-	pc.timings.learn("length", timing.breed_name, timing.anim, elapsed * timing.scale, nil, timing.scale)
+	pc.timings.learn("length", timing.breed_name, timing.anim, elapsed * timing.scale, nil, timing.scale, Managers.state.unit_storage:go_id(unit))
 end
 
 function host_reactions.after_stagger_enter(unit, blackboard, t, record)
@@ -1134,6 +1135,23 @@ function host_reactions.after_recoil_enter(unit, blackboard, t, record)
 			probe = pc.probe_tools and pc.probe_tools.reaction_entered(unit, "cue", record.anim, record.breed_name) or nil,
 		}
 
+		-- T16: the host's own recoils start and end in the debug log, with the enemy's network id that its timing lines
+		-- carry too, so a reading far off its group can be traced to what that enemy was doing.
+		if pc.debug then
+			local go_id = Managers.state.unit_storage:go_id(unit)
+
+			own_recoils[unit] = {
+				t = t,
+				anim = record.anim,
+				breed_name = record.breed_name,
+				blocked_attack = record.blocked_attack,
+				go_id = go_id,
+				blackboard = blackboard,
+			}
+
+			pc.log("host own recoil start enemy=%s go=%s anim=%s after=%s", tostring(record.breed_name), tostring(go_id), tostring(record.anim), tostring(record.blocked_attack))
+		end
+
 		return
 	end
 
@@ -1292,7 +1310,7 @@ function host_reactions.recoil_cue(unit, kind)
 		pc.probe_tools.reaction_timed(unit, kind, watch.breed_name, watch.anim, elapsed, watch.blocked_attack, watch.probe)
 	end
 
-	pc.timings.learn(kind, watch.breed_name, watch.anim, elapsed, watch.blocked_attack, watch.probe or 1)
+	pc.timings.learn(kind, watch.breed_name, watch.anim, elapsed, watch.blocked_attack, watch.probe or 1, Managers.state.unit_storage:go_id(unit))
 end
 
 -- The host's anim_cb_stunned_finished, which ends a recoil. Returns true to hold it back from vanilla: for a client's
@@ -1599,7 +1617,21 @@ function host_reactions.update()
 	end
 end
 
+-- T16: why the host's own recoil ended and how long it ran, with leave's own reason (bt_node.lua:87).
+function host_reactions.own_recoil_ended(unit, blackboard, t, reason, destroy)
+	local record = own_recoils[unit]
+
+	own_recoils[unit] = nil
+
+	if not record or record.blackboard ~= blackboard then
+		return
+	end
+
+	pc.log("host own recoil end enemy=%s go=%s anim=%s after=%s lasted=%.3fs reason=%s destroy=%s", tostring(record.breed_name), tostring(record.go_id), tostring(record.anim), tostring(record.blocked_attack), t - record.t, tostring(reason), tostring(destroy == true))
+end
+
 function host_reactions.clear()
+	own_recoils = {}
 	skip_stagger_for = nil
 	skip_capture = nil
 	skip_is_blast = false
@@ -1855,5 +1887,9 @@ end)
 mod:hook_safe("BTBlockedAction", "leave", function (self, unit, blackboard, t, reason, destroy)
 	if recoil_ends[unit] ~= nil then
 		pc.guard("host recoil end", host_reactions.recoil_ended, unit, blackboard, t, reason, destroy)
+	end
+
+	if own_recoils[unit] ~= nil then
+		pc.guard("host own recoil end", host_reactions.own_recoil_ended, unit, blackboard, t, reason, destroy)
 	end
 end)

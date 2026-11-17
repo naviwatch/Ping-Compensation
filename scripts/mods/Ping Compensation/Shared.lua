@@ -1,7 +1,7 @@
 local mod = get_mod("Ping Compensation")
 
 -- Host and client must run the same VERSION. Bump it whenever any message in CLAUDE.md's "Network messages" changes.
-local VERSION = 13
+local VERSION = 14
 
 -- Playtest builds write the debug log by default, so testers don't have to remember /pingcomp debug on. Set this to
 -- false for a public release: players who want the log can still switch it on, and their choice is remembered.
@@ -40,6 +40,25 @@ local pc = {
 		BTCorruptorGrabAction = "grab",
 		BTCrazyJumpAction = "pounce",
 	},
+	-- Family G (build 5.1, D52): the nodes whose shots a client judges on its own player, and the kind of shot. A
+	-- client's results go several to a message (pc_shots), at most this often.
+	SHOOTER_NODES = {
+		BTRatlingGunnerShootAction = "bullet",
+		BTFireProjectileAction = "arrow",
+	},
+	SHOT_FLUSH = 0.1,
+	-- Seconds a client waits for the host to confirm a vortex's catch it shows at once (D53) before it undoes it.
+	CATCH_CONFIRM = 2,
+	-- T18: nodes that set an enemy's turn speed as they start and leave it set (AILocomotionExtension.set_rotation_speed),
+	-- with that speed. An attack later in the same sequence turns at it on the host (Client.lua).
+	TURN_SPEED_SETTERS = {
+		BTPackMasterSkulkAroundAction = 5, -- bt_pack_master_skulk_around_action.lua:32
+		BTPackMasterEscortRatOgreAction = 5, -- bt_pack_master_escort_rat_ogre_action.lua:27
+		BTSkulkAroundAction = 5, -- bt_skulk_around_action.lua:40
+		BTNinjaSkulkAction = 5, -- bt_ninja_skulk_action.lua:41
+		BTNinjaApproachAction = 5, -- bt_ninja_approach_action.lua:44
+	},
+	DEFAULT_TURN_SPEED = 10, -- DEFAULT_ROTATION_SPEED in ai_locomotion_extension.lua
 	TELEPORT_LIMIT = 2.5, -- metres the host will move its copy of an enemy to where a client saw it (D27)
 	MAX_STAGGER_SPEEDUP = 3, -- fastest the host plays a client's stagger; past this it ends the stagger early (D38)
 	-- Enemies whose reactions to a player's hits that player's client decides (D29, D31, D40). Every hit the client
@@ -156,6 +175,101 @@ function pc.stagger_speed(breed_name, asked)
 end
 
 mod.pc = pc
+
+-- Every mod message sent and received is counted per mission, by name (D56), to show the network load once every
+-- enemy type is covered (T10). Every other file registers and sends through these, since this one loads first.
+local network_send = mod.network_send
+local network_register = mod.network_register
+
+mod.network_send = function (self, name, ...)
+	pc.count("msg_sent_" .. tostring(name))
+
+	return network_send(self, name, ...)
+end
+
+mod.network_register = function (self, name, callback)
+	return network_register(self, name, function (...)
+		pc.count("msg_received_" .. tostring(name))
+
+		return callback(...)
+	end)
+end
+
+-- A breed's behaviour tree (BreedBehaviors[breed.behavior]): each node is a table whose first entry is the node's class
+-- and whose action_data is its action table.
+function pc.tree_of(breed)
+	local behaviors = rawget(_G, "BreedBehaviors")
+
+	return behaviors and breed and breed.behavior and behaviors[breed.behavior] or nil
+end
+
+-- The first node in the tree that matches(node), and the node it sits in.
+function pc.find_node(node, matches, parent, depth)
+	depth = depth or 0
+
+	if type(node) ~= "table" or depth > 30 then
+		return nil
+	end
+
+	if type(node[1]) == "string" and matches(node) then
+		return node, parent
+	end
+
+	for i = 2, #node do
+		local found, found_parent = pc.find_node(node[i], matches, node, depth + 1)
+
+		if found then
+			return found, found_parent
+		end
+	end
+
+	return nil
+end
+
+local turn_speeds = {} -- action table -> the speed the host turns an enemy at while it runs that action (T18)
+
+-- T18: the speed the host turns an enemy at during this attack. The host's locomotion keeps whatever speed a node set
+-- last (locomotion_templates_ai.lua:156). In a sequence, every run passes through each earlier node, so an attack
+-- there turns at the speed the last speed-setting node before it sets: the packmaster's hook after its skulking
+-- (skaven_packmaster_behavior.lua:60), the warpfire thrower's shooting likewise. Anything else turns at the default:
+-- staggers, recoils and the other nodes that change the speed put it back when they end. From the client's own copy of
+-- the tree, as Lance asked ("The client should use it's own data for this, not rely on the host").
+function pc.turn_speed(breed, action)
+	if type(action) ~= "table" then
+		return pc.DEFAULT_TURN_SPEED
+	end
+
+	local cached = turn_speeds[action]
+
+	if cached then
+		return cached
+	end
+
+	local speed = pc.DEFAULT_TURN_SPEED
+	local node, parent = pc.find_node(pc.tree_of(breed), function (candidate)
+		return candidate.action_data == action
+	end)
+
+	if node and parent and parent[1] == "BTSequence" then
+		for i = 2, #parent do
+			local sibling = parent[i]
+
+			if sibling == node then
+				break
+			end
+
+			local set = type(sibling) == "table" and pc.TURN_SPEED_SETTERS[sibling[1]]
+
+			if set then
+				speed = set
+			end
+		end
+	end
+
+	turn_speeds[action] = speed
+
+	return speed
+end
 
 local saved_debug = mod:get("debug")
 
