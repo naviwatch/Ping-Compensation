@@ -1,7 +1,7 @@
 local mod = get_mod("Ping Compensation")
 
 -- Host and client must run the same VERSION. Bump it whenever any message in CLAUDE.md's "Network messages" changes.
-local VERSION = 12
+local VERSION = 13
 
 -- Playtest builds write the debug log by default, so testers don't have to remember /pingcomp debug on. Set this to
 -- false for a public release: players who want the log can still switch it on, and their choice is remembered.
@@ -29,6 +29,17 @@ local pc = {
 	stagger_timing = "speed", -- /pingcomp stagger speed|end|off, on the host: how a client's stagger is shortened (D32)
 	combowait = true, -- /pingcomp combowait, on the host: a frenzy combo waits for the client's answer before its next move (D15)
 	COMBO_WAIT = 0.5, -- seconds a combo waits for that answer before the host goes with its own guess (D15)
+	-- Family F (D52): seconds a disabler's hook, grab or leap is held open on the host past its own copy's moment, for the
+	-- targeted client's answer, before the host lets it end.
+	GRAB_WAIT = 0.5,
+	-- Seconds a client waits for the host to confirm a grab or pin it shows at once (D53) before it undoes it.
+	GRAB_CONFIRM = 2,
+	-- Family F: the disabler's node and the kind of attack it is, which pc_swing_begin names in step_name.
+	DISABLER_KINDS = {
+		BTPackMasterAttackAction = "hook",
+		BTCorruptorGrabAction = "grab",
+		BTCrazyJumpAction = "pounce",
+	},
 	TELEPORT_LIMIT = 2.5, -- metres the host will move its copy of an enemy to where a client saw it (D27)
 	MAX_STAGGER_SPEEDUP = 3, -- fastest the host plays a client's stagger; past this it ends the stagger early (D38)
 	-- Enemies whose reactions to a player's hits that player's client decides (D29, D31, D40). Every hit the client
@@ -56,6 +67,15 @@ local pc = {
 		beastmen_bestigor = true,
 		beastmen_standard_bearer = true,
 		beastmen_standard_bearer_crater = true,
+		-- Build 5 (D52): every special, and the ungor archer with them.
+		skaven_pack_master = true,
+		skaven_gutter_runner = true,
+		skaven_ratling_gunner = true,
+		skaven_warpfire_thrower = true,
+		skaven_poison_wind_globadier = true,
+		chaos_vortex_sorcerer = true,
+		chaos_corruptor_sorcerer = true,
+		beastmen_ungor_archer = true,
 	},
 	-- Covered breeds whose stagger animations play faster when the stagger_scale variable is raised (the calibration
 	-- probe, 2026-11-14: 2x asked, 2x reached). The host plays a client's stagger of these faster (D32, D38). The other
@@ -73,8 +93,16 @@ local pc = {
 	-- Build 3.1 diagnostic: the clients decided "too weak to stagger" for hundreds of hits on these. For a client's
 	-- hits on them, the host still works out its own stagger, without applying it, and logs where it disagrees; both
 	-- sides log what their stagger maths used for every hit on them (pc.stagger_inputs, D45). Build 4 checks the elites
-	-- the same way, to show where the client's stand-in falls short for them.
+	-- the same way, to show where the client's stand-in falls short for them, and build 5 the specials.
 	CHECK_BREEDS = {
+		skaven_pack_master = true,
+		skaven_gutter_runner = true,
+		skaven_ratling_gunner = true,
+		skaven_warpfire_thrower = true,
+		skaven_poison_wind_globadier = true,
+		chaos_vortex_sorcerer = true,
+		chaos_corruptor_sorcerer = true,
+		beastmen_ungor_archer = true,
 		skaven_plague_monk = true,
 		chaos_berzerker = true,
 		skaven_storm_vermin = true,

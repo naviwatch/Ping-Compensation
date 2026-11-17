@@ -7,12 +7,14 @@ local pc = mod.pc
 --   3. books whatever the player's client answers: damage for a hit, the block for a block, nothing for a miss.
 -- Families: A, single swings (BTAttackAction); B, frenzy combo steps (BTComboAttackAction); C, elites' sweeps and
 -- overheads (BTStormVerminAttackAction), which reach every modded player near their box; D, elites' shoves
--- (BTStormVerminPushAction).
+-- (BTStormVerminPushAction); F, disablers (D52): the packmaster's hook (BTPackMasterAttackAction), the leech's grab
+-- (BTCorruptorGrabAction) and the gutter runner's pounce (BTCrazyJumpAction), which reaches every modded player.
 -- Bots, the host's own hero and players without the mod never get a record here, so they stay vanilla.
 
 local host = {
 	suppress = nil, -- the swing whose vanilla hit test is being skipped right now
 	box_skip = nil, -- family C: the player units the next box overlap leaves out, during an elite's damage frame
+	leap_skip = nil, -- family F: the player units the next leap overlap leaves out, during a gutter runner's leap
 }
 
 pc.host = host
@@ -33,6 +35,7 @@ local mismatched = {} -- peer id -> true once we've said their build differs
 local swings = {} -- swing id -> record
 local by_attacker = {} -- enemy unit -> its newest record of families A, B and D
 local boxes = {} -- enemy unit -> its newest family C attack: { action, blackboard, swings = { one per modded player } }
+local leaps = {} -- gutter runner unit -> its newest leap (family F): { blackboard, jump_data, swings = { one per modded player } }
 local action_sets = {} -- action table -> name of the BreedActions set it lives in, or false
 local next_id = 0
 
@@ -268,6 +271,164 @@ local function announce_box(unit, blackboard)
 	end
 end
 
+-- Family F: who the disabler is after, as each node records it in enter.
+local function disabler_target(blackboard, kind)
+	if kind == "hook" then
+		return blackboard.drag_target_unit
+	elseif kind == "grab" then
+		return blackboard.corruptor_target
+	end
+
+	return blackboard.jump_data and blackboard.jump_data.target_unit
+end
+
+-- Family F (D52): a disabler's hook, grab or pounce, announced after the node's enter. The hook and the grab go to
+-- their target, whose own screen judges them. A pounce goes to every modded player, because the sphere round the
+-- gutter runner's neck catches whichever player it flies into (bt_crazy_jump_action.lua:415), aimed only for its
+-- target, whose screen also judges the snap of its last 2.7 m.
+local function announce_disabler(unit, blackboard, kind)
+	local action = blackboard.action
+	local breed = blackboard.breed
+	local target = disabler_target(blackboard, kind)
+
+	if kind == "pounce" then
+		leaps[unit] = nil
+	end
+
+	if not action or not breed or breed.boss or not target then
+		return
+	end
+
+	local attacker_go_id = pc.network():unit_game_object_id(unit)
+	local set_name = action_set_name(action, breed)
+
+	if not attacker_go_id or not set_name then
+		return
+	end
+
+	local t = pc.now()
+	local attack_anim = type(action.attack_anim) == "string" and action.attack_anim or kind
+
+	if kind ~= "pounce" then
+		local owner = Managers.player:unit_owner(target)
+		local peer = owner and owner.remote and not owner.bot_player and owner.peer_id
+
+		if not peer or not peer_is_fresh(peer) then
+			return
+		end
+
+		local swing = new_swing(unit, blackboard, "F", action, breed, target, peer, attacker_go_id, set_name, attack_anim, t, nil, kind)
+
+		swing.kind = kind
+		by_attacker[unit] = swing
+
+		send_begin(swing, blackboard, true)
+
+		return
+	end
+
+	local group = {
+		blackboard = blackboard,
+		jump_data = blackboard.jump_data,
+		swings = {},
+		by_target = {},
+	}
+
+	for _, player in pairs(Managers.player:human_players()) do
+		local peer = player.remote and not player.bot_player and player.peer_id
+		local player_unit = player.player_unit
+
+		if peer and peer_is_fresh(peer) and player_unit and Unit.alive(player_unit) then
+			local swing = new_swing(unit, blackboard, "F", action, breed, player_unit, peer, attacker_go_id, set_name, attack_anim, t, nil, kind)
+
+			swing.kind = kind
+			swing.group = group
+			swing.aimed = player_unit == target
+			group.swings[#group.swings + 1] = swing
+			group.by_target[player_unit] = swing
+
+			send_begin(swing, blackboard, swing.aimed)
+		end
+	end
+
+	if #group.swings == 0 then
+		return
+	end
+
+	leaps[unit] = group
+
+	-- In its last 2.7 m the host's leap would also catch its target in a wider zone than the sphere, the snap
+	-- (bt_crazy_jump_action.lua:177), from where the host sees them. A modded target's own screen judges that, so the
+	-- host's copy never snaps at them.
+	if group.by_target[target] then
+		group.jump_data.snap_failed = true
+	end
+end
+
+-- Family F: what the packmaster's damage frame and BTPackMasterAttackAction.attack_success
+-- (bt_pack_master_attack_action.lua:110) would have decided, for the debug log. Nothing here has side effects.
+local function hook_would(swing, blackboard, unit)
+	if blackboard.attack_aborted then
+		return "aborted"
+	end
+
+	local target = swing.target
+	local action = swing.action
+
+	if not Unit.alive(target) or not DamageUtils.check_distance(action, blackboard, unit, target) or not DamageUtils.check_infront(unit, target) then
+		return "miss"
+	end
+
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	if status and (status:get_is_dodging() or status:is_invisible()) then
+		local position = POSITION_LOOKUP[unit]
+		local dodge_position = POSITION_LOOKUP[target]
+		local direction = Vector3.normalize(Vector3.flat(dodge_position - position))
+		local forward = Quaternion.forward(Unit.local_rotation(unit, 0))
+		local angle = math.deg(math.acos(math.clamp(Vector3.dot(direction, forward), -1, 1)))
+
+		if angle > action.dodge_angle or Vector3.distance_squared(position, dodge_position) >= action.dodge_distance * action.dodge_distance then
+			return "miss"
+		end
+	end
+
+	return PerceptionUtils.pack_master_has_line_of_sight_for_attack(blackboard.physics_world, unit, target) and "hit" or "miss"
+end
+
+-- Family F: what BTCorruptorGrabAction.grab_player (bt_corruptor_grab_action.lua:221) would have decided once the
+-- host's own projectile arrived, without its grab_delay, for the debug log. Nothing here has side effects.
+local function grab_would(swing, blackboard, unit)
+	local target = swing.target
+	local action = swing.action
+	local self_position = POSITION_LOOKUP[unit]
+	local target_position = POSITION_LOOKUP[target]
+
+	if not self_position or not target_position or not blackboard.projectile_target_position then
+		return "miss"
+	end
+
+	local target_distance_squared = Vector3.distance_squared(blackboard.projectile_target_position:unbox(), target_position)
+	local status = blackboard.target_unit_status_extension
+	local physics_world = World.physics_world(blackboard.world)
+
+	if not action.ignore_dodge and blackboard.target_dodged or status and status:is_invisible() then
+		local direction = Vector3.normalize(Vector3.flat(target_position - self_position))
+		local forward = Quaternion.forward(Unit.local_rotation(unit, 0))
+		local angle = math.deg(math.acos(math.clamp(Vector3.dot(direction, forward), -1, 1)))
+
+		if Vector3.distance_squared(self_position, target_position) < action.min_dodge_angle_squared and angle <= action.dodge_angle or target_distance_squared < action.dodge_distance * action.dodge_distance then
+			return PerceptionUtils.is_position_in_line_of_sight(unit, self_position, target_position, physics_world) and "hit" or "miss"
+		end
+
+		return "miss"
+	elseif not not action.ignore_dodge and Vector3.distance_squared(self_position, target_position) > action.max_distance_squared or target_distance_squared > 25 then
+		return "miss"
+	end
+
+	return PerceptionUtils.is_position_in_line_of_sight(unit, self_position + Vector3.up(), target_position + Vector3.up(), physics_world) and "hit" or "miss"
+end
+
 -- What vanilla would have decided at this frame. Nothing here has side effects.
 local function would_have_judged(swing, blackboard, unit)
 	if blackboard.attack_aborted then
@@ -445,6 +606,12 @@ function host.before_damage_frame(unit, callback_name)
 		if callback_name ~= "anim_cb_stormvermin_push" or blackboard.active_node ~= BTStormVerminPushAction or blackboard.action ~= swing.action or blackboard.attacking_target ~= swing.target then
 			return nil
 		end
+	elseif swing.family == "F" then
+		-- Only the hook has a damage frame, the generic one (animation_callback_templates.lua:132, whose target is the
+		-- drag target here). A leech's damage frame only sends its projectile off, which goes on as in vanilla.
+		if swing.kind ~= "hook" or callback_name ~= "anim_cb_damage" or blackboard.active_node ~= BTPackMasterAttackAction or blackboard.action ~= swing.action or blackboard.drag_target_unit ~= swing.target then
+			return nil
+		end
 	elseif callback_name ~= "anim_cb_damage" or blackboard.active_node ~= BTAttackAction or blackboard.action ~= swing.action or blackboard.attacking_target ~= swing.target then
 		return nil
 	end
@@ -465,7 +632,7 @@ function host.before_damage_frame(unit, callback_name)
 	swing.frame_t[frame] = t
 	swing.expires = math.max(swing.expires, t + pc.SWING_LIFETIME)
 
-	local ok, verdict = pcall(would_have_judged, swing, blackboard, unit)
+	local ok, verdict = pcall(swing.family == "F" and hook_would or would_have_judged, swing, blackboard, unit)
 
 	swing.would[frame] = ok and verdict or "unknown"
 
@@ -513,6 +680,172 @@ function host.combo_hold(unit, blackboard, t)
 	end
 
 	apply_guess(swing, blackboard, swing.would[1])
+
+	return false
+end
+
+-- Family F: the disabler's hook or grab whose answer is still due, or nil.
+local function waiting_disabler(unit, blackboard, kind)
+	local swing = by_attacker[unit]
+
+	if not swing or swing.family ~= "F" or swing.kind ~= kind or swing.host_judged or swing.answered or blackboard ~= swing.blackboard then
+		return nil
+	end
+
+	return swing
+end
+
+-- Family F, called before BTPackMasterAttackAction.run: once the host's own copy of the hook has reached its damage
+-- frame, the attack doesn't time out (bt_pack_master_attack_action.lua:105) until the target's answer arrives, for at
+-- most pc.GRAB_WAIT. The answer comes a round trip after that frame, and a hit makes run go on to the pull.
+function host.hook_hold(unit, blackboard, t)
+	local swing = waiting_disabler(unit, blackboard, "hook")
+
+	if not swing or swing.frames == 0 or t - swing.frame_t[1] >= pc.GRAB_WAIT then
+		return
+	end
+
+	if blackboard.attack_time_ends and t + 0.05 > blackboard.attack_time_ends then
+		blackboard.attack_time_ends = t + 0.05
+
+		if not swing.grab_wait_t then
+			swing.grab_wait_t = t
+
+			pc.count("host_grab_waited")
+		end
+	end
+end
+
+-- Family F, called before BTCorruptorGrabAction.overlap_players: vanilla grabs once the host's own copy of the leech's
+-- projectile is within 2 m of where it aimed (bt_corruptor_grab_action.lua:202). A modded target's screen judges that
+-- with its own copy instead, so here the host only notes when its copy arrived, for the hold and the log. Returns true
+-- to skip vanilla's test.
+function host.grab_overlap(unit, blackboard, t)
+	local swing = by_attacker[unit]
+
+	if not swing or swing.family ~= "F" or swing.kind ~= "grab" or swing.host_judged or blackboard ~= swing.blackboard or blackboard.corruptor_target ~= swing.target then
+		return false
+	end
+
+	if not peer_is_fresh(swing.peer) then
+		-- That client has gone quiet, so the grab is the host's again.
+		swing.host_judged = true
+
+		pc.count("host_judged_quiet_client")
+
+		return false
+	end
+
+	if swing.frames == 0 and blackboard.projectile_target_position and blackboard.projectile_position then
+		local to_target = blackboard.projectile_target_position:unbox() - blackboard.projectile_position:unbox()
+
+		if Vector3.length(Vector3.flat(to_target)) < 2 then
+			local ok, verdict = pcall(grab_would, swing, blackboard, unit)
+
+			swing.frames = 1
+			swing.frame_t[1] = t
+			swing.would[1] = ok and verdict or "unknown"
+			swing.expires = math.max(swing.expires, t + pc.SWING_LIFETIME)
+		end
+	end
+
+	return true
+end
+
+-- Family F, called before BTCorruptorGrabAction.run: once the host's own projectile has arrived, the attack doesn't
+-- end with its animation (bt_corruptor_grab_action.lua:139) until the target's answer arrives, for at most
+-- pc.GRAB_WAIT. Returns true while vanilla mustn't see that the animation has ended.
+function host.grab_hold(unit, blackboard, t)
+	local swing = waiting_disabler(unit, blackboard, "grab")
+
+	if not swing or swing.frames == 0 or t - swing.frame_t[1] >= pc.GRAB_WAIT then
+		return false
+	end
+
+	if not swing.grab_wait_t then
+		swing.grab_wait_t = t
+
+		pc.count("host_grab_waited")
+	end
+
+	return true
+end
+
+-- Family F, called around BTCrazyJumpAction.check_colliding_players: the modded players this leap was sent to, which
+-- its sphere leaves out because their own screens judge it, or nil.
+function host.leap_skip_for(unit)
+	local group = leaps[unit]
+
+	if not group then
+		return nil
+	end
+
+	local skip = nil
+
+	for i = 1, #group.swings do
+		local swing = group.swings[i]
+
+		if not swing.host_judged then
+			if peer_is_fresh(swing.peer) then
+				skip = skip or {}
+				skip[swing.target] = true
+			else
+				-- That client has gone quiet, so the host's sphere reaches them as in vanilla.
+				swing.host_judged = true
+
+				pc.count("host_judged_quiet_client")
+			end
+		end
+	end
+
+	return skip
+end
+
+local function leap_answer_due(group)
+	for i = 1, #group.swings do
+		local swing = group.swings[i]
+
+		if not swing.answered and not swing.host_judged then
+			return true
+		end
+	end
+
+	return false
+end
+
+-- Family F, called before BTCrazyJumpAction.run. Returns true when a modded player's screen said the leap pinned them:
+-- run then ends the leap as vanilla does when its own test finds a player, and BTTargetPouncedAction teleports the
+-- gutter runner onto them and pins them (bt_target_pounced_action.lua:15). Otherwise, once the leap has landed, it
+-- doesn't end (bt_crazy_jump_action.lua:322) while an answer is still due, for at most pc.GRAB_WAIT.
+function host.leap_before(unit, blackboard, t)
+	local group = leaps[unit]
+	local data = blackboard.jump_data
+
+	if not group or blackboard ~= group.blackboard or not data or data ~= group.jump_data or group.left then
+		return false
+	end
+
+	if group.pounce then
+		data.target_unit = group.pounce
+		blackboard.target_unit = group.pounce
+		group.pounce = nil
+
+		return true
+	end
+
+	if data.state == "landing" and data.land_time then
+		group.land_t = group.land_t or t
+
+		if t - group.land_t < pc.GRAB_WAIT and t + 0.05 > data.land_time and leap_answer_due(group) then
+			data.land_time = t + 0.05
+
+			if not group.waited then
+				group.waited = true
+
+				pc.count("host_grab_waited")
+			end
+		end
+	end
 
 	return false
 end
@@ -783,6 +1116,59 @@ local function book_shove(swing)
 	return "booked"
 end
 
+-- Family F: a hook, grab or pounce that landed on its target's screen (D52), where it already shows (D53). The
+-- disabler goes on as vanilla does when its own test finds the player: the pull, the grab or the pin. Only while it
+-- still can here: alive, not staggered and still in that attack. Either way the client hears of it, and undoes what it
+-- showed if the host refused.
+local function book_disabler(swing)
+	local attacker = swing.attacker
+	local target = swing.target
+	local blackboard = BLACKBOARDS[attacker]
+	local refused = nil
+
+	if not Unit.alive(target) then
+		refused = "target gone"
+	elseif not same_attacker(swing) or not HEALTH_ALIVE[attacker] then
+		refused = "the special is dead"
+	elseif not blackboard or blackboard ~= swing.blackboard then
+		refused = "the special is gone"
+	elseif blackboard.stagger then
+		refused = "the special is staggered"
+	elseif swing.kind == "hook" then
+		if blackboard.active_node ~= BTPackMasterAttackAction or blackboard.action ~= swing.action or blackboard.drag_target_unit ~= target or blackboard.attack_aborted then
+			refused = "the hook was over"
+		else
+			-- What the damage frame and attack_success do for a hook that lands (animation_callback_templates.lua:216,
+			-- bt_pack_master_attack_action.lua:110): the damage (none, for the packmaster), then run goes on to the pull.
+			AiUtils.damage_target(target, attacker, swing.action, swing.action.damage)
+
+			blackboard.attack_success = true
+		end
+	elseif swing.kind == "grab" then
+		if blackboard.active_node ~= BTCorruptorGrabAction or blackboard.action ~= swing.action or blackboard.corruptor_target ~= target or blackboard.grabbed_unit or blackboard.attack_aborted then
+			refused = "the grab was over"
+		else
+			-- What grab_player does for a grab that lands (bt_corruptor_grab_action.lua:274); run grabs the player next.
+			blackboard.grabbed_unit = target
+			blackboard.attack_success = true
+		end
+	else
+		local group = swing.group
+
+		if not group or leaps[attacker] ~= group or group.left or group.pounced or blackboard.jump_data ~= group.jump_data then
+			refused = "the leap was over"
+		else
+			group.pounce = target
+			group.pounced = true
+		end
+	end
+
+	mod:network_send("pc_reaction_ack", swing.peer, pc.VERSION, "grab", swing.id, refused and "rejected" or "applied")
+	pc.count(refused and "host_grab_refused" or "host_grab_booked")
+
+	return refused and "refused: " .. refused or "booked"
+end
+
 local function valid_answer(id, frame, result, multiplier, improved, direction, through_block, distance, angle, recoil_anim, has_position, x, y, z, yaw)
 	return type(id) == "number" and type(frame) == "number" and frame >= 1 and frame <= MAX_FRAMES and frame == math.floor(frame)
 		and RESULTS[result] == true and type(multiplier) == "number" and multiplier == multiplier and multiplier >= 0 and multiplier <= 100
@@ -880,10 +1266,13 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 			outcome = book_box(swing, false, through_block)
 		elseif swing.family == "D" then
 			outcome = book_shove(swing)
+		elseif swing.family == "F" then
+			outcome = book_disabler(swing)
 		else
 			outcome = book_hit(swing, through_block)
 		end
-	elseif result == "blocked" then
+	elseif result == "blocked" and swing.family ~= "F" then
+		-- A disabler's hook, grab or pounce can't be blocked, so a client never says so.
 		local recoil = recoil_anim ~= "" and {
 			anim = recoil_anim,
 			position = has_position and Vector3(x, y, z) or nil,
@@ -932,7 +1321,7 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 
 		pc.log("host swing=%d enemy=%s attack=%s%s frame=%d answer=%s host_would=%s outcome=%s answer_after=%s ping=%s client_distance=%.2f client_angle=%.1f%s", swing.id, swing.breed_name, tostring(swing.action.name), swing.step_name and "/" .. swing.step_name or "", frame, result, would, outcome,
 			frame_t and string.format("%.3fs", t - frame_t) or "n/a", type(ping) == "number" and string.format("%.0fms", ping * 1000) or "n/a", distance, angle,
-			swing.wait_t and string.format(" combo_wait=%s", swing.guessed and "ran out" or string.format("%.3fs", t - swing.wait_t)) or "")
+			swing.wait_t and string.format(" combo_wait=%s", swing.guessed and "ran out" or string.format("%.3fs", t - swing.wait_t)) or swing.grab_wait_t and string.format(" grab_wait=%.3fs", t - swing.grab_wait_t) or "")
 
 	end
 
@@ -979,6 +1368,108 @@ mod:hook_safe("BTStormVerminPushAction", "enter", function (self, unit, blackboa
 	announce(unit, blackboard, "D")
 end)
 
+-- Family F (D52): a disabler's hook, grab or pounce starts here.
+for node_name, kind in pairs(pc.DISABLER_KINDS) do
+	mod:hook_safe(node_name, "enter", function (self, unit, blackboard, t)
+		if pc.broken or not pc.is_server() or not pc.in_game() then
+			return
+		end
+
+		announce_disabler(unit, blackboard, kind)
+	end)
+end
+
+-- Family F: the hook's answer is waited for (host.hook_hold). Runs everything but the original through pc.guard.
+mod:hook("BTPackMasterAttackAction", "run", function (func, self, unit, blackboard, t, dt)
+	if not pc.broken then
+		pc.guard("host hook wait", host.hook_hold, unit, blackboard, t)
+	end
+
+	return func(self, unit, blackboard, t, dt)
+end)
+
+-- Family F: a modded target's screen judges the leech's grab, so vanilla's test is skipped (host.grab_overlap).
+mod:hook("BTCorruptorGrabAction", "overlap_players", function (func, self, unit, t, dt, blackboard)
+	if not pc.broken then
+		local ok, skip = pc.guard("host grab test", host.grab_overlap, unit, blackboard, t)
+
+		if ok and skip then
+			return
+		end
+	end
+
+	return func(self, unit, t, dt, blackboard)
+end)
+
+-- Family F: the grab's answer is waited for (host.grab_hold): vanilla's run mustn't see that the attack's animation
+-- has ended until then.
+mod:hook("BTCorruptorGrabAction", "run", function (func, self, unit, blackboard, t, dt)
+	if pc.broken or not blackboard.attack_finished then
+		return func(self, unit, blackboard, t, dt)
+	end
+
+	local ok, hold = pc.guard("host grab wait", host.grab_hold, unit, blackboard, t)
+
+	if not ok or not hold then
+		return func(self, unit, blackboard, t, dt)
+	end
+
+	blackboard.attack_finished = false
+
+	local result = func(self, unit, blackboard, t, dt)
+
+	blackboard.attack_finished = true
+
+	return result
+end)
+
+-- Family F: the leap's sphere leaves out the modded players its swings went to (host.leap_skip, used up by the overlap
+-- hook below).
+mod:hook("BTCrazyJumpAction", "check_colliding_players", function (func, self, unit, blackboard, pos)
+	if pc.broken then
+		return func(self, unit, blackboard, pos)
+	end
+
+	local ok, skip = pc.guard("host leap filter", host.leap_skip_for, unit)
+
+	if not ok or not skip then
+		return func(self, unit, blackboard, pos)
+	end
+
+	host.leap_skip = skip
+
+	local hit_unit = func(self, unit, blackboard, pos)
+
+	host.leap_skip = nil
+
+	return hit_unit
+end)
+
+-- Family F: a pounce a modded player's screen saw ends the leap with them as its target, as vanilla's run does when its
+-- own test finds a player (bt_crazy_jump_action.lua:203), and a leap whose answers are due is held (host.leap_before).
+mod:hook("BTCrazyJumpAction", "run", function (func, self, unit, blackboard, t, dt)
+	if pc.broken or not leaps[unit] then
+		return func(self, unit, blackboard, t, dt)
+	end
+
+	local ok, pounce = pc.guard("host leap wait", host.leap_before, unit, blackboard, t)
+
+	if ok and pounce then
+		return "done"
+	end
+
+	return func(self, unit, blackboard, t, dt)
+end)
+
+-- Family F: the leap is over, whichever way, so a later answer can't pin anyone.
+mod:hook_safe("BTCrazyJumpAction", "leave", function (self, unit, blackboard, t, reason, destroy)
+	local group = leaps[unit]
+
+	if group and group.blackboard == blackboard then
+		group.left = true
+	end
+end)
+
 local function without_skipped(actors, skip)
 	local kept = {}
 
@@ -995,16 +1486,22 @@ end
 
 -- Family C: while host.box_skip is set, an elite's box test is running (bt_storm_vermin_attack_action.lua:393), and
 -- its overlap leaves out the players whose own screens judge the swing. Only that one overlap, the one that looks for
--- player hit boxes (its 13th argument): host.box_skip is cleared as it is used. A mod:hook on an engine function the
--- whole game calls, so every other call goes straight through, and its own work runs through pc.guard.
+-- player hit boxes (its 13th argument): host.box_skip is cleared as it is used. Family F: the same with host.leap_skip
+-- for a gutter runner's leap test (bt_crazy_jump_action.lua:418), whose sphere looks for players' triggers (its 11th
+-- argument). A mod:hook on an engine function the whole game calls, so every other call goes straight through, and
+-- its own work runs through pc.guard.
 mod:hook(PhysicsWorld, "immediate_overlap", function (func, ...)
-	local skip = host.box_skip
+	local skip = nil
 
-	if not skip or select(13, ...) ~= "filter_player_hit_box_check" then
+	if host.box_skip and select(13, ...) == "filter_player_hit_box_check" then
+		skip = host.box_skip
+		host.box_skip = nil
+	elseif host.leap_skip and select(11, ...) == "filter_player_and_husk_trigger" then
+		skip = host.leap_skip
+		host.leap_skip = nil
+	else
 		return func(...)
 	end
-
-	host.box_skip = nil
 
 	local actors, count = func(...)
 
@@ -1058,6 +1555,7 @@ end)
 function host.update()
 	host.suppress = nil
 	host.box_skip = nil
+	host.leap_skip = nil
 
 	if not pc.is_server() or not pc.in_game() then
 		return
@@ -1092,6 +1590,12 @@ function host.update()
 			if group and swing.group == group and group.swings[1] == swing then
 				boxes[swing.attacker] = nil
 			end
+
+			local leap = leaps[swing.attacker]
+
+			if leap and swing.group == leap and leap.swings[1] == swing then
+				leaps[swing.attacker] = nil
+			end
 		end
 	end
 end
@@ -1102,8 +1606,10 @@ function host.clear()
 	swings = {}
 	by_attacker = {}
 	boxes = {}
+	leaps = {}
 	host.suppress = nil
 	host.box_skip = nil
+	host.leap_skip = nil
 
 	pc.host_reactions.clear()
 	pc.blasts.clear()

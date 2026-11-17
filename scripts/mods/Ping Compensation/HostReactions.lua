@@ -36,6 +36,7 @@ local STAGGER_ANIM_TABLES = {
 	"shield_block_anims",
 	"shield_stagger_anims",
 	"shield_break_anims",
+	"grabbing_stagger_anims", -- the leech's, when a stagger breaks its grab (breed_chaos_corruptor_sorcerer.lua:302)
 }
 
 local skip_stagger_for = nil -- the enemy whose vanilla stagger is skipped while the current hit is booked
@@ -621,17 +622,30 @@ local function apply_stagger(sender, id, go_id, stagger_type, duration, length, 
 		ack(previous.peer, "stagger", previous.id, "rejected")
 	end
 
-	staggers[unit] = {
-		id = id,
-		peer = sender,
-		unit = unit,
-		anim = anim,
-		yaw = yaw,
-		position = has_position and Vector3Box(x, y, z) or nil,
-		stagger = blackboard.stagger,
-		t = t,
-		breed_name = breed.name,
-	}
+	local suicide_run = blackboard.suicide_run
+
+	if type(suicide_run) == "table" and suicide_run.explosion_started then
+		-- A globadier staggered once its detonation has begun: the behaviour tree's first branch takes it instead of the
+		-- stagger and kills it, with no killer, as in vanilla (BTGlobadierSuicideStaggerAction, bt_conditions.lua:579),
+		-- so no BTStaggerAction.enter follows. The client showed that death at once (Reactions.lua).
+		staggers[unit] = nil
+
+		ack(sender, "stagger", id, "applied")
+		pc.count("host_stagger_detonation")
+		pc.log("host stagger=%d from=%s enemy=%s: its detonation had begun, so the behaviour tree kills it", id, name_of(sender), breed.name)
+	else
+		staggers[unit] = {
+			id = id,
+			peer = sender,
+			unit = unit,
+			anim = anim,
+			yaw = yaw,
+			position = has_position and Vector3Box(x, y, z) or nil,
+			stagger = blackboard.stagger,
+			t = t,
+			breed_name = breed.name,
+		}
+	end
 
 	pc.count("host_stagger_received")
 	stagger_procs(unit, blackboard, attacker, profile_name, target_index, stagger_type, duration, stagger_value, is_push, damage_source)

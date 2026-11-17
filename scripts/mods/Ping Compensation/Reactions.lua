@@ -152,6 +152,7 @@ local function stagger_type_of(breed, anim)
 			add_stagger_anims(lookup, action.shield_block_anims)
 			add_stagger_anims(lookup, action.shield_stagger_anims)
 			add_stagger_anims(lookup, action.shield_break_anims)
+			add_stagger_anims(lookup, action.grabbing_stagger_anims)
 		end
 
 		stagger_lookup[breed.name] = lookup
@@ -397,6 +398,72 @@ local function attack_staggered(fake)
 	end
 
 	fake.attack_action = nil
+	fake.shooting = nil
+end
+
+-- A special's hold on a player (D52): the node the host runs while the player's status says so. The packmaster's pull,
+-- drag and hoist and the gutter runner's pin ignore some staggers (their ignore_staggers), which the host reads from
+-- blackboard.action and this client can't tell from an animation.
+local PACK_MASTER_NODES = {
+	pack_master_pulling = "BTPackMasterInitialPullAction",
+	pack_master_dragging = "BTPackMasterDragAction",
+	pack_master_hoisting = "BTPackMasterHoistAction",
+	pack_master_hanging = "BTPackMasterHoistAction",
+}
+
+-- The player this special holds on this screen, if any, and how: "pack_master", "pounce" or "corruptor".
+local function held_player(unit)
+	for _, player in pairs(Managers.player:players()) do
+		local player_unit = player.player_unit
+		local status = player_unit and Unit.alive(player_unit) and ScriptUnit.has_extension(player_unit, "status_system")
+
+		if status then
+			if status.pack_master_grabber == unit then
+				return status, "pack_master"
+			elseif status.pounced_down and status.pouncer_unit == unit then
+				return status, "pounce"
+			elseif status.grabbed_by_corruptor and status.corruptor_unit == unit then
+				return status, "corruptor"
+			end
+		end
+	end
+
+	return nil
+end
+
+-- What a special is doing that its attack's ignore_staggers depends on, from what this client sees, written onto the
+-- stand-in before the stagger maths runs: the player it holds (their status), whether it is shooting (from its first
+-- turn or aim, track_host_animation, and the ratling gunner's rpc_ai_weapon_shoot_start, reactions.shooting), and the
+-- globadier's suicide run (track_host_animation). A stagger that breaks the leech's grab picks its grabbing staggers
+-- (BTCorruptorGrabAction.leave sets corruptor_grab_stagger, bt_corruptor_grab_action.lua:63, and its
+-- custom_enter_function reads it).
+local function special_attack(unit, breed, fake)
+	local status, how = held_player(unit)
+	local tree = breed_tree(breed)
+	local action = nil
+
+	fake.corruptor_grab_stagger = how == "corruptor" or nil
+
+	if how == "pack_master" then
+		local node = PACK_MASTER_NODES[status.pack_master_status]
+
+		action = node and find_node_action(tree, node, 0)
+	elseif how == "pounce" then
+		action = find_node_action(tree, "BTTargetPouncedAction", 0)
+	elseif fake.shooting then
+		action = fake.shooting
+	elseif fake.suicide_run then
+		action = fake.suicide_run
+	end
+
+	if action then
+		fake.attack_action = action
+		fake.special_attack = action
+	elseif fake.special_attack and fake.attack_action == fake.special_attack then
+		-- The hold or the shooting is over.
+		fake.attack_action = nil
+		fake.special_attack = nil
+	end
 end
 
 -- The game reuses a dead enemy's unit for a new enemy of the same breed (BreedFreezer), with a new network id, so
@@ -479,6 +546,13 @@ local function fake_for(unit, breed)
 	end
 
 	return fake
+end
+
+-- The stand-in kept for this enemy, if any, and only while it is still the enemy it was made for (fake_for).
+local function fake_of(unit)
+	local fake = fakes[unit]
+
+	return fake and fake.go_id == Managers.state.unit_storage:go_id(unit) and fake or nil
 end
 
 -- Whether this unit is an enemy killed on this screen, whose host messages are ignored. Only while the unit is still
@@ -606,9 +680,57 @@ local function stagger_over(fake)
 	fake.staggering_id = nil
 end
 
+-- A special's shooting attack, whose ignore_staggers the host reads from blackboard.action from the attack's first
+-- frame, and the animations the host sends as it begins. The warpfire thrower first turns towards its target (one of
+-- its attack_anims, BTWarpfireThrowerShootAction._start_align_towards_target, bt_warpfire_thrower_shoot_action.lua:250,
+-- from enter) and the ratling gunner aims (attack_shoot_align, BTRatlingGunnerShootAction._start_align_towards_target,
+-- bt_ratling_gunner_shoot_action.lua:408, from enter); both play attack_shoot_start when they open fire (:245 and
+-- :437), and turn or aim again when they realign. No other node of theirs plays these animations, and their hit
+-- reactions play on each machine, not from the host.
+local shoot_lookup = {} -- breed name -> { action = its shooting action, starts = { [animation] = true } }, or false
+
+local function shooting_of(breed)
+	local entry = shoot_lookup[breed.name]
+
+	if entry == nil then
+		local tree = breed_tree(breed)
+		local warpfire = find_node_action(tree, "BTWarpfireThrowerShootAction", 0)
+		local ratling = not warpfire and find_node_action(tree, "BTRatlingGunnerShootAction", 0)
+
+		entry = false
+
+		if warpfire then
+			entry = {
+				action = warpfire,
+				starts = {
+					attack_shoot_start = true,
+				},
+			}
+
+			if type(warpfire.attack_anims) == "table" then
+				for _, name in pairs(warpfire.attack_anims) do
+					entry.starts[name] = true
+				end
+			end
+		elseif ratling then
+			entry = {
+				action = ratling,
+				starts = {
+					attack_shoot_align = true,
+					attack_shoot_start = true,
+				},
+			}
+		end
+
+		shoot_lookup[breed.name] = entry
+	end
+
+	return entry or nil
+end
+
 -- An enemy animation the host played and this screen shows. Keeps the stand-in blackboard close to the host's.
 local function track_host_animation(unit, anim)
-	local fake = fakes[unit]
+	local fake = fake_of(unit)
 
 	if anim == "stagger_finished" then
 		if fake then
@@ -620,6 +742,44 @@ local function track_host_animation(unit, anim)
 
 	local breed = fake and fake.breed or covered_breed(unit)
 	local stagger_type = breed and stagger_type_of(breed, anim)
+	local shooting = breed and shooting_of(breed)
+
+	if shooting then
+		if shooting.starts[anim] then
+			fake = fake or fake_for(unit, breed)
+			fake.shooting = shooting.action
+
+			return
+		end
+
+		-- Any other animation from the host ends the shooting: the warpfire thrower's attack_shoot_end
+		-- (BTWarpfireThrowerShootAction.leave, :97), or the ratling gunner's next move, since its leave plays none
+		-- (bt_ratling_gunner_shoot_action.lua:80). So does a stagger (attack_staggered) and the ratling gunner's
+		-- rpc_ai_weapon_shoot_end (reactions.shooting).
+		if fake then
+			fake.shooting = nil
+		end
+	end
+
+	-- The globadier's suicide run (BTSuicideRunAction): suicide_run_start begins it (bt_suicide_run_action.lua:131) and
+	-- attack_foff_self begins its detonation (:222). Its action's ignore_staggers let only explosions stagger it, and it
+	-- stays the host's blackboard.action until the globadier dies, but for its staggers: the behaviour tree goes back to
+	-- the run after each one, as its health stays under 70% (BTConditions.suicide_run, bt_conditions.lua:607), and
+	-- blackboard.suicide_run, with explosion_started, is never cleared. So this stand-in keeps both until it dies.
+	if breed and (anim == "suicide_run_start" or anim == "attack_foff_self") then
+		local run = find_node_action(breed_tree(breed), "BTSuicideRunAction", 0)
+
+		if run then
+			fake = fake or fake_for(unit, breed)
+			fake.suicide_run = run
+
+			if anim == "attack_foff_self" then
+				fake.detonating = true
+			end
+
+			return
+		end
+	end
 
 	if not stagger_type then
 		-- A new move. The host clears this flag when the enemy starts its next attack (bt_attack_action.lua:224).
@@ -661,6 +821,19 @@ end
 function reactions.attack_started(unit, breed, action)
 	if pc.REACTION_BREEDS[breed.name] then
 		note_attack(fake_for(unit, breed), action)
+	end
+end
+
+-- The host's rpc_ai_weapon_shoot_start and rpc_ai_weapon_shoot_end (BTRatlingGunnerShootAction._start_shooting and
+-- stop_shooting, bt_ratling_gunner_shoot_action.lua:288 and :220): a ratling gunner fires between them, and its shooting
+-- ignores some staggers.
+function reactions.shooting(go_id, started)
+	local unit = Managers.state.unit_storage:unit(go_id)
+	local breed = unit and Unit.alive(unit) and covered_breed(unit)
+	local shoot = breed and find_node_action(breed_tree(breed), "BTRatlingGunnerShootAction", 0)
+
+	if shoot then
+		fake_for(unit, breed).shooting = started and shoot or nil
 	end
 end
 
@@ -979,6 +1152,7 @@ local function work_out_stagger(unit, breed, fake, attacker, damage_profile, tar
 	end
 
 	expire_timers(fake, t)
+	special_attack(unit, breed, fake)
 
 	local health = ScriptUnit.has_extension(unit, "health_system")
 
@@ -1161,6 +1335,56 @@ local function enter_stagger(unit, breed, fake, attacker, stagger_type, duration
 	return anim, idle_event or "idle", override_rotation or impact_rotation, variable_scale
 end
 
+-- A globadier staggered once its detonation has begun doesn't stagger: the behaviour tree picks
+-- BTGlobadierSuicideStaggerAction over the stagger (skaven_poison_wind_globadier_behavior.lua:8, bt_conditions.lua:579),
+-- whose enter kills it with no killer (bt_globadier_suicide_stagger_action.lua:12), and its death sets off its gas
+-- (death_reactions.lua:1071). The host does that with the stagger this client sends; this screen shows the death now,
+-- as the host's death message would (AiUtils.kill_unit, ai_utils.lua:1326, then HealthSystem.rpc_add_damage): the
+-- globadier itself as the attacker, the damage source "suicide", straight down. The gas comes from the host.
+local function detonation_death(unit, t)
+	local health = ScriptUnit.has_extension(unit, "health_system")
+
+	if not health then
+		return
+	end
+
+	local amount = NetworkConstants.damage.max
+	local position = Unit.world_position(unit, 0)
+	local direction = Vector3(0, 0, -1)
+
+	dead[unit] = {
+		go_id = pc.network():unit_game_object_id(unit),
+		t = t,
+	}
+
+	local prediction = predictions[unit]
+
+	if prediction then
+		finish_prediction(prediction, "killed by its detonation")
+	end
+
+	pc.client.reaction_started(unit, "killed by its detonation")
+	health:add_damage(unit, amount, "full", "kinetic", position, direction, "suicide", nil, unit, nil, nil, false, false, nil, nil, nil, 1)
+
+	if health:is_alive() then
+		-- A plain table, as in kill below.
+		local killing_blow = {}
+
+		killing_blow[DamageDataIndex.DAMAGE_AMOUNT] = amount
+		killing_blow[DamageDataIndex.DAMAGE_TYPE] = "kinetic"
+		killing_blow[DamageDataIndex.ATTACKER] = unit
+		killing_blow[DamageDataIndex.HIT_ZONE] = "full"
+		killing_blow[DamageDataIndex.POSITION] = Vector3Aux.box(nil, position)
+		killing_blow[DamageDataIndex.DIRECTION] = Vector3Aux.box(nil, direction)
+		killing_blow[DamageDataIndex.DAMAGE_SOURCE_NAME] = "suicide"
+		killing_blow[DamageDataIndex.SOURCE_ATTACKER_UNIT] = unit
+		killing_blow[DamageDataIndex.FIRST_HIT] = false
+		killing_blow[DamageDataIndex.TARGET_INDEX] = 1
+
+		Managers.state.entity:system("death_system"):kill_unit(unit, killing_blow)
+	end
+end
+
 -- batch: a blast's list of staggers (reactions.new_stagger_batch), which goes to the host after the blast is worked out.
 local function stagger(unit, breed, attacker, damage_profile, profile_name, target_index, hit_zone_name, attack_direction, damage_source_name, t, batch)
 	local fake = fake_for(unit, breed)
@@ -1207,6 +1431,14 @@ local function stagger(unit, breed, attacker, damage_profile, profile_name, targ
 		send("pc_stagger", id, go_id, stagger_type, pc.finite(duration, 3), pc.finite(length, 3), pc.finite(direction.x, 3), pc.finite(direction.y, 3), pc.finite(direction.z, 3),
 			anim_scale and pc.finite(anim_scale, 3) or -1, pc.finite(stagger_value, 3), always_stagger, is_push, anim, pc.finite(Quaternion.yaw(rotation), 4),
 			pc.finite(position.x, 3), pc.finite(position.y, 3), pc.finite(position.z, 3), true, profile_name, target_index or 0, damage_source_name)
+	end
+
+	if fake.detonating then
+		detonation_death(unit, t)
+		pc.count("client_detonation_kill")
+		pc.log("client stagger=%d enemy=%s type=%d: its detonation had begun, so it dies (the host's behaviour tree kills it)", id, breed.name, stagger_type)
+
+		return
 	end
 
 	pc.client.reaction_started(unit, "staggered by you")
@@ -1597,6 +1829,13 @@ function reactions.host_animation(go_id, anim_id, variable_id, variable_value)
 		return true
 	end
 
+	-- A gutter runner pinning this player on this screen while the host's copy still flies or lands (Disablers.lua).
+	if pc.disablers and pc.disablers.holds(unit) then
+		pc.count("client_grab_animation_held")
+
+		return true
+	end
+
 	local anim = NetworkLookup.anims[anim_id]
 	local prediction = predictions[unit]
 
@@ -1750,6 +1989,15 @@ mod:network_register("pc_reaction_ack", function (sender, version, kind, id, res
 		return
 	end
 
+	-- A disabler's grab or pin this screen showed at once (D53).
+	if kind == "grab" then
+		if pc.disablers then
+			pc.guard("client grab ack", pc.disablers.acknowledged, id, result)
+		end
+
+		return
+	end
+
 	local prediction = by_key[tostring(kind) .. ":" .. tostring(id)]
 
 	if not prediction then
@@ -1880,6 +2128,19 @@ end)
 mod:hook_safe("AIInventorySystem", "rpc_ai_drop_single_item", function (self, channel_id, unit_id, item_inventory_index, item_drop_reason_id)
 	if not self.is_server and not pc.broken then
 		pc.guard("client shield drop", reactions.item_dropped, unit_id, item_drop_reason_id)
+	end
+end)
+
+-- A ratling gunner starts and stops firing (reactions.shooting).
+mod:hook_safe("WeaponSystem", "rpc_ai_weapon_shoot_start", function (self, channel_id, owner_unit_id, shoot_time)
+	if not pc.is_server() and not pc.broken then
+		pc.guard("client shooting", reactions.shooting, owner_unit_id, true)
+	end
+end)
+
+mod:hook_safe("WeaponSystem", "rpc_ai_weapon_shoot_end", function (self, channel_id, owner_unit_id)
+	if not pc.is_server() and not pc.broken then
+		pc.guard("client shooting", reactions.shooting, owner_unit_id, false)
 	end
 end)
 

@@ -26,12 +26,39 @@ local CUT_MEMORY = 2 -- seconds a cut swing is remembered, only so that a damage
 local MAX_FRAMES = 8
 
 -- The damage frame of each family: A, single swings; B, frenzy combo steps; C, elites' sweeps and overheads; D,
--- elites' shoves.
+-- elites' shoves; F, the packmaster's hook. A leech's grab and a gutter runner's pounce, the other disablers of
+-- family F, are judged on the frame their projectile or leap reaches the player (judge_grab, judge_leap).
 local FRAME_CALLBACKS = {
 	A = "anim_cb_damage",
 	B = "anim_cb_frenzy_damage",
 	C = "anim_cb_damage",
 	D = "anim_cb_stormvermin_push",
+	F = "anim_cb_damage",
+}
+
+-- Family F: the kinds of disabler attack pc_swing_begin names in step_name (pc.DISABLER_KINDS).
+local DISABLER_KINDS = {
+	hook = true,
+	grab = true,
+	pounce = true,
+}
+
+local LEAP_RADIUS = 1 -- the sphere round a gutter runner's neck (BTCrazyJumpAction.check_colliding_players)
+local SNAP_START = 2.7 -- enter_snap_state_distance (bt_crazy_jump_action.lua:107)
+local SNAP_DISTANCE = 2 -- snap_distance and side_snap_distance (bt_crazy_jump_action.lua:245 and :284)
+local SNAP_SIDE = 1
+local GRAB_ARRIVAL = 2 -- how near its aim point a leech's projectile grabs (BTCorruptorGrabAction.overlap_players)
+local PLAYER_RADIUS = 0.35 -- about a player's width, for judging by shape
+local PLAYER_HEIGHT = 1.8
+-- The animations a gutter runner's leap plays as part of it (bt_crazy_jump_action.lua:38 to :47, :141 and :334); its
+-- landing ends it on this screen.
+local LEAP_ANIMS = {
+	to_crouch = true,
+	jump_start = true,
+}
+local LEAP_END_ANIMS = {
+	jump_land = true,
+	jump_fail = true,
 }
 
 local swings = {} -- swing id -> record, kept for the stats and the debug log
@@ -348,6 +375,8 @@ function client.after_locomotion(t, dt)
 			end
 		elseif swing.family == "D" then
 			update_shove_facing(swing, unit, target, t, dt)
+		elseif swing.family == "F" then
+			client.update_disabler(swing, unit, target, t, dt)
 		else
 			update_facing(swing, unit, target, t, dt)
 		end
@@ -435,12 +464,276 @@ local function judge_box(swing, unit, target, rotation)
 	return inside, Vector3.length(offset), math.deg(math.acos(math.max(-1, math.min(1, cosine))))
 end
 
+local function angle_between(direction, forward)
+	return math.deg(math.acos(math.max(-1, math.min(1, Vector3.dot(direction, forward)))))
+end
+
+local function line_of_sight_world(unit)
+	return World.get_data(Unit.world(unit), "physics_world")
+end
+
+-- Family F, the packmaster's hook, after its reach and cone (it is unblockable): copy of
+-- BTPackMasterAttackAction.attack_success (bt_pack_master_attack_action.lua:110) on this screen. A dodging player
+-- escapes unless they are still within the hook's dodge angle of the packmaster's facing and its dodge distance; then
+-- line of sight decides. Returns nil if it lands, else why not.
+local function hook_misses(swing, unit, target, status, rotation)
+	local action = swing.action
+
+	if status and is_dodging(status) then
+		local attacker_position = position(unit)
+		local dodge_position = position(target)
+		local direction = Vector3.normalize(Vector3.flat(dodge_position - attacker_position))
+		local dodge_distance = action.dodge_distance or 0
+
+		if angle_between(direction, Quaternion.forward(rotation)) > (action.dodge_angle or 0) or Vector3.distance_squared(attacker_position, dodge_position) >= dodge_distance * dodge_distance then
+			return "dodged"
+		end
+	end
+
+	if not PerceptionUtils.pack_master_has_line_of_sight_for_attack(line_of_sight_world(unit), unit, target) then
+		return "line of sight"
+	end
+
+	return nil
+end
+
+-- Family F, the leech's grab: copy of BTCorruptorGrabAction.grab_player (bt_corruptor_grab_action.lua:221) on this
+-- screen, once its projectile has arrived. A player who dodged during the attack escapes unless they are close and in
+-- front of the leech, or still near the projectile's aim point; one who didn't is grabbed unless they are too far
+-- from that point. Then line of sight. Returns nil if it lands, else why not.
+local function grab_misses(swing, unit, target, status)
+	local action = swing.action
+	local self_position = position(unit)
+	local target_position = position(target)
+	local target_distance_squared = Vector3.distance_squared(swing.aim_point:unbox(), target_position)
+	local physics_world = line_of_sight_world(unit)
+	local dodge_distance = action.dodge_distance or 0
+
+	if not action.ignore_dodge and swing.dodged_during_attack or status and status:is_invisible() then
+		local direction = Vector3.normalize(Vector3.flat(target_position - self_position))
+		local angle = angle_between(direction, Quaternion.forward(Unit.local_rotation(unit, 0)))
+
+		if Vector3.distance_squared(self_position, target_position) < (action.min_dodge_angle_squared or 0) and angle <= (action.dodge_angle or 0) or target_distance_squared < dodge_distance * dodge_distance then
+			return not PerceptionUtils.is_position_in_line_of_sight(unit, self_position, target_position, physics_world) and "line of sight" or nil
+		end
+
+		return "dodged"
+	elseif action.ignore_dodge and Vector3.distance_squared(self_position, target_position) > (action.max_distance_squared or math.huge) or target_distance_squared > 25 then
+		return "out of reach"
+	end
+
+	return not PerceptionUtils.is_position_in_line_of_sight(unit, self_position + Vector3.up(), target_position + Vector3.up(), physics_world) and "line of sight" or nil
+end
+
+local own_triggers = {} -- player unit -> whether a gutter runner's leap overlap finds that unit on this machine
+
+-- Whether the overlap a gutter runner's leap uses can see this player on this machine. Checked once per player unit,
+-- with a small sphere round the player, and logged.
+local function overlap_sees_trigger(target)
+	local known = own_triggers[target]
+
+	if known == nil then
+		local actors = PhysicsWorld.immediate_overlap(line_of_sight_world(target), "shape", "sphere", "position", position(target) + Vector3(0, 0, 1), "size", 0.6, "types", "both", "collision_filter", "filter_player_and_husk_trigger")
+
+		known = false
+
+		for _, actor in ipairs(actors or {}) do
+			if Actor.unit(actor) == target then
+				known = true
+
+				break
+			end
+		end
+
+		own_triggers[target] = known
+
+		pc.log("client: the game's overlap %s this player, so gutter runners' leaps are judged %s", known and "finds" or "doesn't find", known and "with it" or "by shape")
+	end
+
+	return known
+end
+
+-- Whether this player is in the leap's sphere round centre: by the game's own overlap where it sees this player,
+-- else by distance to an upright segment for the player.
+local function in_leap_sphere(centre, target)
+	if overlap_sees_trigger(target) then
+		local actors = PhysicsWorld.immediate_overlap(line_of_sight_world(target), "shape", "sphere", "position", centre, "size", LEAP_RADIUS, "types", "both", "collision_filter", "filter_player_and_husk_trigger")
+
+		for _, actor in ipairs(actors or {}) do
+			if Actor.unit(actor) == target then
+				return true, "overlap"
+			end
+		end
+
+		return false, "overlap"
+	end
+
+	local feet = position(target)
+	local nearest = Vector3(feet.x, feet.y, math.max(feet.z, math.min(feet.z + PLAYER_HEIGHT, centre.z)))
+
+	return Vector3.distance(centre, nearest) <= LEAP_RADIUS + PLAYER_RADIUS, "shape"
+end
+
+local function node_position(unit, name)
+	return Unit.world_position(unit, Unit.has_node(unit, name) and Unit.node(unit, name) or 0)
+end
+
+-- Family F: a grab or pounce judged on this screen, outside a damage frame. The answer goes out before the local
+-- effects, so a problem in those can't leave the host without one.
+local function judge_disabler(swing, unit, target, result, reason, distance, t)
+	swing.frames = 1
+	swing.past_damage = true
+	swing.release_t = t + FACING_HOLD
+
+	pc.count("client_judged")
+	pc.count("client_judged_F")
+	pc.count(result == "miss" and "client_miss_" .. reason or "client_" .. result)
+
+	send_answer(swing, 1, result, 0, false, "", false, distance, 0)
+
+	if result == "hit" then
+		pc.guard("client disabler shown", pc.disablers.start, swing, unit, target)
+	end
+
+	if pc.debug then
+		local status = ScriptUnit.has_extension(target, "status_system")
+
+		pc.log("client swing=%d enemy=%s attack=%s frame=1 verdict=%s reason=%s distance=%.2f since_begin=%.3fs dodging=%s dodged_in_swing=%s family=F:%s aimed=%s%s", swing.id, swing.breed.name, swing.action_name, result, reason, distance, t - swing.begin_t,
+			tostring(status ~= nil and status.is_dodging == true), tostring(swing.dodged == true), tostring(swing.kind), tostring(swing.aimed == true), swing.box_method and " sphere=" .. swing.box_method or "")
+	end
+end
+
+-- Family F, the leech's grab: copy of BTCorruptorGrabAction.overlap_players (bt_corruptor_grab_action.lua:202) on this
+-- screen. Each machine flies its own copy of the projectile towards a point just past where it saw the player's neck
+-- when it set off (CorruptorBeamExtension._get_positions, corruptor_beam_extension.lua:133), so this one is aimed at
+-- this player's real position. The grab is judged once it is within 2 m (flat) of that point, after the action's
+-- grab_delay.
+local function judge_grab(swing, unit, target, t)
+	if not swing.arrived_t then
+		local beam = ScriptUnit.has_extension(unit, "ai_beam_effect_system")
+		local projectile = beam and beam.state == "projectile" and beam.projectile_unit
+		local aim_point = beam and beam.aimed_at_position
+
+		if not projectile or not aim_point or not Unit.alive(projectile) then
+			return
+		end
+
+		local aimed = aim_point:unbox()
+
+		if Vector3.length(Vector3.flat(aimed - Unit.local_position(projectile, 0))) >= GRAB_ARRIVAL then
+			return
+		end
+
+		swing.arrived_t = t
+		swing.aim_point = Vector3Box(aimed)
+	end
+
+	if t < swing.arrived_t + (swing.action.grab_delay or 0) then
+		return
+	end
+
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local why = grab_misses(swing, unit, target, status)
+
+	judge_disabler(swing, unit, target, why and "miss" or "hit", why or "landed", Vector3.distance(position(unit), position(target)), t)
+end
+
+-- Family F, the gutter runner's pounce: copy of the in-air part of BTCrazyJumpAction.run (bt_crazy_jump_action.lua:163
+-- to :317) on this screen's copy of the leap, against this player's live position, every frame. The sphere round its
+-- neck pins whichever player it reaches. In its last 2.7 m it also catches its target in a wider zone (the snap),
+-- unless they side-stepped it: the leap then moves away from them. A leap is aimed once, at launch, and never steers,
+-- so this screen's copy flies the host's arc; the host skips the snap for a modded target (Host.lua).
+local function judge_leap(swing, unit, target, t)
+	local neck = node_position(unit, "j_neck")
+	local previous = swing.last_neck and swing.last_neck:unbox()
+
+	if swing.last_neck then
+		swing.last_neck:store(neck)
+	else
+		swing.last_neck = Vector3Box(neck)
+	end
+
+	local inside, method = in_leap_sphere(neck, target)
+	local reason = "sphere"
+
+	swing.box_method = method
+
+	if not inside and swing.aimed and not swing.snap_failed then
+		if not swing.snapping and Vector3.length(Vector3.flat(position(target) - neck)) < SNAP_START then
+			local status = ScriptUnit.has_extension(target, "status_system")
+
+			-- Someone else already pins them (bt_crazy_jump_action.lua:180): the leap fails.
+			if status and status.pounced_down then
+				swing.snap_failed = true
+			else
+				swing.snapping = true
+			end
+		end
+
+		if swing.snapping and previous then
+			-- The leap aims at its target's neck (data.enemy_spine_node, bt_prepare_for_crazy_jump_action.lua:189).
+			local target_neck = node_position(target, "j_neck")
+			local to_target = target_neck - neck
+			local velocity = neck - previous
+
+			if Vector3.length_squared(velocity) > 0 and Vector3.dot(Vector3.normalize(velocity), Vector3.normalize(to_target)) < 0 then
+				swing.snap_failed = true
+				swing.snapping = false
+				swing.side_stepped = true
+			elseif Vector3.length(to_target) < SNAP_DISTANCE and Vector3.length(Vector3.flat(neck - target_neck)) < SNAP_SIDE then
+				inside, reason = true, "snap"
+			end
+		end
+	end
+
+	if inside then
+		judge_disabler(swing, unit, target, "hit", reason, Vector3.distance(neck, position(target)), t)
+	end
+end
+
+-- Family F, every frame after LocomotionSystem.update: the hook and the grab turn the special towards the player the
+-- whole time (bt_pack_master_attack_action.lua:95, bt_corruptor_grab_action.lua:165); the grab and the pounce are
+-- judged as their projectile or leap reaches the player. The leech remembers a dodge at any point of its attack
+-- (bt_corruptor_grab_action.lua:116).
+function client.update_disabler(swing, unit, target, t, dt)
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	note_dodges(swing, status)
+
+	if swing.kind == "pounce" then
+		if not swing.past_damage then
+			judge_leap(swing, unit, target, t)
+		end
+
+		return
+	end
+
+	if not swing.past_damage then
+		local rotation = flat_rotation(Unit.local_position(unit, 0), Unit.local_position(target, 0))
+
+		if rotation then
+			swing.wanted:store(rotation)
+		end
+
+		if swing.kind == "grab" then
+			if status and is_dodging(status) then
+				swing.dodged_during_attack = true
+			end
+
+			judge_grab(swing, unit, target, t)
+		end
+	end
+
+	ease_facing(swing, unit, dt)
+end
+
 -- Called from the AnimationSystem.animation_callback hook when an enemy copy fires the damage frame of the swing it
 -- has open at this player: anim_cb_damage (families A and C), anim_cb_frenzy_damage (B) or anim_cb_stormvermin_push (D).
 function client.damage_frame(unit, callback_name)
 	local swing = by_unit[unit]
 
-	if swing and FRAME_CALLBACKS[swing.family] ~= callback_name then
+	-- A leech's damage frame only sends its projectile off; its grab is judged when that arrives (judge_grab).
+	if swing and (FRAME_CALLBACKS[swing.family] ~= callback_name or swing.family == "F" and swing.kind ~= "hook") then
 		return
 	end
 
@@ -520,10 +813,19 @@ function client.damage_frame(unit, callback_name)
 		end
 	end
 
+	-- Family F: the hook is unblockable, and has its own rule after its reach and cone: the dodge, then line of sight.
+	if family == "F" and result == "hit" then
+		local why = hook_misses(swing, unit, target, status, rotation)
+
+		if why then
+			result, reason = "miss", why
+		end
+	end
+
 	pc.count("client_judged")
 	pc.count(result == "miss" and "client_miss_" .. reason or "client_" .. result)
 
-	if family == "C" or family == "D" then
+	if family == "C" or family == "D" or family == "F" then
 		pc.count("client_judged_" .. family)
 
 		if not swing.aimed then
@@ -566,6 +868,9 @@ function client.damage_frame(unit, callback_name)
 			pc.guard("client box results", pc.hit_results.box, swing, unit, target, false)
 		elseif family == "D" then
 			pc.guard("client shove results", pc.hit_results.shove, swing, unit, target, rotation)
+		elseif family == "F" then
+			-- The hook does no damage; the player is grabbed at once instead (D53).
+			pc.guard("client disabler shown", pc.disablers.start, swing, unit, target)
 		else
 			pc.guard("client hit results", pc.hit_results.hit, swing, unit, target)
 		end
@@ -582,7 +887,7 @@ function client.damage_frame(unit, callback_name)
 		pc.log("client swing=%d enemy=%s attack=%s%s frame=%d verdict=%s reason=%s distance=%.2f reach=%.2f angle=%.1f cone=%.1f frozen=%s facing=%s since_begin=%.3fs dodging=%s effective=%s dodges=%s/%s dodged_in_swing=%s over_count_in_swing=%s dodgecount=%s recoil=%s family=%s aimed=%s%s",
 			swing.id, breed.name, swing.action_name, combo and "/" .. tostring(swing.step_name) or "", frame, result, reason, distance, reach, angle, cone, tostring(tightened == true), use_our_facing and "client" or "host", t - swing.begin_t,
 			tostring(dodging_now), tostring(effective_now), tostring(status and status.dodge_cooldown), tostring(status and status.dodge_count), tostring(swing.dodged == true), tostring(swing.dodge_over_count == true), pc.dodgecount and "on" or "off",
-			tostring(recoil_anim or "host"), family, tostring(swing.aimed == true), family == "C" and " box=" .. tostring(swing.box_method) or "")
+			tostring(recoil_anim or "host"), family .. (swing.kind and ":" .. swing.kind or ""), tostring(swing.aimed == true), family == "C" and " box=" .. tostring(swing.box_method) or "")
 	end
 end
 
@@ -617,6 +922,28 @@ function client.animation_changed(go_id, anim_id)
 
 	if event == swing.attack_anim then
 		return
+	end
+
+	-- Family F: a gutter runner's leap plays these as part of it, and its landing ends it here without reaching this
+	-- player (bt_crazy_jump_action.lua:334): a miss, which lets the host's leap end too.
+	if swing.kind == "pounce" then
+		if LEAP_ANIMS[event] then
+			return
+		end
+
+		if LEAP_END_ANIMS[event] and not swing.past_damage then
+			swing.frames = 1
+			swing.past_damage = true
+
+			pc.count("client_judged")
+			pc.count("client_judged_F")
+			pc.count("client_miss_landed")
+			pc.log("client swing=%d enemy=%s attack=%s frame=1 verdict=miss reason=landed (%s) since_begin=%.3fs family=F:pounce aimed=%s side_stepped=%s", swing.id, swing.breed.name, swing.action_name, tostring(event), pc.now() - swing.begin_t, tostring(swing.aimed == true), tostring(swing.side_stepped == true))
+			send_answer(swing, 1, "miss", 0, false, "", false, 0, 0)
+			forget(swing)
+
+			return
+		end
 	end
 
 	-- An elite whose attack shrugs off a stagger restarts the attack's wind-up (reset_attack, bt_storm_vermin_attack_action
@@ -690,10 +1017,11 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 	local set = BreedActions[set_name]
 	local action = set and set[action_name]
 	local step = family == "B" and action and type(action.combo_attacks) == "table" and type(step_name) == "string" and action.combo_attacks[step_name] or nil
+	local kind = family == "F" and DISABLER_KINDS[step_name] and step_name or nil
 
 	pc.count("client_announced")
 
-	if not breed or not target or not action or family == "B" and not step then
+	if not breed or not target or not action or family == "B" and not step or family == "F" and not kind then
 		-- This client can't judge the swing, so it says so. The host books nothing for it.
 		pc.count("client_unjudged")
 		pc.print("client swing=%d can't be judged: enemy=%s target=%s action=%s/%s%s", id, tostring(breed and breed.name), tostring(target ~= nil), set_name, action_name, family == "B" and "/" .. tostring(step_name) or "")
@@ -780,8 +1108,10 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 		box_flat = type(box_flat) == "number" and box_flat or 0,
 		wanted = QuaternionBox(wanted_rotation),
 		current = QuaternionBox(current_rotation),
-		aimed = family ~= "C" or aimed == true,
+		-- A family C sweep and a family F pounce reach every modded player; the others go to their target only.
+		aimed = family ~= "C" and family ~= "F" or aimed == true,
 		track_until = t + (type(rotation_time) == "number" and rotation_time or 0), -- family C
+		kind = kind, -- family F: hook, grab or pounce
 	}
 
 	swings[id] = swing
@@ -800,6 +1130,10 @@ mod:hook_safe("LocomotionSystem", "update", function (self, context, t)
 
 	if pc.reactions.active() then
 		pc.guard("client reactions", pc.reactions.after_locomotion, t, context.dt)
+	end
+
+	if pc.disablers and pc.disablers.active() then
+		pc.guard("client grabs", pc.disablers.after_locomotion, t)
 	end
 end)
 
@@ -926,6 +1260,9 @@ function client.update(dt)
 
 	pc.guard("client reactions upkeep", pc.reactions.update, dt)
 	pc.guard("client hit results upkeep", pc.hit_results.update)
+	if pc.disablers then
+		pc.guard("client grabs upkeep", pc.disablers.update)
+	end
 
 	if next(recently_cut) ~= nil then
 		local t = pc.now()
@@ -962,10 +1299,15 @@ function client.clear()
 	contact_lost = false
 	reping_timer = 0
 	own_hit_boxes = {}
+	own_triggers = {}
 
 	pc.forget_host()
 	pc.reactions.clear()
 	pc.hit_results.clear()
+
+	if pc.disablers then
+		pc.disablers.clear()
+	end
 end
 
 function client.open_swing_count()

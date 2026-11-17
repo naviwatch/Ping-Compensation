@@ -49,6 +49,16 @@ local FINGERPRINT_BREEDS = {
 	"chaos_warrior",
 	"skaven_storm_vermin",
 	"skaven_storm_vermin_commander",
+	-- Build 5 (D52): the specials, whose disabling attacks the client judges and whose reactions it decides, and the
+	-- ungor archer.
+	"beastmen_ungor_archer",
+	"chaos_corruptor_sorcerer",
+	"chaos_vortex_sorcerer",
+	"skaven_gutter_runner",
+	"skaven_pack_master",
+	"skaven_poison_wind_globadier",
+	"skaven_ratling_gunner",
+	"skaven_warpfire_thrower",
 }
 
 local BREED_FIELDS = {
@@ -99,6 +109,18 @@ local ACTION_NODES = {
 	BTStaggerAction = true,
 	BTStormVerminAttackAction = true,
 	BTStormVerminPushAction = true,
+	-- Build 5 (D52): the disablers' attacks (family F), and the specials' holds, shooting and the globadier's suicide
+	-- run, whose ignore_staggers the client's stagger maths reads.
+	BTCorruptorGrabAction = true,
+	BTCrazyJumpAction = true,
+	BTPackMasterAttackAction = true,
+	BTPackMasterDragAction = true,
+	BTPackMasterHoistAction = true,
+	BTPackMasterInitialPullAction = true,
+	BTRatlingGunnerShootAction = true,
+	BTSuicideRunAction = true,
+	BTTargetPouncedAction = true,
+	BTWarpfireThrowerShootAction = true,
 }
 
 -- The fields of those action tables that the client's maths reads. Only these are fingerprinted, so state the host's
@@ -114,16 +136,23 @@ local ACTION_FIELDS = {
 	"damage",
 	"damage_type",
 	"difficulty_duration",
+	"dodge_angle",
+	"dodge_distance",
 	"dodge_window_duration",
 	"dodge_window_start",
 	"fatigue_type",
+	"grab_delay",
+	"grabbing_stagger_anims",
 	"height",
 	"hit_react_type",
+	"ignore_dodge",
 	"ignore_staggers",
 	"impact_push_speed",
 	"knocked_down_attack_anim",
+	"max_distance_squared",
 	"max_impact_push_speed",
 	"max_player_push_speed",
+	"min_dodge_angle_squared",
 	"moving_attack",
 	"moving_stagger_minimum_destination_distance",
 	"moving_stagger_threshold",
@@ -134,6 +163,7 @@ local ACTION_FIELDS = {
 	"player_dodged_radius",
 	"player_push_speed",
 	"player_push_speed_blocked",
+	"projectile_speed",
 	"push",
 	"range",
 	"reset_attack_animations",
