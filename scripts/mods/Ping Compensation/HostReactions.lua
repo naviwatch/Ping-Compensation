@@ -592,9 +592,12 @@ local function apply_stagger(sender, id, go_id, stagger_type, duration, length, 
 	local blackboard = unit and BLACKBOARDS[unit]
 	local breed = blackboard and blackboard.breed
 
+	-- An empty animation: a stagger AiUtils.stagger refused on the client's screen (Reactions.lua), which shows nothing.
+	local procs_only = anim == ""
+
 	if unit then
 		note_answer(unit)
-		check_answer(unit, sender, stagger_type, id)
+		check_answer(unit, sender, procs_only and 0 or stagger_type, id)
 	end
 
 	if not breed or not pc.REACTION_BREEDS[breed.name] or not HEALTH_ALIVE[unit] then
@@ -607,13 +610,25 @@ local function apply_stagger(sender, id, go_id, stagger_type, duration, length, 
 		return refuse("the player has no hero")
 	end
 
+	-- Vanilla's stagger_ai runs the hit's on-stagger procs whether or not AiUtils.stagger refuses the stagger
+	-- (damage_utils.lua:3639), so the host runs them for one the client's screen refused too (D57 review).
+	if procs_only then
+		pc.count("host_stagger_procs_only")
+		stagger_procs(unit, blackboard, attacker, profile_name, target_index, stagger_type, duration, stagger_value, is_push, damage_source)
+
+		return
+	end
+
 	local t = pc.now()
 	local before = blackboard.stagger_time
 
 	AiUtils.stagger(unit, blackboard, attacker, Vector3(dx, dy, dz), length, stagger_type, duration, anim_scale >= 0 and anim_scale or nil, t, stagger_value, always_stagger, is_push, nil, nil, damage_source)
 
-	-- AiUtils.stagger refuses a few combinations, such as a light stagger on an enemy already blown back.
+	-- AiUtils.stagger refuses a few combinations, such as a light stagger on an enemy already blown back. Its procs
+	-- still run, as above.
 	if blackboard.stagger_time == before then
+		stagger_procs(unit, blackboard, attacker, profile_name, target_index, stagger_type, duration, stagger_value, is_push, damage_source)
+
 		return refuse("the game refused the stagger")
 	end
 
@@ -714,6 +729,18 @@ mod:network_register("pc_blast_staggers", function (sender, version, damage_sour
 		end
 	end
 end)
+
+-- Called after BTBlockedAction.leave while a client's stagger waits for its enter. A stagger that ends a recoil goes
+-- through the recoil's leave first (bt_node.lua:97), which raises the stagger count to 3 (bt_blocked_action.lua:64), so
+-- the waiting stagger takes the count the leave left: otherwise before_stagger_enter took the raise for someone else's
+-- stagger and refused it (D57 review; the 3.1 playtest's two such recoils both ended that way).
+function host_reactions.recoil_left(unit, blackboard)
+	local record = staggers[unit]
+
+	if record and type(record.stagger) == "number" and record.stagger < 3 and blackboard.stagger == 3 then
+		record.stagger = 3
+	end
+end
 
 -- Called before BTStaggerAction.enter. Returns the client stagger it is entering, if any.
 function host_reactions.before_stagger_enter(node, unit, blackboard, t)
@@ -922,15 +949,25 @@ function host_reactions.after_stagger_enter(unit, blackboard, t, record)
 	pc.count(applied and "host_stagger_applied" or "host_stagger_own_animation")
 
 	if applied and record.timing ~= "off" then
+		-- The enemy's own stagger code may have put this stagger on its timer alone, set just now: the savage's and the
+		-- plague monk's after a broken frenzy (breed_chaos_berzerker.lua:666, breed_skaven_plague_monk.lua:619). Vanilla
+		-- then ends it on that timer whatever its animation, so only the timer is brought forward, by the whole lead,
+		-- and the animation's length stays out of it (D57 review).
+		local own_timer = blackboard.stagger_ignore_anim_cb == true
+
+		if own_timer then
+			record.timing = "its own timer, brought forward"
+		end
+
 		-- The stagger's timer, set when the client's message arrived, ends one round trip early as well.
 		if blackboard.stagger_time and record.rtt then
-			blackboard.stagger_time = math.max(blackboard.stagger_time - record.rtt, t)
+			blackboard.stagger_time = math.max(blackboard.stagger_time - (own_timer and record.lead or record.rtt), t)
 		end
 
 		-- Past the speed-up limit, or for an enemy whose stagger animations ignore the speed variable (Chaos enemies,
 		-- gors, shielded stormvermin), the timer alone ends the stagger, without waiting for the animation's cue.
 		-- Other players see the animation cut short.
-		if record.end_at then
+		if record.end_at and not own_timer then
 			blackboard.stagger_ignore_anim_cb = true
 			blackboard.stagger_time = math.max(blackboard.stagger_time or t, record.end_at)
 		end
@@ -940,7 +977,7 @@ function host_reactions.after_stagger_enter(unit, blackboard, t, record)
 			pc.count("host_stagger_speed_sum", record.speed)
 		end
 
-		if record.end_at then
+		if record.end_at and not own_timer then
 			pc.count("host_stagger_ended_early")
 		end
 
@@ -1885,6 +1922,10 @@ end)
 -- Every recoil leaves through here: reason "done" when its run ended it, "aborted" when a higher branch of the
 -- behaviour tree took over, and destroy when the enemy died or was removed (bt_node.lua:87, ai_brain.lua:79).
 mod:hook_safe("BTBlockedAction", "leave", function (self, unit, blackboard, t, reason, destroy)
+	if staggers[unit] ~= nil then
+		pc.guard("host recoil left", host_reactions.recoil_left, unit, blackboard)
+	end
+
 	if recoil_ends[unit] ~= nil then
 		pc.guard("host recoil end", host_reactions.recoil_ended, unit, blackboard, t, reason, destroy)
 	end

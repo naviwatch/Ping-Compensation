@@ -677,6 +677,44 @@ local function stagger_over(fake)
 	fake.stagger_time = nil
 	fake.stagger_type = nil
 	fake.staggering_id = nil
+	fake.stagger_idle_due = nil
+end
+
+-- The host raises and lowers the shield itself (a recoil's enter and every recoil's and stagger's leave,
+-- bt_blocked_action.lua:33 and :68, bt_stagger_action.lua:205) and syncs it, so before the game's stagger code runs
+-- here the stand-in shield starts from the host's (D57 review).
+local function sync_shield(unit, fake)
+	local shield = shield_for(unit, fake)
+
+	if shield and not shield.shield_broken then
+		shield.is_blocking = shield_up(unit)
+	end
+end
+
+-- What BTBlockedAction.leave does when a stagger ends a recoil (bt_blocked_action.lua:59 to :72): it runs before the
+-- stagger's enter (bt_node.lua:97), which then finds the recoil's flag gone, the stagger count at least 3 and the
+-- shield up. The enemy is recoiling here while this screen shows its own recoil, or one the host played that nothing
+-- has ended yet (D57 review).
+local function leave_recoil(fake, unit, t)
+	local prediction = predictions[unit]
+	local recoiling = prediction ~= nil and prediction.kind == "recoil" or fake.recoil_until ~= nil and t < fake.recoil_until
+
+	fake.recoil_until = nil
+	fake.blocked = nil
+
+	if not recoiling then
+		return
+	end
+
+	if fake.stagger and fake.stagger < 3 then
+		fake.stagger = 3
+	end
+
+	local shield = fake.shield
+
+	if shield and not shield.shield_broken then
+		shield.is_blocking = true
+	end
 end
 
 -- A special's shooting attack, whose ignore_staggers the host reads from blackboard.action from the attack's first
@@ -743,6 +781,30 @@ local function track_host_animation(unit, anim)
 	local stagger_type = breed and stagger_type_of(breed, anim)
 	local shooting = breed and shooting_of(breed)
 
+	if fake and not stagger_type then
+		if fake.stagger_type and fake.stagger_idle_due then
+			-- The stagger's own idle, which BTStaggerAction.enter plays straight after its animation
+			-- (bt_stagger_action.lua:81).
+			fake.stagger_idle_due = nil
+		elseif fake.stagger_type then
+			-- Whatever BTStaggerAction.leave plays next ends the stagger: stagger_finished (above), or the event the
+			-- breed's enter function returned in its place (bt_stagger_action.lua:54 and :226), which is the shielded
+			-- stormvermin's idle after every stagger (breed_skaven_storm_vermin_with_shield.lua:799) and "to_sword" after
+			-- a shielded clan rat's or marauder's shield breaks (breed_skaven_clan_rat_with_shield.lua:570) (D57 review).
+			stagger_over(fake)
+		end
+
+		-- A recoil the host played is over once it plays anything else.
+		fake.recoil_until = nil
+	end
+
+	-- A recoil the host plays, after another player's block or one left to the host: a stagger that ends it goes
+	-- through BTBlockedAction.leave first (leave_recoil).
+	if breed and is_recoil_anim(breed, anim) then
+		fake = fake or fake_for(unit, breed)
+		fake.recoil_until = pc.now() + RECOIL_HOLD
+	end
+
 	if shooting then
 		if shooting.starts[anim] then
 			fake = fake or fake_for(unit, breed)
@@ -803,11 +865,17 @@ local function track_host_animation(unit, anim)
 
 	fake = fake_for(unit, breed)
 	attack_staggered(fake)
+	sync_shield(unit, fake)
 	fake.stagger = (fake.stagger or 0) + 1
+	leave_recoil(fake, unit, t)
 	fake.stagger_type = stagger_type
 	fake.stagger_anim_done = false
 	fake.staggering_id = fake.stagger
+	fake.stagger_idle_due = true
 	fake.action = action
+	-- The breeds' enter functions add to the stagger's timer, which AiUtils.stagger sets from a duration the host
+	-- doesn't send; without one they stop there (D57 review).
+	fake.stagger_time = t
 	-- The shielded stormvermin's stagger code reads it (breed_skaven_storm_vermin_with_shield.lua:732).
 	fake.current_health_percent = health and health:current_health_percent() or 1
 
@@ -971,7 +1039,18 @@ local function finish_prediction(prediction, reason, catch_up)
 
 	local held = prediction.held
 
-	-- The host never played this reaction, so this screen plays the newest change the host did make.
+	-- The host never played this stagger, so the stand-in isn't staggered by it either: nothing else would end it, and
+	-- while it stays staggered no recoil shows at once and every hit counts the stagger as building (D57 review).
+	if catch_up and not prediction.echo_seen and prediction.kind == "stagger" then
+		local fake = fake_of(prediction.unit)
+
+		if fake and fake.staggering_id == prediction.staggering_id then
+			stagger_over(fake)
+		end
+	end
+
+	-- The host never played this reaction, so this screen plays the newest change the host did make, and the stand-in
+	-- follows it.
 	if catch_up and held and not prediction.echo_seen and Unit.alive(prediction.unit) and Unit.has_animation_state_machine(prediction.unit) then
 		local event = NetworkLookup.anims[held.anim_id]
 
@@ -981,6 +1060,8 @@ local function finish_prediction(prediction, reason, catch_up)
 			animation_system():anim_event(prediction.unit, event, true)
 		end
 
+		measure_host_animation(prediction.unit, event, held.variable_id, held.variable_value)
+		track_host_animation(prediction.unit, event)
 		pc.count("client_held_replayed")
 	end
 
@@ -1158,9 +1239,24 @@ local function work_out_stagger(unit, breed, fake, attacker, damage_profile, tar
 	fake.current_health_percent = health and health:current_health_percent() or 1
 
 	local power_level = hit.can_stagger and hit.power_level or 0
+	-- The host's blackboard.action is the attack the enemy is in, which the game's maths reads (the counter-push trait's
+	-- bonus, damage_utils.lua:641; the attack's ignore_staggers, :795). The stand-in keeps the attack apart, so for the
+	-- call it stands in as the action, unless the enemy is staggered (D57 review, T11).
+	local own_action = fake.action
+
+	fake.action = own_action or fake.attack_action
+
+	sync_shield(unit, fake)
+
 	-- D45: what the maths uses, to compare with the host's "host check maths" line for the same hit (go= is the enemy).
 	local inputs = pc.debug and pc.CHECK_BREEDS[breed.name] and pc.stagger_inputs(unit, fake, attacker, damage_profile, target_index, hit_zone_name, power_level, hit.boost_curve_multiplier, hit.is_critical_strike, hit.blocking, damage_source, t)
-	local stagger_type, duration, length, stagger_value, strength = with_stand_ins(unit, fake, DamageUtils.calculate_stagger_player, ImpactTypeOutput, unit, attacker, hit_zone_name, power_level, hit.boost_curve_multiplier, hit.is_critical_strike, damage_profile, target_index, hit.blocking, damage_source)
+	local ok, stagger_type, duration, length, stagger_value, strength = pcall(with_stand_ins, unit, fake, DamageUtils.calculate_stagger_player, ImpactTypeOutput, unit, attacker, hit_zone_name, power_level, hit.boost_curve_multiplier, hit.is_critical_strike, damage_profile, target_index, hit.blocking, damage_source)
+
+	fake.action = own_action
+
+	if not ok then
+		error(stagger_type, 0)
+	end
 
 	if inputs then
 		local result = type(stagger_type) == "number" and stagger_type or 0
@@ -1181,14 +1277,14 @@ local function work_out_stagger(unit, breed, fake, attacker, damage_profile, tar
 
 	local is_push = damage_profile.is_push and true or false
 	local always_stagger = attack_template.always_stagger and true or false
+	-- AiUtils.stagger refuses these (ai_utils.lua:1117 and :1123), but vanilla's stagger_ai runs the hit's on-stagger
+	-- procs all the same (damage_utils.lua:3639), so they still go to the host, which runs them (stagger, D57 review).
+	local refused = nil
 
-	-- AiUtils.stagger refuses these (ai_utils.lua:1110).
 	if not always_stagger and not is_push and fake.stagger and fake.stagger_type == stagger_types.explosion and stagger_type ~= stagger_types.explosion then
-		return nil, "already blown back"
-	end
-
-	if breed.boss_staggers and stagger_type < stagger_types.explosion then
-		return nil, "boss"
+		refused = "already blown back"
+	elseif breed.boss_staggers and stagger_type < stagger_types.explosion then
+		refused = "boss"
 	end
 
 	local direction = attack_direction
@@ -1205,7 +1301,7 @@ local function work_out_stagger(unit, breed, fake, attacker, damage_profile, tar
 		direction = Vector3.normalize(attacker_position - target_position)
 	end
 
-	return stagger_type, duration or 0, length or 0, stagger_value or 1, direction, attack_template.stagger_animation_scale, always_stagger, is_push
+	return stagger_type, duration or 0, length or 0, stagger_value or 1, direction, attack_template.stagger_animation_scale, always_stagger, is_push, refused
 end
 
 -- Copy of BTStaggerAction._select_animation (bt_stagger_action.lua:115). The host's distance to its destination
@@ -1298,12 +1394,12 @@ local function enter_stagger(unit, breed, fake, attacker, stagger_type, duration
 		fake.stagger = 3
 	end
 
-	local prediction = predictions[unit]
-
 	attack_staggered(fake)
-	fake.blocked = prediction ~= nil and prediction.kind == "recoil" or nil
+	leave_recoil(fake, unit, t)
 	fake.stagger_anim_done = false
 	fake.staggering_id = fake.stagger
+	-- This screen's echo takes the host's idle (reactions.host_animation), so what the host plays after it ends this.
+	fake.stagger_idle_due = nil
 	fake.action = action
 
 	local stagger_anims, idle_event, override_rotation
@@ -1387,11 +1483,28 @@ end
 -- batch: a blast's list of staggers (reactions.new_stagger_batch), which goes to the host after the blast is worked out.
 local function stagger(unit, breed, attacker, damage_profile, profile_name, target_index, hit_zone_name, attack_direction, damage_source_name, t, batch)
 	local fake = fake_for(unit, breed)
-	local stagger_type, duration, length, stagger_value, direction, anim_scale, always_stagger, is_push = work_out_stagger(unit, breed, fake, attacker, damage_profile, target_index, hit_zone_name, attack_direction, damage_source_name, t, profile_name)
+	local stagger_type, duration, length, stagger_value, direction, anim_scale, always_stagger, is_push, refused = work_out_stagger(unit, breed, fake, attacker, damage_profile, target_index, hit_zone_name, attack_direction, damage_source_name, t, profile_name)
 
 	if not stagger_type then
 		pc.count("client_hit_no_stagger")
 		pc.log("client hit enemy=%s profile=%s no stagger: %s%s", breed.name, tostring(profile_name), tostring(duration), type(length) == "number" and string.format(" strength=%.2f", length) or "")
+
+		return
+	end
+
+	-- A stagger AiUtils.stagger refuses: nothing shows, here or on the host, but the host runs the hit's on-stagger procs
+	-- from it, as vanilla's stagger_ai does (damage_utils.lua:3639). An empty animation marks it (HostReactions.lua).
+	if refused then
+		local position = Unit.local_position(unit, 0)
+
+		next_id = next_id + 1
+
+		send("pc_stagger", next_id, pc.network():unit_game_object_id(unit), stagger_type, pc.finite(duration, 3), pc.finite(length, 3), pc.finite(direction.x, 3), pc.finite(direction.y, 3), pc.finite(direction.z, 3),
+			anim_scale and pc.finite(anim_scale, 3) or -1, pc.finite(stagger_value, 3), always_stagger, is_push, "", 0, pc.finite(position.x, 3), pc.finite(position.y, 3), pc.finite(position.z, 3), false, profile_name, target_index or 0,
+			damage_source_name)
+		pc.count("client_hit_no_stagger")
+		pc.count("client_stagger_procs_only")
+		pc.log("client hit enemy=%s profile=%s no stagger: %s, sent for the host's procs", breed.name, tostring(profile_name), refused)
 
 		return
 	end
@@ -1459,7 +1572,8 @@ local function stagger(unit, breed, attacker, damage_profile, profile_name, targ
 
 	local prediction = start_prediction("stagger", id, unit, breed, { anim, idle_event }, true, length, duration * (difficulty_settings.stagger_modifier or 1) + STAGGER_MARGIN, t)
 
-	prediction.opening_event = breed.shield_opening_event
+	-- Which stagger of the stand-in this is, to undo it if the host never plays it (finish_prediction).
+	prediction.staggering_id = fake.staggering_id
 
 	if batch then
 		prediction.echo_deadline = t + BLAST_ECHO_WAIT
@@ -1808,9 +1922,14 @@ end
 
 -- Plays the recoil chosen above, now. The host's copy comes back a ping later and is dropped.
 function reactions.play_recoil(swing, unit, anim)
+	local t = pc.now()
+
 	animation_system():anim_event(unit, anim, true)
 	measure_start(unit, "recoil", anim, 1, swing.breed, swing.attack_anim)
-	start_prediction("recoil", swing.id, unit, swing.breed, { anim }, pc.recoil == "full", 1, RECOIL_HOLD, pc.now())
+	start_prediction("recoil", swing.id, unit, swing.breed, { anim }, pc.recoil == "full", 1, RECOIL_HOLD, t)
+	-- The host's copy of this recoil can outlast this screen's prediction, and a stagger that ends it goes through its
+	-- leave first (leave_recoil).
+	fake_for(unit, swing.breed).recoil_until = t + RECOIL_HOLD
 	pc.count("client_recoil")
 end
 
@@ -1868,9 +1987,11 @@ function reactions.host_animation(go_id, anim_id, variable_id, variable_value)
 			return true
 		end
 
-		-- The event after a stagger is the host's own pick of idle, which for a shielded enemy depends on its shield.
-		-- Play the host's, still as part of the echo.
-		if expected and prediction.kind == "stagger" and prediction.echo_index == 2 and (anim == "idle" or anim == prediction.opening_event) then
+		-- The event after a stagger is the host's own pick of idle, which its enter plays straight after the stagger's
+		-- animation (bt_stagger_action.lua:81), and which for a shielded enemy depends on its shield and stagger count:
+		-- the shielded stormvermin picks one of three (breed_skaven_storm_vermin_with_shield.lua:749). Play the host's,
+		-- still as part of the echo, whatever it is (D57 review).
+		if expected and prediction.kind == "stagger" and prediction.echo_index == 2 and not (covered_breed(unit) and stagger_type_of(covered_breed(unit), anim)) then
 			prediction.echo_index = 3
 
 			animation_system():anim_event(unit, anim, true)
@@ -1913,6 +2034,13 @@ function reactions.movement_message(unit_storage, game_object_id, animation_driv
 	if not animation_driven then
 		if prediction.echo_seen then
 			finish_prediction(prediction, "the host's reaction is over")
+
+			-- Its recoil, if it was one, is over on the host too.
+			local fake = fake_of(unit)
+
+			if fake then
+				fake.recoil_until = nil
+			end
 		end
 
 		return false
