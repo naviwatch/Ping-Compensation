@@ -540,10 +540,20 @@ local function write_summary(reason)
 	end
 end
 
+-- With a plain pcall, not pc.guard, which does nothing once the mod has switched itself off: the mission it switched
+-- itself off in is the one whose summary is worth most (D57 review).
+local function summarise(reason)
+	local ok, problem = pcall(write_summary, reason)
+
+	if not ok then
+		pc.print("could not write the summary: %s", tostring(problem))
+	end
+end
+
 -- VMF calls this when the mods reload and when the game closes.
 mod.on_unload = function (exit_game)
 	if exit_game then
-		pc.guard("exit summary", write_summary, "the game is closing")
+		summarise("the game is closing")
 	end
 
 	pc.timings.save()
@@ -553,7 +563,7 @@ end
 mod.on_game_state_changed = function (status, state_name)
 	if state_name == "StateIngame" then
 		if status == "exit" then
-			pc.guard("mission summary", write_summary, "the mission or keep ended")
+			summarise("the mission or keep ended")
 		end
 
 		clear()

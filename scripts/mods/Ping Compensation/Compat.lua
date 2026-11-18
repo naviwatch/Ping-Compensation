@@ -25,40 +25,25 @@ local TOGGLES = {
 	},
 }
 
--- The breeds whose data the client's maths reads: those whose reactions it decides, and those whose swings it judges.
-local FINGERPRINT_BREEDS = {
-	"beastmen_gor",
-	"beastmen_ungor",
-	"chaos_berzerker",
-	"chaos_fanatic",
-	"chaos_marauder",
-	"chaos_marauder_with_shield",
-	"skaven_clan_rat",
-	"skaven_clan_rat_with_shield",
-	"skaven_plague_monk",
-	"skaven_slave",
-	"skaven_storm_vermin_with_shield",
-	-- Build 4 (D49): the elites, whose sweeps and shoves the client judges (the bulwark's too) and whose reactions it
-	-- decides (all but the bulwark's).
-	"beastmen_bestigor",
-	"beastmen_standard_bearer",
-	"beastmen_standard_bearer_crater",
-	"chaos_bulwark",
-	"chaos_raider",
-	"chaos_raider_tutorial",
-	"chaos_warrior",
-	"skaven_storm_vermin",
-	"skaven_storm_vermin_commander",
-	-- Build 5 (D52): the specials, whose disabling attacks the client judges and whose reactions it decides, and the
-	-- ungor archer.
-	"beastmen_ungor_archer",
-	"chaos_corruptor_sorcerer",
-	"chaos_vortex_sorcerer",
-	"skaven_gutter_runner",
-	"skaven_pack_master",
-	"skaven_poison_wind_globadier",
-	"skaven_ratling_gunner",
-	"skaven_warpfire_thrower",
+-- The breeds whose data the client's maths reads: those whose reactions it decides (pc.REACTION_BREEDS), and every other
+-- enemy whose attacks it judges. The host sends a client the attacks of any enemy that isn't a boss (Host.lua), so those
+-- are every such breed whose behaviour tree has one of these nodes. In game version 6.13 that is the bulwark, the
+-- ethereal skeletons of the wizard's tower map, the sorcerers of the skulking sorcerer mutator and of its Chaos Wastes
+-- curse, the prologue's clan rat and marauder, chaos_skeleton, and the Necromancer's skeletons, which fight only
+-- enemies. They are found from the game's own tables (fingerprint_breeds), so the list keeps up with the game (D57
+-- review: all but the bulwark had been left out of the list written by hand).
+local JUDGED_NODES = {
+	BTAttackAction = true, -- family A
+	BTComboAttackAction = true, -- B
+	BTStormVerminAttackAction = true, -- C
+	BTStormVerminPushAction = true, -- D
+	BTPackMasterAttackAction = true, -- F
+	BTCorruptorGrabAction = true,
+	BTCrazyJumpAction = true,
+	BTRatlingGunnerShootAction = true, -- G
+	BTFireProjectileAction = true,
+	BTThrowPoisonGlobeAction = true, -- H
+	BTWarpfireThrowerShootAction = true,
 }
 
 local BREED_FIELDS = {
@@ -97,6 +82,19 @@ local BREED_FIELDS = {
 	"stagger_threshold_light",
 	"stagger_threshold_medium",
 	"unbreakable_shield",
+	"weapon_reach",
+	"weapon_reach_cone",
+}
+
+-- For an enemy whose reactions the host decides, only the breed fields that judging its attacks reads (Geometry.lua,
+-- Client.lua, HitResults.lua), so a change the host alone makes to the rest can't move every client's hits to the host:
+-- the Chaos Wastes curse sets its sorcerer's health on the host only (mutator_curse_skulking_sorcerer.lua:36).
+local REACH_FIELDS = {
+	"dodge_timer",
+	"player_dodged_cone",
+	"player_dodged_radius",
+	"race",
+	"radius",
 	"weapon_reach",
 	"weapon_reach_cone",
 }
@@ -360,21 +358,74 @@ local function collect_actions(node, list, depth)
 	end
 end
 
-local function feed_breed(out, name)
-	local breed = Breeds[name]
+local function has_judged_node(node, depth)
+	if type(node) ~= "table" or depth > 30 then
+		return false
+	end
 
-	out[#out + 1] = name
+	if JUDGED_NODES[node[1]] then
+		return true
+	end
+
+	for i = 2, #node do
+		if has_judged_node(node[i], depth + 1) then
+			return true
+		end
+	end
+
+	return false
+end
+
+local judged_breeds = nil -- worked out once: the game's breeds and trees don't change while it runs
+
+-- The breeds to fingerprint, sorted by name so every machine feeds them in the same order: { name, decides }, where
+-- decides says this client decides that enemy's reactions.
+local function fingerprint_breeds()
+	if judged_breeds then
+		return judged_breeds
+	end
+
+	local list = {}
+
+	for name, breed in pairs(Breeds) do
+		if type(breed) == "table" and breed.name == name then
+			local decides = pc.REACTION_BREEDS[name] == true
+
+			if decides or not breed.boss and not breed.is_player and has_judged_node(pc.tree_of(breed), 0) then
+				list[#list + 1] = {
+					name = name,
+					decides = decides,
+				}
+			end
+		end
+	end
+
+	table.sort(list, function (a, b)
+		return a.name < b.name
+	end)
+
+	judged_breeds = list
+
+	return list
+end
+
+local function feed_breed(out, entry)
+	local breed = Breeds[entry.name]
+	local fields = entry.decides and BREED_FIELDS or REACH_FIELDS
+
+	out[#out + 1] = entry.name
 
 	if breed then
-		for j = 1, #BREED_FIELDS do
-			out[#out + 1] = BREED_FIELDS[j]
+		for j = 1, #fields do
+			out[#out + 1] = fields[j]
 
-			feed(out, breed[BREED_FIELDS[j]], 0)
+			feed(out, breed[fields[j]], 0)
 		end
 	end
 end
 
-local function feed_breed_actions(out, name)
+local function feed_breed_actions(out, entry)
+	local name = entry.name
 	local behaviors = rawget(_G, "BreedBehaviors")
 	local breed = Breeds[name]
 	local tree = behaviors and breed and breed.behavior and behaviors[breed.behavior]
@@ -406,13 +457,17 @@ end
 
 local SECTION_FEEDERS = {
 	enemies = function (out)
-		for i = 1, #FINGERPRINT_BREEDS do
-			feed_breed(out, FINGERPRINT_BREEDS[i])
+		local breeds = fingerprint_breeds()
+
+		for i = 1, #breeds do
+			feed_breed(out, breeds[i])
 		end
 	end,
 	actions = function (out)
-		for i = 1, #FINGERPRINT_BREEDS do
-			feed_breed_actions(out, FINGERPRINT_BREEDS[i])
+		local breeds = fingerprint_breeds()
+
+		for i = 1, #breeds do
+			feed_breed_actions(out, breeds[i])
 		end
 
 		-- Build 5.1 (D52): the shots' and areas' own data, which the client's judging reads (Shots.lua, Areas.lua).
@@ -479,13 +534,15 @@ function compat.fingerprint()
 	-- One line per enemy type, so the host's and a client's logs show which enemies differ, which points at the mod
 	-- that changes them (2.2 playtest: one client's enemies and attacks differed for an hour, cause unknown).
 	if pc.debug then
-		for i = 1, #FINGERPRINT_BREEDS do
-			local name = FINGERPRINT_BREEDS[i]
-			local enemy_out, action_out = {}, {}
-			local ok_enemy = pcall(feed_breed, enemy_out, name)
-			local ok_actions = pcall(feed_breed_actions, action_out, name)
+		local ok_list, breeds = pcall(fingerprint_breeds)
 
-			pc.log("enemy data breed=%s enemy=%s actions=%s", name, ok_enemy and hash_text(table.concat(enemy_out, "|")) or "error000", ok_actions and hash_text(table.concat(action_out, "|")) or "error000")
+		for i = 1, ok_list and #breeds or 0 do
+			local entry = breeds[i]
+			local enemy_out, action_out = {}, {}
+			local ok_enemy = pcall(feed_breed, enemy_out, entry)
+			local ok_actions = pcall(feed_breed_actions, action_out, entry)
+
+			pc.log("enemy data breed=%s reactions=%s enemy=%s actions=%s", entry.name, entry.decides and "client" or "host", ok_enemy and hash_text(table.concat(enemy_out, "|")) or "error000", ok_actions and hash_text(table.concat(action_out, "|")) or "error000")
 		end
 	end
 

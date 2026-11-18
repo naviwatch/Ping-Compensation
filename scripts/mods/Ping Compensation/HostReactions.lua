@@ -817,7 +817,7 @@ end
 -- an enemy the host sets the flag for the length of BTStaggerAction.enter, so it sends the variable with every stagger
 -- as it does for the others: a client's stagger at the faster speed (forced_animation), the host's own at normal
 -- speed, as vanilla plays it, so a faster value never lingers on any machine. Returns what restore_stagger_flag puts
--- back.
+-- back, which the enter hook does whatever happens in between.
 function host_reactions.force_stagger_flag(node, unit, blackboard)
 	local action = node._tree_node and node._tree_node.action_data
 	local breed = blackboard.breed
@@ -1860,8 +1860,11 @@ mod:hook("BTStaggerAction", "enter", function (func, self, unit, blackboard, t)
 
 	pc.guard("host stagger timing", host_reactions.stagger_entered, self, unit, blackboard, t)
 
+	-- The flag goes back with a plain pcall, not pc.guard, which does nothing if the mod has just switched itself off:
+	-- left on the game's own action table, it would stay until the game closes, changing the host's enemy-data
+	-- fingerprint from the next mission on and overriding the D32 speed-up (D57 review).
 	if flag_ok and saved_flag then
-		pc.guard("host stagger speed flag", host_reactions.restore_stagger_flag, saved_flag)
+		pcall(host_reactions.restore_stagger_flag, saved_flag)
 	end
 
 	if ok and record then
