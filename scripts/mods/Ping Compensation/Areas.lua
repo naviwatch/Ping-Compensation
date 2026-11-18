@@ -1422,6 +1422,18 @@ function areas.acknowledged(go_id, result)
 	end
 end
 
+-- Once the mod has switched itself off on this screen (Client.lua), nothing else would ever end a catch shown at once
+-- that the host hasn't confirmed, so it is undone (D57 review).
+function areas.release_catches(reason)
+	for go_id, record in pairs(catches) do
+		if record.confirmed then
+			catches[go_id] = nil
+		else
+			undo_catch(go_id, record, reason)
+		end
+	end
+end
+
 -- StatusSystem.rpc_status_change_bool from the host (Disablers.lua passes it on). Returns true to drop it: the echo of
 -- a catch this screen shows. The host's later message that throws the player out goes through.
 function areas.status_message(status_id, status_bool, game_object_id, other_object_id)

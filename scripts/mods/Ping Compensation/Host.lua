@@ -1127,10 +1127,25 @@ local function book_shove(swing)
 	return "booked"
 end
 
+-- Family F: the game's own filter for who this disabler can take (ai_utils.lua): the packmaster's and the leech's
+-- nodes check theirs every frame (bt_pack_master_attack_action.lua:59, bt_corruptor_grab_action.lua:83), and the
+-- leap's sphere takes only a player the gutter runner's accepts (bt_crazy_jump_action.lua:425), which alone knows
+-- whether another special has disabled them. The pin that follows checks it too, but lets a downed player through
+-- (bt_target_pounced_action.lua:27), which the sphere never takes (D57 review).
+local function takes_now(kind, attacker, target, blackboard)
+	if kind == "hook" then
+		return AiUtils.is_of_interest_to_packmaster(attacker, target) == true
+	elseif kind == "grab" then
+		return AiUtils.is_of_interest_to_corruptor(attacker, target) == true
+	end
+
+	return AiUtils.is_of_interest_to_gutter_runner(attacker, target, blackboard) == true
+end
+
 -- Family F: a hook, grab or pounce that landed on its target's screen (D52), where it already shows (D53). The
 -- disabler goes on as vanilla does when its own test finds the player: the pull, the grab or the pin. Only while it
--- still can here: alive, not staggered and still in that attack. Either way the client hears of it, and undoes what it
--- showed if the host refused.
+-- still can here: alive, not staggered, still in that attack, and a player the game's filter would take. Either way
+-- the client hears of it, and undoes what it showed if the host refused.
 local function book_disabler(swing)
 	local attacker = swing.attacker
 	local target = swing.target
@@ -1145,6 +1160,8 @@ local function book_disabler(swing)
 		refused = "the special is gone"
 	elseif blackboard.stagger then
 		refused = "the special is staggered"
+	elseif not takes_now(swing.kind, attacker, target, blackboard) then
+		refused = "the game wouldn't take them now"
 	elseif swing.kind == "hook" then
 		if blackboard.active_node ~= BTPackMasterAttackAction or blackboard.action ~= swing.action or blackboard.drag_target_unit ~= target or blackboard.attack_aborted then
 			refused = "the hook was over"

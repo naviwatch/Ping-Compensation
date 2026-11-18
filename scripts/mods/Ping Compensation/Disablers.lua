@@ -229,6 +229,18 @@ function disablers.update()
 	end
 end
 
+-- Once the mod has switched itself off on this screen (Client.lua), nothing else would ever end a grab or pin shown at
+-- once that the host hasn't confirmed, so it is undone; one the host has confirmed is the host's to end (D57 review).
+function disablers.release_all(reason)
+	for _, record in pairs(shown) do
+		if record.confirmed then
+			forget(record)
+		else
+			undo(record, reason)
+		end
+	end
+end
+
 function disablers.clear()
 	shown = {}
 	by_unit = {}

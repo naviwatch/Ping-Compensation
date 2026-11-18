@@ -47,6 +47,7 @@ local LEAP_RADIUS = 1 -- the sphere round a gutter runner's neck (BTCrazyJumpAct
 local SNAP_START = 2.7 -- enter_snap_state_distance (bt_crazy_jump_action.lua:107)
 local SNAP_DISTANCE = 2 -- snap_distance and side_snap_distance (bt_crazy_jump_action.lua:245 and :284)
 local SNAP_SIDE = 1
+local LEAP_TAKE_OFF = 0.3 -- metres a gutter runner's copy moves from where it crouched once its leap is in the air
 local GRAB_ARRIVAL = 2 -- how near its aim point a leech's projectile grabs (BTCorruptorGrabAction.overlap_players)
 local PLAYER_RADIUS = 0.35 -- about a player's width, for judging by shape
 local PLAYER_HEIGHT = 1.8
@@ -69,6 +70,7 @@ local hello_timer = 0
 local host_answered = false -- the host has replied to a hello since this mission started
 local contact_lost = false -- the player has been told the host went quiet
 local reping_timer = 0
+local released_after_break = false -- what this screen showed at once was undone after the mod switched itself off
 
 local local_player_unit = pc.local_player_unit
 
@@ -473,6 +475,33 @@ local function line_of_sight_world(unit)
 	return World.get_data(Unit.world(unit), "physics_world")
 end
 
+-- Family F: whether the game's own filter would let this disabler take this player, from what this screen knows of the
+-- player's state (AiUtils.is_of_interest_to_packmaster, _corruptor and _gutter_runner, ai_utils.lua). The packmaster's
+-- and the leech's nodes check theirs every frame, and the leap's sphere takes only a player the gutter runner's accepts
+-- (bt_crazy_jump_action.lua:425). Whether another special has disabled the player only the host knows, and checks
+-- (Host.lua, takes_now) (D57 review).
+local function can_take(kind, special, target)
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	if not status then
+		return false
+	end
+
+	local pounced = status:is_pounced_down()
+	local pack_master = status:is_grabbed_by_pack_master() and status:get_pack_master_grabber()
+	local corruptor = status:is_grabbed_by_corruptor() and status.corruptor_unit
+
+	if status:is_knocked_down() or status.using_transport or status.is_ledge_hanging or status:is_grabbed_by_chaos_spawn() then
+		return false
+	elseif kind == "hook" then
+		return not pounced and not (pack_master and pack_master ~= special) and not corruptor and status.pack_master_status ~= "pack_master_hanging"
+	elseif kind == "grab" then
+		return not pounced and not pack_master and not (corruptor and corruptor ~= special) and status.pack_master_status ~= "pack_master_hanging"
+	end
+
+	return not pack_master and not corruptor and not (pounced and status:get_pouncer_unit() ~= special)
+end
+
 -- Family F, the packmaster's hook, after its reach and cone (it is unblockable): copy of
 -- BTPackMasterAttackAction.attack_success (bt_pack_master_attack_action.lua:110) on this screen. A dodging player
 -- escapes unless they are still within the hook's dodge angle of the packmaster's facing and its dodge distance; then
@@ -634,7 +663,7 @@ local function judge_grab(swing, unit, target, t)
 	end
 
 	local status = ScriptUnit.has_extension(target, "status_system")
-	local why = grab_misses(swing, unit, target, status)
+	local why = not can_take("grab", unit, target) and "untakeable" or grab_misses(swing, unit, target, status)
 
 	judge_disabler(swing, unit, target, why and "miss" or "hit", why or "landed", Vector3.distance(position(unit), position(target)), t)
 end
@@ -645,6 +674,25 @@ end
 -- unless they side-stepped it: the leap then moves away from them. A leap is aimed once, at launch, and never steers,
 -- so this screen's copy flies the host's arc; the host skips the snap for a modded target (Host.lua).
 local function judge_leap(swing, unit, target, t)
+	-- The game tests the leap only once it is in the air (bt_crazy_jump_action.lua:137 to :163): first the gutter
+	-- runner crouches where it stands for its jump delay (0.3 s), or aligns. Its copy here leaves that spot when the
+	-- host's takes off, so nothing is judged before then (D57 review).
+	if not swing.airborne then
+		local root = Unit.local_position(unit, 0)
+
+		if not swing.crouch_position then
+			swing.crouch_position = Vector3Box(root)
+		end
+
+		if Vector3.distance(root, swing.crouch_position:unbox()) < LEAP_TAKE_OFF then
+			return
+		end
+
+		swing.airborne = true
+
+		pc.log("client swing=%d enemy=%s leap took off here %.3fs after it began", swing.id, swing.breed.name, t - swing.begin_t)
+	end
+
 	local neck = node_position(unit, "j_neck")
 	local previous = swing.last_neck and swing.last_neck:unbox()
 
@@ -652,6 +700,16 @@ local function judge_leap(swing, unit, target, t)
 		swing.last_neck:store(neck)
 	else
 		swing.last_neck = Vector3Box(neck)
+	end
+
+	-- A player the game's filter wouldn't take is passed over, and its target's snap fails, as the host's leap checks
+	-- every frame (bt_crazy_jump_action.lua:118).
+	if not can_take("pounce", unit, target) then
+		if swing.aimed then
+			swing.snap_failed = true
+		end
+
+		return
 	end
 
 	local inside, method = in_leap_sphere(neck, target)
@@ -814,9 +872,10 @@ function client.damage_frame(unit, callback_name)
 		end
 	end
 
-	-- Family F: the hook is unblockable, and has its own rule after its reach and cone: the dodge, then line of sight.
+	-- Family F: the hook is unblockable, and has its own rule after its reach and cone: the dodge, then line of sight,
+	-- for a player the packmaster's node would still take.
 	if family == "F" and result == "hit" then
-		local why = hook_misses(swing, unit, target, status, rotation)
+		local why = not can_take("hook", unit, target) and "untakeable" or hook_misses(swing, unit, target, status, rotation)
 
 		if why then
 			result, reason = "miss", why
@@ -1136,7 +1195,7 @@ mod:hook_safe("LocomotionSystem", "update", function (self, context, t)
 	end
 
 	if next(by_unit) ~= nil then
-		client.after_locomotion(t, context.dt)
+		pc.guard("client facing", client.after_locomotion, t, context.dt)
 	end
 
 	if pc.reactions.active() then
@@ -1276,7 +1335,25 @@ end
 -- Tells the host this client runs the mod, which version, and whether its attacks switch is on. Without a recent
 -- hello the host judges this player as vanilla.
 function client.update(dt)
-	if pc.broken or pc.is_server() or not pc.in_game() then
+	if pc.broken then
+		-- Once the mod has switched itself off, the grabs, pins and catches it showed at once that the host hasn't
+		-- confirmed are undone, once, since nothing else would end them; plain pcalls, as pc.guard does nothing now.
+		if not released_after_break and not pc.is_server() then
+			released_after_break = true
+
+			if pc.disablers then
+				pcall(pc.disablers.release_all, "the mod switched itself off")
+			end
+
+			if pc.areas then
+				pcall(pc.areas.release_catches, "the mod switched itself off")
+			end
+		end
+
+		return
+	end
+
+	if pc.is_server() or not pc.in_game() then
 		return
 	end
 
@@ -1329,6 +1406,7 @@ function client.clear()
 	host_answered = false
 	contact_lost = false
 	reping_timer = 0
+	released_after_break = false
 	own_hit_boxes = {}
 	own_triggers = {}
 
