@@ -367,6 +367,15 @@ function pc.local_player_unit()
 	return unit and Unit.alive(unit) and unit or nil
 end
 
+-- An attacker with the ai_unblockable perk (the "Crushing" grudge mark, buff_settings_grudge_marks.lua:437) can't be
+-- blocked. The game checks it only on the host (DamageUtils.check_block and check_ranged_block, damage_utils.lua:2738
+-- and :2790), so a client that runs a block on its own screen checks it first (D57 review).
+function pc.unblockable(attacker)
+	local buffs = attacker and Unit.alive(attacker) and ScriptUnit.has_extension(attacker, "buff_system")
+
+	return buffs and buffs:has_buff_perk("ai_unblockable") == true or false
+end
+
 local function format_message(format, ...)
 	local ok, message = pcall(string.format, format, ...)
 

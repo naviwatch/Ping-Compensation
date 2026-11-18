@@ -341,7 +341,8 @@ local function book_shot(target, kind, shooter_go_id, result, zone, breed_name)
 end
 
 mod:network_register("pc_shots", function (sender, version, list)
-	if not pc.is_server() or not pc.in_game() or version ~= pc.VERSION or type(list) ~= "string" or #list > MAX_LIST_LENGTH + 50 then
+	-- A host that has switched itself off judges its own shots again, so a client's report would count twice.
+	if pc.broken or not pc.is_server() or not pc.in_game() or version ~= pc.VERSION or type(list) ~= "string" or #list > MAX_LIST_LENGTH + 50 then
 		return
 	end
 
@@ -381,10 +382,11 @@ end)
 
 -- Client -------------------------------------------------------------------------------------------------------------
 
-local aims = {} -- gunner network id -> { node, t, rotation, point, body } while its stream is aimed at this player
+local aims = {} -- gunner network id -> { node, seen, check_t, obscured, last_seen, rotation, point, body, ... } while its stream is aimed at this player
 local turns = {} -- archer network id -> { t, ends_t, turn_speed, rotation, ... } while it aims at this player (D59)
 local arrows = {} -- arrow id -> what this screen knows of it, while it follows the arrow's copy
 local pending = {} -- arrow id -> an announcement whose copy hasn't arrived yet
+local removed = {} -- arrow id -> when this screen removed its copy before the host's own removal of it arrived
 local queued = {} -- shots judged here, waiting to go to the host
 local flush_at = 0
 
@@ -473,7 +475,7 @@ local function judge_shot(kind, owner, target, zone, direction, action_data, arr
 
 	push_player(target, action_data)
 
-	local blocked = DamageUtils.check_ranged_block(owner, target, fatigue_type) == true
+	local blocked = not pc.unblockable(owner) and DamageUtils.check_ranged_block(owner, target, fatigue_type) == true
 
 	queue(kind, go_id, blocked and "blocked" or "hit", zone, breed.name)
 	pc.count("client_shot_" .. kind)
@@ -492,9 +494,12 @@ local function judge_shot(kind, owner, target, zone, direction, action_data, arr
 end
 
 -- A bullet of this client's own copy of a stream hit something this frame (physics_cb_light_weight_projectile_hit).
+-- Returns true when nothing in these hits stops it, so it flies on: the game removes a client's copy at its first hit
+-- of any kind (projectile_system.lua:1694), but the host's own bullet flies on through near-miss capsules, the gunner
+-- itself and the dead (damage_utils.lua:3128 and :3365), and would reach this player's body a frame later (D57 review).
 function shots.client_bullet(projectile_data, hits)
 	if not judging() then
-		return
+		return false
 	end
 
 	local target = pc.local_player_unit()
@@ -502,7 +507,7 @@ function shots.client_bullet(projectile_data, hits)
 	local action_data = projectile_data.action_data
 
 	if not target or not owner or not Unit.alive(owner) or not action_data then
-		return
+		return false
 	end
 
 	local verdict, zone = first_stop(hits, owner, target)
@@ -510,6 +515,8 @@ function shots.client_bullet(projectile_data, hits)
 	if verdict == "player" then
 		judge_shot("bullet", owner, target, zone, projectile_data.direction:unbox(), action_data)
 	end
+
+	return verdict == nil
 end
 
 -- On the target's screen the stream aims at the player's live position by the host's own rule
@@ -527,9 +534,116 @@ end
 
 shots.rotate_from_to = rotate_from_to
 
+local LINE_OF_SIGHT_FILTER = "filter_ai_line_of_sight_check" -- target_selection_utils.lua:1861
+
+local function node_position(target, node_name)
+	return Unit.world_position(target, Unit.has_node(target, node_name) and Unit.node(target, node_name) or 0)
+end
+
+-- The point the gunner looks from, turned towards this player on the flat (target_selection_utils.lua:1897 and :1926).
+local function eye_of(unit, target)
+	local self_position = POSITION_LOOKUP[unit]
+	local flat = Vector3.flat(POSITION_LOOKUP[target] - self_position)
+
+	if Vector3.length_squared(flat) < 0.0001 then
+		return nil
+	end
+
+	local eye = Matrix4x4(0.73776, -0.374671, 0.561545, 0.655785, 0.59515, -0.464481, -0.160177, 0.710927, 0.684781, 0.203595, -0.422035, 0.525395)
+	local pose = Matrix4x4.from_quaternion_position(Quaternion.look(flat, Vector3.up()), self_position)
+
+	return Matrix4x4.translation(Matrix4x4.multiply(eye, pose))
+end
+
+-- A line of sight checked both ways, as the game's double_raycast does (target_selection_utils.lua:1838).
+local function seen_from(physics_world, from, to)
+	local offset = to - from
+	local distance = Vector3.length(offset)
+
+	if distance < 0.001 then
+		return true
+	end
+
+	local direction = offset / distance
+
+	if PhysicsWorld.immediate_raycast(physics_world, from, direction, distance, "closest", "collision_filter", LINE_OF_SIGHT_FILTER) then
+		return false
+	end
+
+	return not PhysicsWorld.immediate_raycast(physics_world, to, -direction, distance, "closest", "collision_filter", LINE_OF_SIGHT_FILTER)
+end
+
+-- target_allowed_for_ratling (target_selection_utils.lua:1887): a downed, hanging or hooked player is never seen.
+local function can_be_targeted(target)
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	return not status or not (status:is_knocked_down() or status:get_is_ledge_hanging() or status:is_ready_for_assisted_respawn() or status:is_hanging_from_hook())
+end
+
+-- The host's check of what the stream aims at, run here for this player (D57 review): BTRatlingGunnerShootAction
+-- ._update_target checks its target every so often (bt_ratling_gunner_shoot_action.lua:340), each time one of the
+-- breed's cast nodes in turn (the chest, then the head), and aims at the node last seen; while none is, at where the
+-- player was last seen (_calculate_wanted_target_position, :391). Returns the node seen, or nil.
+local function check_sight(aim, unit, target, nodes)
+	if not can_be_targeted(target) then
+		return nil
+	end
+
+	local from = eye_of(unit, target)
+
+	if not from then
+		return aim.node
+	end
+
+	aim.cast_index = aim.cast_index % #nodes + 1
+
+	local checked = nodes[aim.cast_index]
+
+	aim.seen[checked] = seen_from(World.get_data(Unit.world(unit), "physics_world"), from, node_position(target, checked))
+
+	for i = 1, #nodes do
+		local name = nodes[(aim.cast_index - i) % #nodes + 1]
+
+		if aim.seen[name] then
+			return name
+		end
+	end
+
+	return nil
+end
+
+-- Where the stream aims this frame, after the check when one is due (the host's timings, :362 to :377).
+local function aim_point(aim, unit, target, breed, t)
+	aim.last_seen = aim.last_seen or Vector3Box(node_position(target, aim.node))
+
+	if t >= aim.check_t then
+		local nodes = breed.line_of_sight_cast_template
+		local seen = (type(nodes) ~= "table" or #nodes == 0) and aim.node or check_sight(aim, unit, target, nodes)
+
+		if seen then
+			if seen ~= aim.node then
+				aim.node_changes = aim.node_changes + 1
+			end
+
+			aim.node = seen
+			aim.obscured = false
+			aim.check_t = t + 0.1 + math.random() * 0.05
+
+			aim.last_seen:store(node_position(target, seen))
+		else
+			aim.obscured = true
+			aim.obscured_checks = aim.obscured_checks + 1
+			aim.check_t = t + 0.5 + math.random() * 0.25
+		end
+	end
+
+	return aim.obscured and aim.last_seen:unbox() or node_position(target, aim.node)
+end
+
 local function update_aim(go_id, aim, target, dt, t)
 	local unit = Managers.state.unit_storage:unit(go_id)
-	local shooter = unit and Unit.alive(unit) and shooter_of(Unit.get_data(unit, "breed"))
+	local breed = unit and Unit.alive(unit) and Unit.get_data(unit, "breed")
+	local shooter = shooter_of(breed)
 	local streams = Managers.state.entity:system("projectile_system")._light_weight.husk_shoot_list
 
 	if not shooter or shooter.kind ~= "bullet" then
@@ -547,15 +661,14 @@ local function update_aim(go_id, aim, target, dt, t)
 	end
 
 	local pivot = POSITION_LOOKUP[unit] + Vector3(0, 0, AIM_PIVOT_HEIGHT)
-	local node = Unit.has_node(target, aim.node) and Unit.node(target, aim.node) or 0
-	local node_position = Unit.world_position(target, node)
-	local offset = node_position - pivot
+	local aimed_at = aim_point(aim, unit, target, breed, t)
+	local offset = aimed_at - pivot
 
 	if Vector3.length_squared(offset) < 0.0001 then
 		return
 	end
 
-	local flat = Vector3.flat(node_position - POSITION_LOOKUP[unit])
+	local flat = Vector3.flat(aimed_at - POSITION_LOOKUP[unit])
 
 	if Vector3.length_squared(flat) > 0.0001 then
 		local body = aim.body and aim.body:unbox() or Unit.local_rotation(unit, 0)
@@ -623,7 +736,7 @@ function shots.stream_stopped(go_id)
 		aims[go_id] = nil
 
 		pc.count("client_streams_aimed")
-		pc.log("client stream go=%d stopped: %d bullets aimed here at this player, body turned here %s", go_id, aim.bullets or 0, tostring(aim.body ~= nil))
+		pc.log("client stream go=%d stopped: %d bullets aimed here at this player, body turned here %s, node now %s (changed %d times), unseen at %d checks", go_id, aim.bullets or 0, tostring(aim.body ~= nil), tostring(aim.node), aim.node_changes or 0, aim.obscured_checks or 0)
 	end
 end
 
@@ -928,6 +1041,12 @@ local function finish_arrow(system, record, why)
 	-- arrow that hit something here disappears where it hit.
 	if projectile and (why ~= "lost" or record.despawned) then
 		system:_remove_light_weight_projectile(data, index)
+
+		-- Removed here first: the host's own removal is dropped when it comes, because the game, finding no copy with
+		-- its id, would remove whichever copy sits at the host's index, another arrow (projectile_system.lua:1258).
+		if not record.despawned then
+			removed[record.id] = pc.now()
+		end
 	end
 
 	if why ~= "hit" then
@@ -1013,6 +1132,13 @@ function shots.update(dt)
 			pc.count("client_arrow_never_seen")
 		end
 	end
+
+	-- The host removes its own arrow within its range's flight time, so its removal comes well before this.
+	for id, removed_t in pairs(removed) do
+		if t - removed_t > MAX_ARROW_TIME then
+			removed[id] = nil
+		end
+	end
 end
 
 function shots.clear()
@@ -1020,6 +1146,7 @@ function shots.clear()
 	turns = {}
 	arrows = {}
 	pending = {}
+	removed = {}
 	queued = {}
 	flush_at = 0
 end
@@ -1034,9 +1161,21 @@ mod:network_register("pc_aim", function (sender, version, go_id, kind, node_name
 	end
 
 	if kind == "stream" then
+		local node = type(node_name) == "string" and node_name ~= "" and node_name or "j_spine"
+		local t = pc.now()
+
+		-- The node the host's stream started on counts as seen, and this screen checks from now on (aim_point).
 		aims[go_id] = {
-			node = type(node_name) == "string" and node_name ~= "" and node_name or "j_spine",
-			t = pc.now(),
+			node = node,
+			seen = {
+				[node] = true,
+			},
+			cast_index = 1,
+			check_t = t + 0.1 + math.random() * 0.05,
+			obscured = false,
+			node_changes = 0,
+			obscured_checks = 0,
+			t = t,
 		}
 
 		pc.count("client_streams_announced")
@@ -1067,7 +1206,11 @@ mod:hook("ProjectileSystem", "physics_cb_light_weight_projectile_hit", function 
 			end
 		end
 	elseif projectile_data.projectile_list_reference then
-		pc.guard("client bullet", shots.client_bullet, projectile_data, hits)
+		local ok, flies_on = pc.guard("client bullet", shots.client_bullet, projectile_data, hits)
+
+		if ok and flies_on then
+			return
+		end
 	end
 
 	return func(self, projectile_data, hits)
@@ -1097,6 +1240,15 @@ mod:hook_safe("ProjectileSystem", "rpc_client_spawn_light_weight_projectile", fu
 end)
 
 mod:hook("ProjectileSystem", "rpc_client_despawn_light_weight_projectile", function (func, self, channel_id, owner_peer_id, index, id)
+	-- An arrow this screen already removed (finish_arrow): dropped even once the mod has switched itself off, since
+	-- the game's fallback would remove another arrow.
+	if not self.is_server and removed[id] then
+		removed[id] = nil
+		pc.count("client_arrow_despawn_dropped")
+
+		return
+	end
+
 	if not self.is_server and not pc.broken and next(arrows) ~= nil then
 		local ok, hold = pc.guard("client arrow despawn", shots.despawn, id)
 

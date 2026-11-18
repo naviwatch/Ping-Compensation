@@ -25,7 +25,6 @@ local stagger_types = pc.stagger_types
 local ECHO_WAIT = 1.5 -- seconds to wait for the host's copy of a reaction before giving up on it
 local BLAST_ECHO_WAIT = 3 -- the same for a blast's stagger, which reaches the host with many others
 local MAX_MESSAGE_LENGTH = 450 -- characters; VMF packs a message's values into one string of at most 500 (mod_manager.lua:626)
-local BLAST_STAGGER_FIELDS = 15 -- values per stagger in pc_blast_staggers
 local STAGGER_MARGIN = 2 -- seconds the position stays ours past the predicted end of a stagger, unless the host moves on
 local RECOIL_HOLD = 2.5 -- the same for a recoil
 local DEAD_MEMORY = 5 -- seconds the host's messages about an enemy killed on this screen are ignored

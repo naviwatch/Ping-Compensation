@@ -382,7 +382,9 @@ local AREA_KINDS = {
 }
 
 mod:network_register("pc_area", function (sender, version, kind, go_id, inside)
-	if not pc.is_server() or not pc.in_game() or version ~= pc.VERSION or not AREA_KINDS[kind] or type(go_id) ~= "number" or type(inside) ~= "boolean" then
+	-- A host that has switched itself off judges its own areas again, so a client's report would count twice; a catch
+	-- gets no answer, so the client undoes it.
+	if pc.broken or not pc.is_server() or not pc.in_game() or version ~= pc.VERSION or not AREA_KINDS[kind] or type(go_id) ~= "number" or type(inside) ~= "boolean" then
 		return
 	end
 
@@ -427,7 +429,9 @@ end)
 -- A warpfire thrower starts firing (_attack_fire), or turns to a new target while it fires (_aim_at_target,
 -- bt_warpfire_thrower_shoot_action.lua:473): every modded player is told, with its target, aimed for that target,
 -- whose own screen turns the thrower. Every modded player's own screen judges the jet for them from now on (T19).
-function areas.announce_jet(unit, blackboard)
+-- retarget: a new target while it fires. One that isn't a live unit yet keeps the earlier announcement, since the
+-- players' screens still run the jet from it, and is announced once it is (D57 review).
+function areas.announce_jet(unit, blackboard, retarget)
 	local target = blackboard and blackboard.target_unit
 	local network = pc.network()
 	local go_id = network:unit_game_object_id(unit)
@@ -440,9 +444,15 @@ function areas.announce_jet(unit, blackboard)
 	end
 
 	if not go_id or not target_go_id then
-		jets_sent[unit] = nil
+		if not retarget then
+			jets_sent[unit] = nil
+		end
 
 		return
+	end
+
+	if retarget then
+		pc.count("host_jets_retargeted")
 	end
 
 	local players = {}
@@ -477,8 +487,7 @@ function areas.jet_retarget(unit, blackboard)
 	local record = jets_sent[unit]
 
 	if record and blackboard and blackboard.target_unit ~= record.target then
-		pc.count("host_jets_retargeted")
-		areas.announce_jet(unit, blackboard)
+		areas.announce_jet(unit, blackboard, true)
 	end
 end
 
@@ -741,10 +750,10 @@ function areas.cloud_update(extension, dt)
 	end
 end
 
--- Ground fire: the line from its first live effect to its last, as the host tests the line from its first blob to its
--- last (damage_blob_extension.lua:606). Returns whether this player is within the blob radius of it on the flat, and
--- whether their height is within that radius of the effect vanilla's own index would pick (:625); nil while the fire
--- has no live effect, when the host's test doesn't run either (:505), so nothing changes.
+-- Ground fire: the line from its first live blob to its last, as the host tests it (damage_blob_extension.lua:606), with
+-- the blobs rebuilt from the effects (add_damage_blob_fx below). Returns whether this player is within the blob radius
+-- of it on the flat, and whether their height is within that radius of the blob vanilla's own index would pick (:625);
+-- nil while the fire has no live blob, when the host's test doesn't run either (:505), so nothing changes.
 local function fire_test(fire, position, t)
 	local points = fire.points
 
@@ -1059,7 +1068,7 @@ local function sweep_jet(unit, jet, own, target)
 		blocking, shield_block = target_status:is_blocking()
 	end
 
-	if target_buffs and target_buffs:has_buff_perk("power_block") and blocking and shield_block and DamageUtils.check_ranged_block(unit, own, "blocked_berzerker") then
+	if target_buffs and target_buffs:has_buff_perk("power_block") and blocking and shield_block and not pc.unblockable(unit) and DamageUtils.check_ranged_block(unit, own, "blocked_berzerker") then
 		pc.count("client_jet_blocked")
 		pc.log("client jet go=%d blocked with a shield", jet.go_id)
 
@@ -1148,7 +1157,7 @@ local function power_blocks(unit, source)
 	local distance = Vector3.length(to_source)
 	local facing = distance < 0.0001 or forward ~= nil and Vector3.dot(forward, to_source / distance) > POWER_BLOCK_DOT
 
-	return facing and DamageUtils.check_ranged_block(source, unit, "blocked_berzerker") == true
+	return facing and not pc.unblockable(source) and DamageUtils.check_ranged_block(source, unit, "blocked_berzerker") == true
 end
 
 -- A tick of a burning on this client's own player (D58), after the game's own tick has played its sound here: the
@@ -1565,11 +1574,19 @@ end)
 -- deals no damage (their screen reports it); on a client, the tick on its own player is shown and reported, after the
 -- game's own tick has played its sound. The game looks these up by name for every tick (buff_extension.lua:794), so
 -- the table entries are hooked. mod:hooks, so everything except the original call runs through pc.guard.
-local function queue_removal(unit, id)
+-- Only this player's own unit: buff ids count per unit (buff_extension.lua:1588), so another player's burning can
+-- carry the same id as this screen's own copy (D57 review).
+local function release_own_burn(unit, buff)
+	if not own_burns[buff.id] or unit ~= pc.local_player_unit() then
+		return
+	end
+
+	own_burns[buff.id] = nil
+
 	local buffs = ScriptUnit.has_extension(unit, "buff_system")
 
 	if buffs then
-		buffs:queue_remove_buff(id)
+		buffs:queue_remove_buff(buff.id)
 	end
 end
 
@@ -1587,11 +1604,7 @@ local function hook_burn_update(functions, name, kind)
 			-- A mod that has switched itself off leaves nothing of its own behind: this screen's own copy of a fire's
 			-- burning, which has no end time, goes at its next tick (removed at the buffs' next update,
 			-- buff_extension.lua:737), and the host's comes again.
-			if own_burns[buff.id] then
-				own_burns[buff.id] = nil
-
-				pcall(queue_removal, unit, buff.id)
-			end
+			pcall(release_own_burn, unit, buff)
 
 			return func(unit, buff, params, world)
 		end
@@ -1674,6 +1687,7 @@ mod:hook_safe("DamageBlobHuskExtension", "init", function (self, extension_init_
 		fires[unit] = {
 			radius = template.blob_radius,
 			life = template.blob_life_time,
+			separation = template.blob_separation_dist or 0,
 			points = {},
 			inside = false,
 			buff_name = template.buff_template_name,
@@ -1682,16 +1696,28 @@ mod:hook_safe("DamageBlobHuskExtension", "init", function (self, extension_init_
 	end
 end)
 
+-- The host places a blob each time its fire has moved blob_separation_dist from the last one, and an effect, the only
+-- thing that reaches this screen, each time it has moved fx_separation_dist (damage_blob_extension.lua:264 and :285;
+-- 2 m and 0.8 m for the warpfire's). So an effect stands in for a blob only once it is that far from the last one
+-- kept, and the line ends where the host's does (D57 review).
 mod:hook_safe("DamageBlobHuskExtension", "add_damage_blob_fx", function (self, position, life_time_percentage)
 	local fire = fires[self.unit]
 
-	if fire then
-		fire.go_id = fire.go_id or go_of(self.unit)
-		fire.points[#fire.points + 1] = {
-			position = Vector3Box(position),
-			dies = pc.now() + (type(life_time_percentage) == "number" and life_time_percentage or 1) * fire.life,
-		}
+	if not fire then
+		return
 	end
+
+	fire.go_id = fire.go_id or go_of(self.unit)
+
+	if fire.last_kept and Vector3.distance_squared(fire.last_kept:unbox(), position) < fire.separation * fire.separation then
+		return
+	end
+
+	fire.last_kept = Vector3Box(position)
+	fire.points[#fire.points + 1] = {
+		position = Vector3Box(position),
+		dies = pc.now() + (type(life_time_percentage) == "number" and life_time_percentage or 1) * fire.life,
+	}
 end)
 
 mod:hook_safe("DamageBlobHuskExtension", "destroy", function (self)

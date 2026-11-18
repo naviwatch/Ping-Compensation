@@ -1201,7 +1201,9 @@ host.player_name = player_name
 -- fingerprint: the client's fingerprint of its enemy data (Compat.lua). Only a client whose enemy data is the host's
 -- decides its own hits (D34); the host and that player are told when that changes.
 mod:network_register("pc_hello", function (sender, version, attacks, fingerprint)
-	if not pc.is_server() then
+	-- A host that has switched itself off no longer applies what its clients decide, so it stops replying: they stop
+	-- judging within pc.PEER_EXPIRY, as they do when they switch themselves off (D57 review, G1-1).
+	if not pc.is_server() or pc.broken then
 		return
 	end
 
