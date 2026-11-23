@@ -7,6 +7,9 @@ local pc = mod.pc
 --     which HealthSystem.rpc_add_damage calls when the host's damage message arrives): damage indicator, flinch,
 --     rumble, the enemy's weapon sound. The host's message for that hit is then dropped, so nothing plays twice.
 --   * Knockback, and the push a blocked swing gives: applied now; the host's copy is dropped.
+--   * Catapults and knock-downs (build 6, D62): the player's own catapulted or knocked-down state starts now; the
+--     host's copy is dropped. A catapult shown here reaches everyone else at once too: the player's own machine sends
+--     it to the host, which passes it on (GenericStatusExtension.set_catapulted, generic_status_extension.lua:1660).
 --   * HP bar: shows an estimate until the host's number arrives. Only the HUD sees it; everything else still reads
 --     the host's HP, which stays the only real one (D7).
 -- Going down and dying stay with the host (T2). Only while the host runs the same build and /pingcomp predict is on.
@@ -19,9 +22,15 @@ local MATCH_WINDOW = 2 -- seconds a shown hit waits for the host's damage messag
 local PUSH_WINDOW = 1.5 -- the same for a knockback
 local RELEASE_DELAY = 0.15 -- the host's HP numbers can trail its damage message by a frame or two
 local SPEED_TOLERANCE = 0.15
+local STATUS_WINDOW = 2 -- seconds a catapult or knock-down shown here waits for the host's copy (D62)
+-- The host works a catapult's direction out from its own positions, and a set upward speed changes its length with the
+-- height between the two, so its copy is matched more loosely than a knockback.
+local CATAPULT_TOLERANCE = 0.3
 
 local pending_hits = {} -- { go_id, source, t } for hits shown here, oldest first
 local pending_pushes = {} -- { speed, limit, t } for knockbacks applied here
+local pending_catapults = {} -- { speed, t } for catapults shown here
+local pending_knock_downs = {} -- { t } for knock-downs shown here
 local estimate = {
 	active = false,
 	total = 0, -- the HP this client expects once the host has booked the hits shown here
@@ -174,8 +183,11 @@ local function shown_health(health)
 	return math.max(current - (shortfall - from_temporary), 0), temporary - from_temporary, max_health
 end
 
-local function push(target, speed, limit, direction, t)
-	if not speed or speed <= 0 then
+-- A knockback the host's copy of will arrive for: applied now, and noted so that copy is dropped.
+local function push_velocity(target, velocity, limit, t)
+	local speed = Vector3.length(velocity)
+
+	if speed <= 0 then
 		return
 	end
 
@@ -191,7 +203,7 @@ local function push(target, speed, limit, direction, t)
 		return
 	end
 
-	locomotion:add_external_velocity(speed * direction, limit)
+	locomotion:add_external_velocity(velocity, limit)
 
 	pending_pushes[#pending_pushes + 1] = {
 		speed = speed,
@@ -200,6 +212,90 @@ local function push(target, speed, limit, direction, t)
 	}
 
 	pc.count("client_push_shown")
+end
+
+local function push(target, speed, limit, direction, t)
+	if not speed or speed <= 0 then
+		return
+	end
+
+	push_velocity(target, speed * direction, limit, t)
+end
+
+-- D62: the player's own catapulted state, now, as the host's StatusUtils.set_catapulted_network would start it a ping
+-- later. Its own setter tells the host, which passes it on to everyone else. Returns whether it was shown.
+function hit_results.catapult(target, velocity, t)
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	-- The setter does nothing for a disabled player (generic_status_extension.lua:1620).
+	if not status or status:is_disabled() then
+		return false
+	end
+
+	status:set_catapulted(true, velocity)
+
+	pending_catapults[#pending_catapults + 1] = {
+		speed = Vector3.length(velocity),
+		t = t,
+	}
+
+	pc.count("client_catapult_shown")
+
+	return true
+end
+
+-- D62: the player's own knocked-down state (a charge's, StatusUtils.set_charged_network, status_utils.lua:168), now.
+-- It ends by itself (player_character_state_charged.lua:93). Returns whether it was shown.
+function hit_results.knock_down(target, t)
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	if not status then
+		return false
+	end
+
+	status:set_charged(true, t)
+
+	pending_knock_downs[#pending_knock_downs + 1] = {
+		t = t,
+	}
+
+	pc.count("client_knock_down_shown")
+
+	return true
+end
+
+-- Family E: an overlap attack's push aside of a player in front of it (BTMeleeOverlapAttackAction.push_close_units,
+-- bt_melee_overlap_attack_action.lua:820), which the host leaves this player out of (question 1 of the build 6 notes,
+-- D69). Applied whatever /pingcomp predict says, as a shot's push is, since nothing else would apply it.
+function hit_results.push_aside(target, velocity)
+	local locomotion = not pc.broken and ScriptUnit.has_extension(target, "locomotion_system")
+
+	if locomotion then
+		locomotion:add_external_velocity(velocity)
+		pc.count("client_pushed_aside")
+	end
+end
+
+-- An overlap attack's push away from the enemy, or its catapult (BTMeleeOverlapAttackAction.push_player,
+-- bt_melee_overlap_attack_action.lua:619), from this screen's positions. Returns what it did, for the log.
+local function shove(unit, target, speed, speed_z, catapult, t)
+	if not speed then
+		return "none"
+	end
+
+	local velocity = speed * Vector3.normalize(position(target) - position(unit))
+
+	if speed_z then
+		Vector3.set_z(velocity, speed_z)
+	end
+
+	if catapult then
+		return hit_results.catapult(target, velocity, t) and "catapult" or "none"
+	end
+
+	push_velocity(target, velocity, nil, t)
+
+	return "push"
 end
 
 local function showing()
@@ -252,7 +348,7 @@ end
 
 -- Called by Client.lua at an elite's sweep or overhead (family C) judged "hit" or "blocked": what the box test does to
 -- this player (bt_storm_vermin_attack_action.lua:420), as the host will book it. The damage, or through a block the
--- blocked damage, and the push, which a block doesn't stop. A catapult still comes from the host, a ping late.
+-- blocked damage, the push, which a block doesn't stop, and from build 6 the catapult (D62).
 function hit_results.box(swing, unit, target, blocked)
 	if not showing() then
 		return
@@ -280,7 +376,80 @@ function hit_results.box(swing, unit, target, blocked)
 		push(target, action.player_push_speed, action.max_player_push_speed, direction, t)
 	end
 
-	pc.log("client swing=%d box %s shown at once: estimate=%.1f push=%s", swing.id, blocked and "block" or "hit", amount, tostring(action.push and action.player_push_speed))
+	-- The catapult (BTStormVerminAttackAction.catapult_enemy, bt_storm_vermin_attack_action.lua:531), through a block
+	-- too, unless the player is knocked down.
+	local catapulted = false
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	if action.catapult and action.shove_speed and status and not status.knocked_down then
+		local velocity = direction * action.shove_speed
+
+		if action.shove_z_speed then
+			Vector3.set_z(velocity, action.shove_z_speed)
+		end
+
+		catapulted = hit_results.catapult(target, velocity, t)
+	end
+
+	pc.log("client swing=%d box %s shown at once: estimate=%.1f push=%s catapult=%s", swing.id, blocked and "block" or "hit", amount, tostring(action.push and action.player_push_speed), tostring(catapulted))
+end
+
+-- Called by Client.lua for a monster's or lord's attack judged "hit", "blocked" or "shield" on this player (family E,
+-- D61): what the host will book for it, at once. An overlap attack (BTMeleeOverlapAttackAction.hit_player,
+-- bt_melee_overlap_attack_action.lua:638): the damage or the blocked damage, and the push or catapult unless the player
+-- is knocked down; after a shield's ranged block only the push. A slam (BTMeleeSlamAction.anim_cb_damage,
+-- bt_melee_slam_action.lua:169): the damage, or the push back after a block with its blocked damage, or after a shield's
+-- block the push alone.
+function hit_results.monster(swing, unit, target, result)
+	if not showing() then
+		return
+	end
+
+	local action = swing.action
+	local direction = Vector3.normalize(position(target) - position(unit))
+	local t = pc.now()
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local knocked_down = status ~= nil and status.knocked_down
+	local amount = 0
+	local moved = "none"
+
+	if swing.kind == "slam" then
+		if result == "hit" then
+			amount = show_damage(swing, unit, target, nil, direction, t)
+		else
+			if action.player_push_speed_blocked then
+				push_velocity(target, action.player_push_speed_blocked * direction, nil, t)
+
+				moved = "push"
+			end
+
+			if result == "blocked" and action.blocked_damage then
+				amount = show_damage(swing, unit, target, action.blocked_damage, direction, t)
+			end
+		end
+	else
+		local attack = swing.attack
+
+		if result == "hit" then
+			amount = show_damage(swing, unit, target, nil, direction, t)
+
+			if not knocked_down then
+				moved = shove(unit, target, attack.player_push_speed, attack.player_push_speed_z, attack.catapult_player, t)
+			end
+		elseif result == "blocked" then
+			if action.blocked_damage then
+				amount = show_damage(swing, unit, target, action.blocked_damage, direction, t)
+			end
+
+			if not knocked_down then
+				moved = shove(unit, target, attack.player_push_speed_blocked, attack.player_push_speed_blocked_z, attack.catapult_player, t)
+			end
+		else
+			moved = shove(unit, target, attack.player_push_speed_blocked, attack.player_push_speed_blocked_z, false, t)
+		end
+	end
+
+	pc.log("client swing=%d %s %s shown at once: estimate=%.1f moved=%s", swing.id, tostring(swing.kind), result, amount, moved)
 end
 
 -- Called by Client.lua at an elite's shove (family D) judged "hit": the damage and the knockback along the enemy's
@@ -479,6 +648,75 @@ function hit_results.push_message(game_object_id, velocity, upper_limit)
 	return false
 end
 
+-- StatusSystem.rpc_set_catapulted from the host for this player. Returns true to drop it: the copy of a catapult this
+-- screen already showed (D62), which would start it again. The host sends a catapult to the hit player alone
+-- (StatusUtils.set_catapulted_network, status_utils.lua:201).
+function hit_results.catapult_message(unit_id, catapulted, velocity)
+	if not catapulted or #pending_catapults == 0 then
+		return false
+	end
+
+	local target = pc.local_player_unit()
+
+	if not target or Managers.state.unit_storage:go_id(target) ~= unit_id then
+		return false
+	end
+
+	local t = pc.now()
+	local speed = velocity and Vector3.length(velocity) or 0
+
+	for i = 1, #pending_catapults do
+		local record = pending_catapults[i]
+
+		if t - record.t <= STATUS_WINDOW and math.abs(speed - record.speed) <= record.speed * CATAPULT_TOLERANCE + 0.5 then
+			table.remove(pending_catapults, i)
+			pc.count("client_catapult_message_dropped")
+			pc.log("client: the host's copy of a catapult shown here dropped, %.3fs later", t - record.t)
+
+			return true
+		end
+	end
+
+	return false
+end
+
+-- StatusSystem.rpc_status_change_bool from the host (Disablers.lua). Returns true to drop it: the copy of a knock-down
+-- this screen already showed (D62).
+function hit_results.status_message(status_id, status_bool, game_object_id)
+	if not status_bool or #pending_knock_downs == 0 or NetworkLookup.statuses[status_id] ~= "charged" then
+		return false
+	end
+
+	local target = pc.local_player_unit()
+
+	if not target or Managers.state.unit_storage:go_id(target) ~= game_object_id then
+		return false
+	end
+
+	local t = pc.now()
+
+	for i = 1, #pending_knock_downs do
+		local record = pending_knock_downs[i]
+
+		if t - record.t <= STATUS_WINDOW then
+			table.remove(pending_knock_downs, i)
+			pc.count("client_knock_down_message_dropped")
+			pc.log("client: the host's copy of a knock-down shown here dropped, %.3fs later", t - record.t)
+
+			return true
+		end
+	end
+
+	return false
+end
+
+local function expire(list, t)
+	while list[1] and t - list[1].t > STATUS_WINDOW do
+		table.remove(list, 1)
+		pc.count("client_status_never_echoed")
+	end
+end
+
 function hit_results.update()
 	local t = pc.now()
 
@@ -490,11 +728,16 @@ function hit_results.update()
 	while pending_pushes[1] and t - pending_pushes[1].t > PUSH_WINDOW do
 		table.remove(pending_pushes, 1)
 	end
+
+	expire(pending_catapults, t)
+	expire(pending_knock_downs, t)
 end
 
 function hit_results.clear()
 	pending_hits = {}
 	pending_pushes = {}
+	pending_catapults = {}
+	pending_knock_downs = {}
 	estimate.active = false
 	estimate.pending = 0
 	estimate.release_t = nil
@@ -517,6 +760,20 @@ mod:hook("HealthSystem", "rpc_add_damage", function (func, self, channel_id, vic
 	end
 
 	return func(self, channel_id, victim_go_id, victim_is_level_unit, attacker_go_id, attacker_is_level_unit, source_attacker_go_id, damage_amount, hit_zone_id, damage_type_id, hit_position, damage_direction, damage_source_id, hit_ragdoll_actor_id, hit_react_type_id, is_dead, ...)
+end)
+
+-- D62: the host's copy of a catapult this screen already showed. A mod:hook, so everything except the original call
+-- runs through pc.guard.
+mod:hook("StatusSystem", "rpc_set_catapulted", function (func, self, channel_id, unit_id, catapulted, velocity, ...)
+	if not pc.is_server() and not pc.broken and #pending_catapults > 0 then
+		local ok, drop = pc.guard("client catapult message", hit_results.catapult_message, unit_id, catapulted, velocity)
+
+		if ok and drop then
+			return
+		end
+	end
+
+	return func(self, channel_id, unit_id, catapulted, velocity, ...)
 end)
 
 mod:hook("LocomotionSystem", "rpc_add_external_velocity", function (func, self, channel_id, game_object_id, velocity)

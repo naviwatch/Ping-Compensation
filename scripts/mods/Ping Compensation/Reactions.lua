@@ -1947,14 +1947,16 @@ function reactions.host_animation(go_id, anim_id, variable_id, variable_value)
 		return true
 	end
 
-	-- A gutter runner pinning this player on this screen while the host's copy still flies or lands (Disablers.lua).
-	if pc.disablers and pc.disablers.holds(unit) then
+	local anim = NetworkLookup.anims[anim_id]
+
+	-- A gutter runner pinning this player on this screen while the host's copy still flies or lands, and a chaos spawn's
+	-- own grab animation, which this screen played as it showed the grab (Disablers.lua, D67).
+	if pc.disablers and pc.disablers.holds(unit, anim) then
 		pc.count("client_grab_animation_held")
 
 		return true
 	end
 
-	local anim = NetworkLookup.anims[anim_id]
 	local prediction = predictions[unit]
 
 	if prediction then

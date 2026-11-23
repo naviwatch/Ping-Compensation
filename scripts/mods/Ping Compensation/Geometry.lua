@@ -76,10 +76,10 @@ function geometry.elite_box(action, position, rotation)
 end
 
 -- The units whose player hit boxes lie in that box, by the game's own query (the same filter the enemy's damage frame
--- uses), as a set.
-function geometry.units_in_box(world, centre, rotation, size)
+-- uses: an elite's, or a monster's overlap attack's own, bt_melee_overlap_attack_action.lua:895), as a set.
+function geometry.units_in_box(world, centre, rotation, size, filter)
 	local physics_world = World.get_data(world, "physics_world")
-	local actors = PhysicsWorld.immediate_overlap(physics_world, "position", centre, "rotation", rotation, "size", size, "shape", "oobb", "types", "dynamics", "collision_filter", "filter_player_hit_box_check")
+	local actors = PhysicsWorld.immediate_overlap(physics_world, "position", centre, "rotation", rotation, "size", size, "shape", "oobb", "types", "dynamics", "collision_filter", filter or "filter_player_hit_box_check")
 	local units = {}
 
 	for _, actor in ipairs(actors or {}) do
@@ -96,16 +96,95 @@ end
 local PLAYER_BOX_RADIUS = 0.35 -- about the width of a player's hit boxes
 local PLAYER_BOX_HEIGHT = 1.8
 
--- The same box test on plain shapes, for when the overlap can't see this player's own hit boxes: an upright cylinder
--- for the player, standing at feet, against the box. Returns whether they meet.
-function geometry.player_in_box(feet, centre, rotation, size)
-	local offset = feet - centre
-	local x = Vector3.dot(offset, Quaternion.right(rotation))
-	local y = Vector3.dot(offset, Quaternion.forward(rotation))
-	local bottom = offset.z
-	local top = offset.z + PLAYER_BOX_HEIGHT
+-- One axis of the box test below: narrows the stretch of the player's core segment, from enter to leave (0 to 1 along
+-- it), that lies within half of the box's centre on that axis. from and step are the segment's start and length on the
+-- axis. Returns nil once nothing is left.
+local function clip_axis(from, step, half, enter, leave)
+	if math.abs(step) < 1e-6 then
+		if math.abs(from) > half then
+			return nil
+		end
 
-	return math.abs(x) <= size.x + PLAYER_BOX_RADIUS and math.abs(y) <= size.y + PLAYER_BOX_RADIUS and top >= -size.z and bottom <= size.z
+		return enter, leave
+	end
+
+	local a = (-half - from) / step
+	local b = (half - from) / step
+
+	if a > b then
+		a, b = b, a
+	end
+
+	enter = math.max(enter, a)
+	leave = math.min(leave, b)
+
+	if enter > leave then
+		return nil
+	end
+
+	return enter, leave
+end
+
+-- The same box test on plain shapes, for when the overlap can't see this player's own hit boxes: the player as an
+-- upright capsule standing at feet, PLAYER_BOX_HEIGHT tall and PLAYER_BOX_RADIUS wide, against the box along the box's
+-- own three axes, so that a tilted box is tested right too: a monster's arm window, which lies along the arm
+-- (BTMeleeOverlapAttackAction.weapon_sweep_overlap, bt_melee_overlap_attack_action.lua:869). The capsule's core segment
+-- is clipped against the box widened by the radius. For an upright box, such as an elite's, that is the same test as an
+-- upright cylinder from the feet to PLAYER_BOX_HEIGHT against the box. Returns whether they meet.
+function geometry.player_in_box(feet, centre, rotation, size)
+	local start = feet + Vector3(0, 0, PLAYER_BOX_RADIUS) - centre
+	local rise = PLAYER_BOX_HEIGHT - 2 * PLAYER_BOX_RADIUS
+	local right = Quaternion.right(rotation)
+	local forward = Quaternion.forward(rotation)
+	local up = Quaternion.up(rotation)
+	local enter, leave = clip_axis(Vector3.dot(start, right), rise * right.z, size.x + PLAYER_BOX_RADIUS, 0, 1)
+
+	if enter then
+		enter, leave = clip_axis(Vector3.dot(start, forward), rise * forward.z, size.y + PLAYER_BOX_RADIUS, enter, leave)
+	end
+
+	if enter then
+		enter = clip_axis(Vector3.dot(start, up), rise * up.z, size.z + PLAYER_BOX_RADIUS, enter, leave)
+	end
+
+	return enter ~= nil
+end
+
+-- Family E, a monster's slam (BTMeleeSlamAction._calculate_collision, bt_melee_slam_action.lua:108), for when the
+-- overlap can't see this player: an upright capsule round centre, radius wide, that reaches half_height above and below
+-- centre, its rounded ends included. The game treats a capsule's size.y so, as the half_height - radius > 0 test before
+-- each capsule overlap shows (bt_melee_slam_action.lua:153, action_geiser.lua:100), and the slam passes its whole height
+-- there. With half_height no more than radius it is a sphere. The player is the upright capsule of player_in_box, and two
+-- upright capsules meet when their core segments come within the sum of their radii. Returns whether they meet.
+function geometry.player_in_capsule(feet, centre, radius, half_height)
+	local core = math.max(half_height - radius, 0)
+	local player_low = feet.z + PLAYER_BOX_RADIUS
+	local player_high = feet.z + PLAYER_BOX_HEIGHT - PLAYER_BOX_RADIUS
+	local gap = math.max(centre.z - core - player_high, player_low - (centre.z + core), 0)
+	local flat = Vector3.length(Vector3.flat(feet - centre))
+	local reach = radius + PLAYER_BOX_RADIUS
+
+	return flat * flat + gap * gap <= reach * reach
+end
+
+-- Copy of the local closest_point_on_line in bt_melee_overlap_attack_action.lua:17: the point of the segment p1 to p2
+-- nearest p, and whether p lies beyond either end.
+function geometry.closest_point_on_line(p, p1, p2)
+	local diff = p - p1
+	local dir = p2 - p1
+	local dot1 = Vector3.dot(diff, dir)
+
+	if dot1 <= 0 then
+		return p1, dot1 < 0
+	end
+
+	local dot2 = Vector3.dot(dir, dir)
+
+	if dot2 <= dot1 then
+		return p2, dot2 < dot1
+	end
+
+	return p1 + dir * (dot1 / dot2), false
 end
 
 mod.pc.geometry = geometry

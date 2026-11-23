@@ -5,7 +5,8 @@ local pc = mod.pc
 --   1. turns its copy of the enemy itself, by the game's own rules, from the player's live position and dodge (for an
 --      elite's sweep, only if this player is the one it attacks),
 --   2. judges the swing on the frame its copy of the enemy fires the damage animation event: reach and cone for single
---      swings, frenzy steps and shoves, the game's box for an elite's sweep or overhead,
+--      swings, frenzy steps and shoves, the game's box for an elite's sweep or overhead, and for a monster's or lord's
+--      attack (family E, build 6) the node's own box, arm sweep or slam capsule, on every modded player's screen,
 --   3. plays its own block at once if it blocked, and sends the result to the host,
 --   4. shows the result at once: the enemy's recoil after a block (Reactions.lua) and, for a hit, the feedback,
 --      knockback and HP estimate (HitResults.lua).
@@ -27,12 +28,15 @@ local MAX_FRAMES = 8
 
 -- The damage frame of each family: A, single swings; B, frenzy combo steps; C, elites' sweeps and overheads; D,
 -- elites' shoves; F, the packmaster's hook. A leech's grab and a gutter runner's pounce, the other disablers of
--- family F, are judged on the frame their projectile or leap reaches the player (judge_grab, judge_leap).
+-- family F, are judged on the frame their projectile or leap reaches the player (judge_grab, judge_leap). E, monsters'
+-- and lords' attacks: an overlap attack's box fires at anim_cb_frenzy_damage too, and its arm's window is judged on
+-- every frame (client.monster_frame, sweep).
 local FRAME_CALLBACKS = {
 	A = "anim_cb_damage",
 	B = "anim_cb_frenzy_damage",
 	C = "anim_cb_damage",
 	D = "anim_cb_stormvermin_push",
+	E = "anim_cb_damage",
 	F = "anim_cb_damage",
 }
 
@@ -42,6 +46,14 @@ local DISABLER_KINDS = {
 	grab = true,
 	pounce = true,
 }
+
+-- Family E (build 6, D61): the kinds of monster and lord attack pc_swing_begin names in step_name. Every modded player's
+-- screen judges its own player; only the screen of the player the enemy attacks turns it.
+local E_KINDS = {
+	overlap = true, -- BTMeleeOverlapAttackAction
+	slam = true, -- BTMeleeSlamAction
+}
+local E_GRACE = 0.5 -- seconds past its attack's own length that a family E swing waits here for its copy's damage frame
 
 local LEAP_RADIUS = 1 -- the sphere round a gutter runner's neck (BTCrazyJumpAction.check_colliding_players)
 local SNAP_START = 2.7 -- enter_snap_state_distance (bt_crazy_jump_action.lua:107)
@@ -370,6 +382,11 @@ function client.after_locomotion(t, dt)
 			finish(swing, "player unit changed")
 		elseif swing.past_damage and t > swing.release_t then
 			forget(swing)
+		elseif swing.family == "E" and not swing.past_damage and t > swing.end_t + E_GRACE then
+			-- The attack is over on this screen and its copy never reached a damage frame here.
+			finish(swing, "attack over")
+		elseif swing.family == "E" then
+			client.update_monster(swing, unit, target, t, dt)
 		elseif swing.family == "B" then
 			update_combo_facing(swing, unit, target, t, dt)
 		elseif swing.family == "C" then
@@ -388,15 +405,18 @@ end
 
 -- The decision half of DamageUtils.check_block (damage_utils.lua:2697), without its host-only parts and without
 -- side effects. It returns whether this player blocks the swing, the numbers the host needs to show the block to the
--- other players, and whether the swing went through a block.
+-- other players, and whether the swing went through a block. A monster's or lord's attack (family E) is blockable
+-- whatever its data says, as its node never reads unblockable, and is blocked from no direction, as its node reads it
+-- from blackboard.attack_anim, which it never sets (bt_melee_overlap_attack_action.lua:640).
 local function would_block(swing, unit, target, status)
 	local action = swing.action
+	local monster = swing.family == "E"
 
-	if action.unblockable or not status then
+	if action.unblockable and not monster or not status then
 		return false
 	end
 
-	local attack_direction = action.attack_directions and action.attack_directions[swing.attack_anim]
+	local attack_direction = not monster and action.attack_directions and action.attack_directions[swing.attack_anim] or nil
 	local is_blocking = status:is_blocking()
 	local can_block, multiplier, improved, direction = status:can_block(unit, attack_direction)
 	local buff_extension = ScriptUnit.has_extension(target, "buff_system")
@@ -421,20 +441,40 @@ local function play_block(swing, unit, status, multiplier, improved, direction)
 	status:blocked_attack(pc.fatigue_type(swing.action, swing.step), unit, multiplier, improved, direction)
 end
 
-local own_hit_boxes = {} -- player unit -> whether the game's overlap finds that unit's own hit boxes on this machine
+local own_hit_boxes = {} -- player unit -> filter and types -> whether the game's overlap finds that unit's own actors here
 
--- Whether the overlap an elite's box test uses can see this player's own hit boxes on this machine. It is checked
--- once per player unit, with a small box around the player, and logged.
-local function overlap_sees(target)
-	local known = own_hit_boxes[target]
+-- Whether the overlap an enemy's attack uses (an elite's box, a monster's box or slam) can see this player's own actors
+-- on this machine. It is checked once per player unit and filter, with a small box around the player, and logged.
+local function overlap_sees(target, filter, types)
+	filter = filter or "filter_player_hit_box_check"
+	types = types or "dynamics"
+
+	local known_here = own_hit_boxes[target]
+
+	if not known_here then
+		known_here = {}
+		own_hit_boxes[target] = known_here
+	end
+
+	local key = filter .. "/" .. types
+	local known = known_here[key]
 
 	if known == nil then
-		local units = pc.geometry.units_in_box(Unit.world(target), position(target) + Vector3(0, 0, 0.9), Quaternion.identity(), Vector3(0.5, 0.5, 0.9))
+		local actors = PhysicsWorld.immediate_overlap(World.get_data(Unit.world(target), "physics_world"), "position", position(target) + Vector3(0, 0, 0.9), "rotation", Quaternion.identity(), "size", Vector3(0.5, 0.5, 0.9), "shape", "oobb", "types", types, "collision_filter", filter)
 
-		known = units[target] == true
-		own_hit_boxes[target] = known
+		known = false
 
-		pc.log("client: the game's overlap %s this player's own hit boxes, so elites' sweeps are judged %s", known and "finds" or "doesn't find", known and "with it" or "by shape")
+		for _, actor in ipairs(actors or {}) do
+			if Actor.unit(actor) == target then
+				known = true
+
+				break
+			end
+		end
+
+		known_here[key] = known
+
+		pc.log("client: the game's overlap with %s (%s) %s this player's own actors, so attacks that use it are judged %s", filter, types, known and "finds" or "doesn't find", known and "with it" or "by shape")
 	end
 
 	return known
@@ -786,10 +826,488 @@ function client.update_disabler(swing, unit, target, t, dt)
 	ease_facing(swing, unit, dt)
 end
 
+-- Family E: the decision half of DamageUtils.check_ranged_block (damage_utils.lua:2773) for this player, without its
+-- side effects: blocking in the inner arc with a weapon that blocks ranged attacks, or against an enemy whose attacks a
+-- block stops anyway. The game checks the attacker's ai_unblockable there only on the host, so it is checked here first
+-- (pc.unblockable).
+local function would_shield_block(unit, target, status)
+	if not status or pc.unblockable(unit) or not status:is_blocking() then
+		return false
+	end
+
+	local can_block, _, improved = status:can_block(unit)
+
+	if not can_block or not improved then
+		return false
+	end
+
+	local inventory = ScriptUnit.has_extension(target, "inventory_system")
+	local weapon = inventory and inventory:get_wielded_slot_item_template()
+	local breed = Unit.get_data(unit, "breed")
+
+	return weapon ~= nil and (weapon.can_block_ranged_attacks or breed and breed.blockable_ranged_attack) and true or false
+end
+
+-- Family E: the facing this screen judges an attack with: its own while it turns the enemy, else the copy's.
+local function monster_rotation(swing, unit)
+	if pc.facing and swing.aimed and swing.facing_ours then
+		return swing.current:unbox(), "client"
+	end
+
+	return Unit.local_rotation(unit, 0), "host"
+end
+
+-- Family E1: copy of the players' half of BTMeleeOverlapAttackAction.push_close_units (bt_melee_overlap_attack_action
+-- .lua:765) for this player, on this screen: one standing in front of the attack, within its push width of the line
+-- ahead of it, is pushed aside unless knocked down. The host leaves modded players out of its own (question 1 of the
+-- build 6 notes, D69), so this sends nothing.
+local function push_aside(swing, unit, target, data)
+	if type(data) ~= "table" or type(data.player_pushed_speed) ~= "number" then
+		return
+	end
+
+	local forward = Quaternion.forward((monster_rotation(swing, unit)))
+	local push_position = position(unit) + forward * (data.push_forward_offset or 0)
+	local ahead = data.ahead_dist or 0
+	local width = data.push_width or 0
+	local radius = math.max(width, ahead) * 1.5
+	local target_position = position(target)
+	local to_target = target_position - push_position
+
+	if Vector3.length_squared(to_target) >= radius * radius then
+		return
+	end
+
+	local projected, outside = pc.geometry.closest_point_on_line(target_position, push_position, push_position + forward * ahead)
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	if outside or Vector3.length_squared(target_position - projected) >= width * width or not status or status.knocked_down then
+		return
+	end
+
+	pc.hit_results.push_aside(target, data.player_pushed_speed * Vector3.normalize(to_target))
+	pc.log("client swing=%d enemy=%s pushed this player aside", swing.id, swing.breed.name)
+end
+
+-- Family E1: copy of BTMeleeOverlapAttackAction.run's turning (bt_melee_overlap_attack_action.lua:498 to :536), fed
+-- from this player's live state, on the screen of the player the enemy attacks. It turns towards them until the
+-- attack's rotation time runs out, counted again from the end of a blended start, and a dodge stops it for good unless
+-- the attack ignores dodging. Then an animation-driven attack's animation turns it (:533), so the facing goes back to
+-- the host; any other keeps the facing it has (:530). An attack with its own rotation_speed lerps at it; an
+-- animation-driven one without snaps, as the locomotion's lerp is off for it (:221); the others turn at T18's speed.
+local function update_overlap_facing(swing, unit, target, t, dt, status)
+	local attack = swing.attack
+
+	if swing.blend_end_t and t > swing.blend_end_t then
+		local rotation_time = type(attack.rotation_time) == "number" and attack.rotation_time or 0
+
+		swing.blend_end_t = nil
+		swing.rotation_timer = t + rotation_time
+		swing.facing_ours = rotation_time > 0
+	end
+
+	if not swing.facing_ours then
+		return
+	end
+
+	if swing.rotation_timer then
+		if t < swing.rotation_timer and status and not status:is_invisible() and (attack.ignores_dodging or not is_dodging(status)) then
+			local rotation = flat_rotation(Unit.local_position(unit, 0), Unit.local_position(target, 0))
+
+			if rotation then
+				swing.wanted:store(rotation)
+			end
+		else
+			swing.rotation_timer = nil
+
+			if swing.anim_driven then
+				swing.facing_ours = false
+
+				return
+			end
+
+			swing.wanted:store(swing.current:unbox())
+		end
+	end
+
+	local speed = attack.rotation_speed or swing.anim_driven and math.huge or swing.turn_speed or ROTATION_SPEED
+	local step = speed * dt
+	local rotation = step >= 1 and swing.wanted:unbox() or Quaternion.lerp(swing.current:unbox(), swing.wanted:unbox(), step)
+
+	swing.current:store(rotation)
+
+	if pc.facing then
+		Unit.set_local_rotation(unit, 0, rotation)
+	end
+end
+
+-- Family E2: copy of BTMeleeSlamAction.run's turning (bt_melee_slam_action.lua:244): towards the player every frame
+-- until the damage frame, unless the slam is animation-driven.
+local function update_slam_facing(swing, unit, target, dt)
+	if not swing.past_damage then
+		local rotation = flat_rotation(Unit.local_position(unit, 0), Unit.local_position(target, 0))
+
+		if rotation then
+			swing.wanted:store(rotation)
+		end
+	end
+
+	ease_facing(swing, unit, dt)
+end
+
+-- Family E1: whether this player is in an overlap attack's box on this screen, with the game's own overlap and the
+-- attack's own filter where it sees this player's hit boxes, else with plain shapes.
+local function in_monster_box(swing, unit, target, centre, box_rotation, size)
+	local filter = swing.attack.hit_only_players and "filter_player_hit_box_check" or "filter_player_and_enemy_hit_box_check"
+
+	if overlap_sees(target, filter, "dynamics") then
+		swing.box_method = "overlap"
+
+		return pc.geometry.units_in_box(Unit.world(unit), centre, box_rotation, size, filter)[target] == true
+	end
+
+	swing.box_method = "shape"
+
+	return pc.geometry.player_in_box(position(target), centre, box_rotation, size)
+end
+
+-- Family E2: the slam's capsule on this screen (BTMeleeSlamAction._calculate_collision and anim_cb_damage,
+-- bt_melee_slam_action.lua:108 and :140), by the game's own overlap where it finds this player, else by shape, then its
+-- dodge: a player with the dodge flag up (the raw flag, not the dodge count, :173) and farther from its centre on the
+-- flat than its dodge_mitigation_radius escapes. Returns nil if it reaches them, else why not.
+local function slam_misses(swing, unit, target, rotation)
+	local action = swing.action
+	local radius = action.radius or 0
+	local height = action.height or 0
+	local self_position = position(unit)
+	local centre = self_position + Quaternion.forward(rotation) * (action.forward_offset or 0) + Vector3(0, 0, height * 0.5)
+	local inside = false
+
+	if overlap_sees(target, "filter_rat_ogre_melee_slam", "both") then
+		local size = Vector3(radius, height, radius)
+		local shape = size.y - size.x > 0 and "capsule" or "sphere"
+		local actors = PhysicsWorld.immediate_overlap(World.get_data(Unit.world(unit), "physics_world"), "shape", shape, "position", centre, "rotation", Quaternion.look(Vector3.up(), Vector3.up()), "size", size, "types", "both", "collision_filter", "filter_rat_ogre_melee_slam")
+
+		for _, actor in ipairs(actors or {}) do
+			if Actor.unit(actor) == target then
+				inside = true
+
+				break
+			end
+		end
+
+		swing.box_method = "overlap"
+	else
+		-- The capsule's size.y, its height, is half its whole length (Geometry.lua).
+		inside = pc.geometry.player_in_capsule(position(target), centre, radius, height)
+		swing.box_method = "shape"
+	end
+
+	if not inside then
+		return "capsule"
+	end
+
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	if status and status.is_dodging and Vector3.length_squared(Vector3.flat(position(target) - centre)) > (action.dodge_mitigation_radius_squared or 0) then
+		return "dodged"
+	end
+
+	return nil
+end
+
+-- Family E: the distance to this player and the angle from the facing, for the answer and the log.
+local function distance_and_angle(unit, target, rotation)
+	local offset = position(target) - position(unit)
+	local flat = Vector3.flat(offset)
+	local cosine = Vector3.length_squared(flat) > 0 and Vector3.dot(Vector3.normalize(flat), Vector3.normalize(Vector3.flat(Quaternion.forward(rotation)))) or 1
+
+	return Vector3.length(offset), math.deg(math.acos(math.max(-1, math.min(1, cosine))))
+end
+
+-- Family E: the verdict at one frame of this screen's copy, in the node's own order. An overlap attack: the melee
+-- block, then a shield's ranged block unless the attack ignores it (bt_melee_overlap_attack_action.lua:643); a slam: a
+-- disabled player is hit, then the shield's block, then the melee block (bt_melee_slam_action.lua:180 to :187). The
+-- answer goes out before the local effects, so a problem in those can't leave the host without one.
+local function monster_verdict(swing, unit, target, frame, miss_reason, rotation, facing, t)
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local result, reason = "hit", "landed"
+	local multiplier, improved, direction, through_block
+	local distance, angle = distance_and_angle(unit, target, rotation)
+
+	swing.frames = math.max(swing.frames, frame)
+	swing.past_damage = true
+	swing.release_t = math.max(t + FACING_HOLD, swing.end_t or 0)
+
+	if miss_reason then
+		result, reason = "miss", miss_reason
+	elseif swing.kind == "slam" and status and status:is_disabled() then
+		reason = "disabled"
+	elseif swing.kind == "slam" and would_shield_block(unit, target, status) then
+		result, reason = "shield", "shield"
+	else
+		local blocked
+
+		blocked, multiplier, improved, direction, through_block = would_block(swing, unit, target, status)
+
+		if blocked then
+			result, reason = "blocked", improved and "in arc" or "outer arc"
+
+			if swing.kind == "overlap" and not swing.action.ignore_shield_block and would_shield_block(unit, target, status) then
+				result, reason = "shield", "shield"
+			end
+		elseif through_block then
+			reason = "through block"
+		end
+	end
+
+	pc.count("client_judged")
+	pc.count("client_judged_E")
+	pc.count("client_judged_E_" .. tostring(swing.kind))
+	pc.count(result == "miss" and "client_miss_" .. reason or "client_" .. result)
+
+	if not swing.aimed then
+		pc.count("client_judged_E_not_aimed")
+	end
+
+	send_answer(swing, frame, result, multiplier, improved, direction, through_block, distance, angle)
+
+	if result == "blocked" or result == "shield" then
+		-- A slam's shield block is the shield's alone; an overlap attack's is its melee block, then the shield's.
+		if not (swing.kind == "slam" and result == "shield") then
+			play_block(swing, unit, status, multiplier, improved, direction)
+		end
+
+		-- Plays the shield's block here and tells the host, as the game's own call does on a client (damage_utils.lua:2821).
+		if result == "shield" then
+			pc.guard("client shield block", DamageUtils.check_ranged_block, unit, target, swing.action.shield_blocked_fatigue_type or "shield_blocked_slam")
+		end
+	end
+
+	if result ~= "miss" then
+		pc.guard("client monster results", pc.hit_results.monster, swing, unit, target, result)
+
+		-- The chaos spawn's grab (D67): its hit_player_func grabs a player it hit or who blocked it, unless they are
+		-- disabled or invisible (breed_chaos_spawn.lua:863), and this screen shows it at once (D53).
+		if swing.grab and result ~= "shield" and status and not status:is_disabled() and not status:is_invisible() then
+			pc.guard("client grab shown", pc.disablers.start, swing, unit, target, "spawn")
+		end
+	end
+
+	if pc.debug then
+		pc.log("client swing=%d enemy=%s attack=%s frame=%d verdict=%s reason=%s distance=%.2f angle=%.1f facing=%s since_begin=%.3fs dodging=%s effective=%s dodged_in_swing=%s family=E:%s aimed=%s turn=%s method=%s window=%s",
+			swing.id, swing.breed.name, swing.action_name, frame, result, reason, distance, angle, facing, t - swing.begin_t, tostring(status ~= nil and status.is_dodging == true), tostring(status ~= nil and status:get_is_dodging() and true or false),
+			tostring(swing.dodged == true), tostring(swing.kind), tostring(swing.aimed == true), tostring(swing.attack and swing.attack.rotation_speed or swing.turn_speed), tostring(swing.box_method), swing.window and "arm" or "none")
+	end
+end
+
+-- Family E1: an arm's window closed on this screen without reaching this player.
+local function close_window(swing, unit, target, reason)
+	local window = swing.window
+
+	if window.over then
+		return
+	end
+
+	window.over = true
+
+	local rotation, facing = monster_rotation(swing, unit)
+
+	monster_verdict(swing, unit, target, 1, reason, rotation, facing, pc.now())
+end
+
+-- Family E1: copy of BTMeleeOverlapAttackAction.weapon_sweep_overlap (bt_melee_overlap_attack_action.lua:827) on this
+-- screen's copy, every frame of an attack's window: a box along its arm or weapon, from base_node_name to tip_node_name,
+-- widened by how far the tip moved since the last frame. The window opens at its start_time and closes at the copy's own
+-- anim_cb_attack_overlap_done (:968) or when the attack is over. It is answered once, as frame 1: when the box first
+-- reaches this player, or as a miss when it closes.
+local function sweep(swing, unit, target, t)
+	local window = swing.window
+
+	if t < window.start_t then
+		return
+	end
+
+	if t > swing.end_t then
+		close_window(swing, unit, target, "window over")
+
+		return
+	end
+
+	if not window.base_node then
+		if type(window.base_name) ~= "string" or type(window.tip_name) ~= "string" or not Unit.has_node(unit, window.base_name) or not Unit.has_node(unit, window.tip_name) then
+			window.over = true
+			swing.frames = 1
+			swing.past_damage = true
+			swing.release_t = t + FACING_HOLD
+
+			pc.count("client_unjudged")
+			pc.print("client swing=%d enemy=%s: its copy has no %s or %s, so its window isn't judged", swing.id, swing.breed.name, tostring(window.base_name), tostring(window.tip_name))
+			send_answer(swing, 1, "unjudged")
+
+			return
+		end
+
+		window.base_node = Unit.node(unit, window.base_name)
+		window.tip_node = Unit.node(unit, window.tip_name)
+	end
+
+	local attack = swing.attack
+	local tip = Unit.world_position(unit, window.tip_node)
+	local to_old = window.tip and window.tip:unbox() - tip or Vector3.zero()
+
+	if window.tip then
+		window.tip:store(tip)
+	else
+		window.tip = Vector3Box(tip)
+	end
+
+	local base = Unit.world_position(unit, window.base_node)
+	local half_range = (attack.range or 0) * 0.5
+	local half_height = (attack.height or 0) * 0.5
+	local size = Vector3(((attack.width or 0) + Vector3.length(to_old)) * 0.5, half_range, half_height)
+	local base_to_tip = tip - base
+	local box_rotation, up, forward
+
+	if window.base_node == window.tip_node then
+		box_rotation = Unit.local_rotation(unit, window.base_node)
+		up = Quaternion.up(box_rotation) * ((attack.offset_up or 0) + half_height)
+		forward = Quaternion.forward(box_rotation) * ((attack.offset_forward or 0) + half_range)
+	else
+		box_rotation = Quaternion.look(base_to_tip, Vector3.up())
+		up = Quaternion.up(box_rotation) * (attack.offset_up or 0)
+		forward = Quaternion.forward(box_rotation) * (attack.offset_forward or 0)
+	end
+
+	local centre = base + base_to_tip * 0.5 + up + forward + to_old * 0.5
+
+	-- A player behind the enemy is passed over (:937).
+	if attack.ignore_targets_behind and Vector3.dot(Vector3.normalize(position(target) - position(unit)), Quaternion.forward(Unit.local_rotation(unit, 0))) <= 0 then
+		return
+	end
+
+	if in_monster_box(swing, unit, target, centre, box_rotation, size) then
+		window.over = true
+
+		local rotation, facing = monster_rotation(swing, unit)
+
+		monster_verdict(swing, unit, target, 1, nil, rotation, facing, t)
+	end
+end
+
+-- Family E, every frame after LocomotionSystem.update: the screen of the player the enemy attacks turns it; every
+-- screen pushes its own player aside where the attack does so every frame, and sweeps an arm's window.
+function client.update_monster(swing, unit, target, t, dt)
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	note_dodges(swing, status)
+
+	if swing.kind == "slam" then
+		if swing.aimed and swing.facing_ours then
+			update_slam_facing(swing, unit, target, dt)
+		end
+
+		return
+	end
+
+	if swing.aimed then
+		update_overlap_facing(swing, unit, target, t, dt, status)
+	end
+
+	local continuous = swing.attack.push_units_in_the_way_continuous
+
+	if continuous and t <= swing.end_t then
+		push_aside(swing, unit, target, continuous)
+	end
+
+	if swing.window and not swing.window.over then
+		sweep(swing, unit, target, t)
+	end
+end
+
+-- Family E: a damage frame of this screen's copy. An overlap attack's box in front fires at anim_cb_damage and at
+-- anim_cb_frenzy_damage alike (bt_melee_overlap_attack_action.lua:718), each a frame of its own, after the window's if
+-- the attack has one; a slam's capsule fires once, at anim_cb_damage.
+function client.monster_frame(swing, unit, callback_name)
+	local target = local_player_unit()
+
+	if target ~= swing.target or callback_name ~= "anim_cb_damage" and not (callback_name == "anim_cb_frenzy_damage" and swing.kind == "overlap") then
+		return
+	end
+
+	local t = pc.now()
+	local rotation, facing = monster_rotation(swing, unit)
+
+	if swing.kind == "slam" then
+		if swing.box_frames == 0 then
+			swing.box_frames = 1
+
+			monster_verdict(swing, unit, target, 1, slam_misses(swing, unit, target, rotation), rotation, facing, t)
+		end
+
+		return
+	end
+
+	-- After its damage_done_time the host's node stops testing unless an arm's window is still open (:540), so a damage
+	-- event that late is no frame there.
+	if swing.done_t and t > swing.done_t and not (swing.window and not swing.window.over) then
+		pc.log("client swing=%d enemy=%s fired a damage event after its damage_done_time; not judged", swing.id, swing.breed.name)
+
+		return
+	end
+
+	local frame = swing.box_frames + 1 + (swing.window and 1 or 0)
+
+	if frame > MAX_FRAMES then
+		return
+	end
+
+	swing.box_frames = swing.box_frames + 1
+
+	local attack = swing.attack
+	local miss_reason = nil
+
+	-- The box in front (:722), the same box as an elite's (Geometry.lua), passing over a player behind (:937).
+	if attack.ignore_targets_behind and Vector3.dot(Vector3.normalize(position(target) - position(unit)), Quaternion.forward(rotation)) <= 0 then
+		miss_reason = "behind"
+	else
+		local centre, box_rotation, size = pc.geometry.elite_box(attack, Unit.local_position(unit, 0), rotation)
+
+		if not in_monster_box(swing, unit, target, centre, box_rotation, size) then
+			miss_reason = "box"
+		end
+	end
+
+	monster_verdict(swing, unit, target, frame, miss_reason, rotation, facing, t)
+
+	-- Some attacks push players aside at each damage frame too (:758).
+	if attack.push_close_units_during_attack and attack.push_units_in_the_way then
+		push_aside(swing, unit, target, attack.push_units_in_the_way)
+	end
+end
+
+-- The copy's anim_cb_attack_overlap_done (bt_melee_overlap_attack_action.lua:968), from the animation callback hook in
+-- Ping Compensation.lua: an arm's window is over on this screen.
+function client.window_done(unit)
+	local swing = by_unit[unit]
+	local target = local_player_unit()
+
+	if swing and swing.family == "E" and swing.window and not swing.window.over and target == swing.target then
+		close_window(swing, unit, target, "arm")
+	end
+end
+
 -- Called from the AnimationSystem.animation_callback hook when an enemy copy fires the damage frame of the swing it
 -- has open at this player: anim_cb_damage (families A and C), anim_cb_frenzy_damage (B) or anim_cb_stormvermin_push (D).
 function client.damage_frame(unit, callback_name)
 	local swing = by_unit[unit]
+
+	-- A monster's or lord's attack (family E) has damage frames of its own kind.
+	if swing and swing.family == "E" then
+		client.monster_frame(swing, unit, callback_name)
+
+		return
+	end
 
 	-- A leech's damage frame only sends its projectile off; its grab is judged when that arrives (judge_grab).
 	if swing and (FRAME_CALLBACKS[swing.family] ~= callback_name or swing.family == "F" and swing.kind ~= "hook") then
@@ -971,6 +1489,27 @@ local function names(list, name)
 	return false
 end
 
+-- Family E: the animations an overlap attack or a slam plays as part of itself, whichever of them the host picked.
+local function own_attack_anim(swing, event)
+	local attack = swing.attack
+
+	if attack then
+		if names(attack.attack_anim, event) then
+			return true
+		end
+
+		if type(attack.multi_attack_anims) == "table" then
+			for _, anim in pairs(attack.multi_attack_anims) do
+				if anim == event then
+					return true
+				end
+			end
+		end
+	end
+
+	return names(swing.action.attack_anim, event)
+end
+
 function client.animation_changed(go_id, anim_id)
 	local swing = by_go_id[go_id]
 
@@ -981,6 +1520,12 @@ function client.animation_changed(go_id, anim_id)
 	local event = NetworkLookup.anims[anim_id]
 
 	if event == swing.attack_anim then
+		return
+	end
+
+	-- Family E: another of the attack's own animations, the host's copy of what this screen plays (a slam is announced
+	-- with the animation the host noted last, Host.lua).
+	if swing.family == "E" and own_attack_anim(swing, event) then
 		return
 	end
 
@@ -1028,7 +1573,9 @@ end
 function client.pushed(attacker_go_id, hit_go_id, shield_blocked)
 	local swing = by_go_id[hit_go_id]
 
-	if not swing or swing.past_damage then
+	-- A monster isn't staggered by a push (only explosions stagger it, boss_staggers, damage_utils.lua:791), and a lord's
+	-- staggers follow rules of their own, so a family E swing goes on; a stagger the host does play cuts it as it arrives.
+	if not swing or swing.past_damage or swing.family == "E" then
 		return
 	end
 
@@ -1066,11 +1613,97 @@ function client.reaction_started(unit, reason)
 	end
 end
 
+-- Family E1: the overlap attack the host chose, by its place in the action's attacks, negative in its running_attacks.
+local function overlap_attack(action, index)
+	if type(index) ~= "number" or index == 0 or index ~= math.floor(index) then
+		return nil
+	end
+
+	local list = index > 0 and action.attacks or action.running_attacks
+	local attack = type(list) == "table" and list[math.abs(index)]
+
+	return type(attack) == "table" and attack or nil
+end
+
+-- Family E: what this screen needs to follow the attack, from its own copy of the data: an overlap attack's turning,
+-- length and window (BTMeleeOverlapAttackAction._init_attack, bt_melee_overlap_attack_action.lua:161 to :259), a slam's
+-- (BTMeleeSlamAction.init_attack, bt_melee_slam_action.lua:44).
+local function init_monster(swing, t)
+	local action = swing.action
+	local attack = swing.attack
+
+	swing.box_frames = 0 -- damage frames of this screen's copy so far
+	swing.grab = pc.GRAB_ATTACKS[swing.action_name] == true -- the chaos spawn's grab (D67)
+
+	if swing.kind == "slam" then
+		local anim_driven = action.anim_driven == true
+
+		if type(action.attack_anims) == "table" then
+			for _, entry in pairs(action.attack_anims) do
+				if type(entry) == "table" and entry[1] == swing.attack_anim and entry[2] then
+					anim_driven = true
+				end
+			end
+		end
+
+		swing.anim_driven = anim_driven
+		swing.facing_ours = not anim_driven
+		swing.end_t = t + (type(action.attack_time) == "number" and action.attack_time or 0)
+
+		return
+	end
+
+	local anim_driven = attack.anim_driven == true
+	local rotation_time = type(attack.rotation_time) == "number" and attack.rotation_time or 0
+	local multi = attack.multi_attack_anims
+
+	-- A side animation of multi_attack_anims turns the enemy itself (:170).
+	if type(multi) == "table" then
+		if swing.attack_anim == multi.fwd then
+			anim_driven = false
+		else
+			anim_driven = true
+			rotation_time = 0
+		end
+	end
+
+	swing.anim_driven = anim_driven
+	swing.rotation_timer = t + rotation_time
+	swing.facing_ours = rotation_time > 0
+	swing.blend_end_t = anim_driven and type(attack.blend_time) == "number" and t + attack.blend_time or nil
+	swing.end_t = t + (type(attack.attack_time) == "number" and attack.attack_time or 0)
+
+	local done = attack.damage_done_time
+
+	if type(done) == "table" then
+		done = done[swing.attack_anim]
+	end
+
+	swing.done_t = type(done) == "number" and t + done or nil
+
+	local window = type(attack.continious_overlap) == "table" and attack.continious_overlap[swing.attack_anim]
+
+	if type(window) == "table" then
+		-- No attack in the game data uses one (6.13); its nodes would be the weapon's, not the enemy's (:233).
+		if window.use_inventory_unit then
+			pc.log("client swing=%d enemy=%s: its window uses an inventory unit, so the enemy's own nodes are tried", swing.id, swing.breed.name)
+		end
+
+		swing.window = {
+			start_t = t + (type(window.start_time) == "number" and window.start_time or 0),
+			base_name = window.base_node_name,
+			tip_name = window.tip_node_name,
+		}
+	end
+end
+
 -- family: "A" for a single swing (BTAttackAction), "B" for one step of a frenzy combo (BTComboAttackAction), whose
--- step_name finds the step in action.combo_attacks, "C" for an elite's sweep or overhead (BTStormVerminAttackAction)
--- and "D" for an elite's shove (BTStormVerminPushAction). Each step of a combo is announced as its own swing. aimed:
--- whether this player is the one the enemy attacks; a family C swing goes to every modded player (D50).
-mod:network_register("pc_swing_begin", function (sender, version, id, attacker_go_id, family, set_name, action_name, attack_anim, box_up, box_down, box_flat, damage_scale, step_name, aimed)
+-- step_name finds the step in action.combo_attacks, "C" for an elite's sweep or overhead (BTStormVerminAttackAction),
+-- "D" for an elite's shove (BTStormVerminPushAction), "F" for a disabler's attack and "E" for a monster's or lord's,
+-- whose step_name is its kind. Each step of a combo is announced as its own swing. aimed: whether this player is the
+-- one the enemy attacks; a family C or E swing goes to every modded player (D50, D61). attack_index: a family E overlap
+-- attack's place in its action's attacks.
+mod:network_register("pc_swing_begin", function (sender, version, id, attacker_go_id, family, set_name, action_name, attack_anim, box_up, box_down, box_flat, damage_scale, step_name, aimed, attack_index)
 	if pc.broken or pc.is_server() or not pc.in_game() or sender ~= pc.host_peer() or version ~= pc.VERSION then
 		return
 	end
@@ -1086,11 +1719,12 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 	local set = BreedActions[set_name]
 	local action = set and set[action_name]
 	local step = family == "B" and action and type(action.combo_attacks) == "table" and type(step_name) == "string" and action.combo_attacks[step_name] or nil
-	local kind = family == "F" and DISABLER_KINDS[step_name] and step_name or nil
+	local kind = family == "F" and DISABLER_KINDS[step_name] and step_name or family == "E" and E_KINDS[step_name] and step_name or nil
+	local attack = kind == "overlap" and action and overlap_attack(action, attack_index) or nil
 
 	pc.count("client_announced")
 
-	if not breed or not target or not action or family == "B" and not step or family == "F" and not kind then
+	if not breed or not target or not action or family == "B" and not step or (family == "F" or family == "E") and not kind or kind == "overlap" and not attack then
 		-- This client can't judge the swing, so it says so. The host books nothing for it.
 		pc.count("client_unjudged")
 		pc.print("client swing=%d can't be judged: enemy=%s target=%s action=%s/%s%s", id, tostring(breed and breed.name), tostring(target ~= nil), set_name, action_name, family == "B" and "/" .. tostring(step_name) or "")
@@ -1178,15 +1812,28 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 		box_flat = type(box_flat) == "number" and box_flat or 0,
 		wanted = QuaternionBox(wanted_rotation),
 		current = QuaternionBox(current_rotation),
-		-- A family C sweep and a family F pounce reach every modded player; the others go to their target only.
-		aimed = family ~= "C" and family ~= "F" or aimed == true,
+		-- A family C sweep, a family E attack and a family F pounce reach every modded player; the others go to their
+		-- target only.
+		aimed = family ~= "C" and family ~= "E" and family ~= "F" or aimed == true,
 		track_until = t + (type(rotation_time) == "number" and rotation_time or 0), -- family C
-		kind = kind, -- family F: hook, grab or pounce
+		kind = kind, -- family F: hook, grab or pounce; family E: overlap or slam
+		attack = attack, -- family E1: the overlap attack, from action.attacks or action.running_attacks
 	}
+
+	if family == "E" and not pc.guard("client monster swing", init_monster, swing, t) then
+		send_answer({ id = id }, 1, "unjudged")
+
+		return
+	end
 
 	swings[id] = swing
 	by_unit[unit] = swing
 	by_go_id[attacker_go_id] = swing
+
+	-- An overlap attack can push players in front aside as it starts (bt_melee_overlap_attack_action.lua:275).
+	if attack and attack.push_units_in_the_way then
+		pc.guard("client push aside", push_aside, swing, unit, target, attack.push_units_in_the_way)
+	end
 end)
 
 mod:hook_safe("LocomotionSystem", "update", function (self, context, t)

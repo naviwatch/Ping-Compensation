@@ -31,8 +31,9 @@ local TRACKED_CALLBACKS = {
 	anim_cb_stunned_finished = true,
 }
 
--- The damage frames of the attack families: anim_cb_damage (A, single swings, and C, elites' sweeps and overheads),
--- anim_cb_frenzy_damage (B, frenzy combo steps) and anim_cb_stormvermin_push (D, elites' shoves).
+-- The damage frames of the attack families: anim_cb_damage (A, single swings, C, elites' sweeps and overheads, and E,
+-- monsters' and lords' attacks), anim_cb_frenzy_damage (B, frenzy combo steps, and E's overlap attacks) and
+-- anim_cb_stormvermin_push (D, elites' shoves). Family E's host test is switched off in its own nodes (Host.lua).
 local DAMAGE_CALLBACKS = {
 	anim_cb_damage = true,
 	anim_cb_frenzy_damage = true,
@@ -77,6 +78,9 @@ mod:hook("AnimationSystem", "animation_callback", function (func, self, unit, ca
 					return
 				end
 			end
+		elseif callback_name == "anim_cb_attack_overlap_done" and not self.is_server then
+			-- Family E1 (build 6): a monster's arm window is over on this screen's copy (Client.lua, client.window_done).
+			pc.guard("client overlap window", pc.client.window_done, unit)
 		end
 
 		return func(self, unit, callback_name, param)

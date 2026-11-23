@@ -1,7 +1,7 @@
 local mod = get_mod("Ping Compensation")
 
 -- Host and client must run the same VERSION. Bump it whenever any message in CLAUDE.md's "Network messages" changes.
-local VERSION = 14
+local VERSION = 15
 
 -- Playtest builds write the debug log by default, so testers don't have to remember /pingcomp debug on. Set this to
 -- false for a public release: players who want the log can still switch it on, and their choice is remembered.
@@ -49,6 +49,11 @@ local pc = {
 	SHOT_FLUSH = 0.1,
 	-- Seconds a client waits for the host to confirm a vortex's catch it shows at once (D53) before it undoes it.
 	CATCH_CONFIRM = 2,
+	-- Family E (build 6, D67): the overlap attacks whose hit or block grabs the player, by action name. The grab is
+	-- inside the attack's hit_player_func (the chaos spawn's, breed_chaos_spawn.lua:860), so the data can't say so.
+	GRAB_ATTACKS = {
+		tentacle_grab = true,
+	},
 	-- T18: nodes that set an enemy's turn speed as they start and leave it set (AILocomotionExtension.set_rotation_speed),
 	-- with that speed. An attack later in the same sequence turns at it on the host (Client.lua).
 	TURN_SPEED_SETTERS = {

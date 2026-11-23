@@ -8,13 +8,18 @@ local pc = mod.pc
 -- Families: A, single swings (BTAttackAction); B, frenzy combo steps (BTComboAttackAction); C, elites' sweeps and
 -- overheads (BTStormVerminAttackAction), which reach every modded player near their box; D, elites' shoves
 -- (BTStormVerminPushAction); F, disablers (D52): the packmaster's hook (BTPackMasterAttackAction), the leech's grab
--- (BTCorruptorGrabAction) and the gutter runner's pounce (BTCrazyJumpAction), which reaches every modded player.
+-- (BTCorruptorGrabAction) and the gutter runner's pounce (BTCrazyJumpAction), which reaches every modded player; E,
+-- monsters' and lords' attacks (build 6, D61), which reach every modded player: overlap sweeps (BTMeleeOverlapAttackAction)
+-- and slams (BTMeleeSlamAction) so far.
 -- Bots, the host's own hero and players without the mod never get a record here, so they stay vanilla.
 
 local host = {
 	suppress = nil, -- the swing whose vanilla hit test is being skipped right now
 	box_skip = nil, -- family C: the player units the next box overlap leaves out, during an elite's damage frame
 	leap_skip = nil, -- family F: the player units the next leap overlap leaves out, during a gutter runner's leap
+	-- Family E: while a monster's overlap test or slam runs, { filter, units, dropped, ... }: every overlap with that
+	-- filter (its 13th argument) leaves those player units out, and notes the ones it dropped.
+	overlap_skip = nil,
 	booking = false, -- true while the host books what a client reported, so the damage-alone log leaves it out (D56)
 }
 
@@ -29,6 +34,8 @@ local RESULTS = {
 	miss = true,
 	cut = true,
 	unjudged = true,
+	shield = true, -- family E: a shield's ranged block, after which only the push follows
+	pushed = true, -- family E: pushed aside or catapulted without a hit (build 6's charges and jump slam)
 }
 
 local peers = {} -- peer id -> { t = main-clock time of that client's last hello, attacks = its /pingcomp attacks switch }
@@ -37,6 +44,8 @@ local swings = {} -- swing id -> record
 local by_attacker = {} -- enemy unit -> its newest record of families A, B and D
 local boxes = {} -- enemy unit -> its newest family C attack: { action, blackboard, swings = { one per modded player } }
 local leaps = {} -- gutter runner unit -> its newest leap (family F): { blackboard, jump_data, swings = { one per modded player } }
+local overlaps = {} -- enemy unit -> its newest family E attack, overlap or slam: { kind, action, attack, swings, by_target, ... }
+local push_hidden = nil -- family E: { side, units } while an overlap attack's push aside runs without the modded players
 local action_sets = {} -- action table -> name of the BreedActions set it lives in, or false
 local next_id = 0
 
@@ -154,8 +163,9 @@ local function new_swing(unit, blackboard, family, action, breed, target, peer, 
 	return swing
 end
 
--- aimed: whether the swing's player is the one the enemy attacks, whose screen turns the enemy. Only a family C swing
--- also reaches players it isn't aimed at.
+-- aimed: whether the swing's player is the one the enemy attacks, whose screen turns the enemy. Families C, E and the
+-- pounce of F also reach players they aren't aimed at. The last value is a family E overlap attack's place in its
+-- action's attacks, negative in its running_attacks, and 0 otherwise.
 local function send_begin(swing, blackboard, aimed)
 	local action = swing.action
 	local box_up, box_down, box_flat = 0, 0, 0
@@ -174,7 +184,7 @@ local function send_begin(swing, blackboard, aimed)
 		pc.count("host_announced_" .. swing.family)
 	end
 
-	mod:network_send("pc_swing_begin", swing.peer, pc.VERSION, swing.id, swing.attacker_go_id, swing.family, swing.set_name, action.name, swing.attack_anim, box_up, box_down, box_flat, pc.finite(ok and scale or 1, 3), swing.step_name or "", aimed and true or false)
+	mod:network_send("pc_swing_begin", swing.peer, pc.VERSION, swing.id, swing.attacker_go_id, swing.family, swing.set_name, action.name, swing.attack_anim, box_up, box_down, box_flat, pc.finite(ok and scale or 1, 3), swing.step_name or "", aimed and true or false, swing.attack_index or 0)
 end
 
 -- Runs once per attack, on the host: after BTAttackAction.enter for family A, after every
@@ -203,8 +213,9 @@ local function announce(unit, blackboard, family, step_name)
 		attack_anim = pc.host_reactions.last_attack_anim(unit)
 	end
 
-	-- The vanilla damage frame does nothing without action.damage, and monsters and lords stay vanilla for now.
-	if not target or not action or not action.damage or not breed or breed.boss or not attack_anim then
+	-- The vanilla damage frame does nothing without action.damage. A lord's shove counts too (build 6): no boss runs
+	-- families A and B.
+	if not target or not action or not action.damage or not breed or not attack_anim then
 		return
 	end
 
@@ -242,8 +253,10 @@ local function announce_box(unit, blackboard)
 
 	boxes[unit] = nil
 
-	-- The game's damage frame reaches the node only with action.damage (animation_callback_templates.lua:141).
-	if not action or not action.damage or not breed or breed.boss or not attack_anim or blackboard.attacking_target_is_ai_breed then
+	-- The game's damage frame reaches the node only with action.damage (animation_callback_templates.lua:141). The
+	-- lords' sweeps (the exalted champions', the Drachenfels sorcerer's while downed) and the shadow lieutenant's count
+	-- too, from build 6.
+	if not action or not action.damage or not breed or not attack_anim or blackboard.attacking_target_is_ai_breed then
 		return
 	end
 
@@ -306,7 +319,8 @@ local function announce_disabler(unit, blackboard, kind)
 		leaps[unit] = nil
 	end
 
-	if not action or not breed or breed.boss or not target then
+	-- No boss runs these nodes, so build 6's lifting of the boss filter changes nothing here.
+	if not action or not breed or not target then
 		return
 	end
 
@@ -373,6 +387,342 @@ local function announce_disabler(unit, blackboard, kind)
 	-- host's copy never snaps at them.
 	if group.by_target[target] then
 		group.jump_data.snap_failed = true
+	end
+end
+
+-- Family E (build 6, D61): an overlap attack's place in its action's attacks, negative in its running_attacks, so a
+-- client finds the same attack table in its own copy of the data. Nil if it is in neither.
+local function attack_index_of(action, attack)
+	if type(action) ~= "table" or type(attack) ~= "table" then
+		return nil
+	end
+
+	if type(action.attacks) == "table" then
+		for i = 1, #action.attacks do
+			if action.attacks[i] == attack then
+				return i
+			end
+		end
+	end
+
+	if type(action.running_attacks) == "table" then
+		for i = 1, #action.running_attacks do
+			if action.running_attacks[i] == attack then
+				return -i
+			end
+		end
+	end
+
+	return nil
+end
+
+-- Family E: whether the overlap attack this enemy has just started can be announced. Its _init_attack pushes players
+-- aside before the announcement goes out (bt_melee_overlap_attack_action.lua:275), and the push hook asks this.
+local function overlap_announceable(unit, blackboard)
+	local action = blackboard.action
+	local breed = blackboard.breed
+
+	return type(action) == "table" and action.damage ~= nil and breed ~= nil and type(blackboard.chosen_attack_anim) == "string"
+		and attack_index_of(action, blackboard.attack) ~= nil and action_set_name(action, breed) ~= nil and pc.network():unit_game_object_id(unit) ~= nil
+end
+
+-- Family E (D61): a monster's or lord's attack that can reach several players goes to every modded player it is an
+-- enemy of, wherever they are, each as a swing of their own, aimed for its target, whose screen turns the enemy. The
+-- Necromancer's skeletons attack enemies only, so they never send one. Returns the attack's group, or nil.
+local function announce_monster(unit, blackboard, kind, attack, attack_anim, attack_index, t)
+	local action = blackboard.action
+	local breed = blackboard.breed
+
+	-- Both nodes deal action.damage (bt_melee_overlap_attack_action.lua:658, bt_melee_slam_action.lua:195), and the
+	-- game's damage frame reaches them only with it (animation_callback_templates.lua:141).
+	if type(action) ~= "table" or not action.damage or not breed or type(attack_anim) ~= "string" then
+		return nil
+	end
+
+	local attacker_go_id = pc.network():unit_game_object_id(unit)
+	local set_name = action_set_name(action, breed)
+
+	if not attacker_go_id or not set_name then
+		return nil
+	end
+
+	local aimed_at = blackboard.attacking_target
+	local side_manager = Managers.state.side
+	local group = {
+		kind = kind,
+		action = action,
+		attack = attack,
+		blackboard = blackboard,
+		started_t = blackboard.attack_started_at_t,
+		swings = {},
+		by_target = {},
+		box_frames = 0, -- damage frames of the host's copy so far
+		grab = pc.GRAB_ATTACKS[action.name] == true, -- the chaos spawn's grab (D67)
+	}
+
+	for _, player in pairs(Managers.player:human_players()) do
+		local peer = player.remote and not player.bot_player and player.peer_id
+		local player_unit = player.player_unit
+
+		if peer and peer_is_fresh(peer) and player_unit and Unit.alive(player_unit) and side_manager:is_enemy(unit, player_unit) then
+			local swing = new_swing(unit, blackboard, "E", action, breed, player_unit, peer, attacker_go_id, set_name, attack_anim, t, nil, kind)
+
+			swing.kind = kind
+			swing.group = group
+			swing.attack = attack
+			swing.attack_index = attack_index
+			swing.aimed = player_unit == aimed_at
+			group.swings[#group.swings + 1] = swing
+			group.by_target[player_unit] = swing
+
+			send_begin(swing, blackboard, swing.aimed)
+		end
+	end
+
+	if #group.swings == 0 then
+		return nil
+	end
+
+	return group
+end
+
+-- Family E1, called after BTMeleeOverlapAttackAction._init_attack (bt_melee_overlap_attack_action.lua:104), which
+-- starts each attack, and each step of a combo (_attack_finished, :392), each its own swing as family B's are. It
+-- returns without starting one after a combo's last step (:105), which leaves attack_started_at_t as it was.
+function host.announce_overlap(unit, blackboard, t)
+	overlaps[unit] = nil
+
+	if blackboard.attack_started_at_t ~= t or blackboard.active_node ~= BTMeleeOverlapAttackAction then
+		return
+	end
+
+	local attack = blackboard.attack
+	local attack_anim = blackboard.chosen_attack_anim
+	local index = attack_index_of(blackboard.action, attack)
+
+	if not index then
+		return
+	end
+
+	local group = announce_monster(unit, blackboard, "overlap", attack, attack_anim, index, t)
+
+	if not group then
+		return
+	end
+
+	-- An arm or weapon box on every frame of a window (:598) is the swing's first frame; the box in front at each
+	-- damage frame (:722) comes after it.
+	local window = type(attack.continious_overlap) == "table" and attack.continious_overlap[attack_anim]
+	local data = blackboard.continous_overlap_data
+
+	-- window is false, not nil, for an attack without any (the and above), so it is tested by its type.
+	group.window = type(window) == "table"
+	group.window_units = group.window and data and data.hit_units or nil
+	overlaps[unit] = group
+end
+
+-- Family E2, called after BTMeleeSlamAction.enter (bt_melee_slam_action.lua:21). The slam plays its animation without
+-- writing it to the blackboard (:60); the host noted it as it played (D47).
+function host.announce_slam(unit, blackboard, t)
+	overlaps[unit] = nil
+
+	local attack_anim = pc.host_reactions.last_attack_anim(unit) or "slam"
+
+	overlaps[unit] = announce_monster(unit, blackboard, "slam", nil, attack_anim, 0, t)
+end
+
+-- Family E at a frame of the host's copy: notes the frame on each player's swing and returns the players whose own
+-- screens judge it, or nil to leave the whole frame to vanilla. A player whose client has gone quiet is the host's to
+-- judge again, as for family C. new_frame is false on a window's later frames, which belong to its first.
+local function monster_frame(group, frame, new_frame, t)
+	local skip = nil
+
+	for i = 1, #group.swings do
+		local swing = group.swings[i]
+
+		if not swing.host_judged and frame <= MAX_FRAMES then
+			if peer_is_fresh(swing.peer) then
+				if new_frame then
+					swing.frames = math.max(swing.frames, frame)
+					swing.frame_t[frame] = t
+					swing.would[frame] = "miss"
+					swing.expires = math.max(swing.expires, t + pc.SWING_LIFETIME)
+				end
+
+				skip = skip or {}
+				skip[swing.target] = true
+			else
+				swing.host_judged = true
+
+				pc.count("host_judged_quiet_client")
+			end
+		end
+	end
+
+	return skip
+end
+
+-- Family E1, called around BTMeleeOverlapAttackAction.overlap_checks (bt_melee_overlap_attack_action.lua:890): at each
+-- damage frame of the host's copy (the box in front, :754) and on every frame of a window (the arm or weapon, :878),
+-- whose hit_units is the window's own. Returns the scope for the overlap hook below, or nil.
+function host.overlap_frame(unit, blackboard, attack, hit_units)
+	local group = overlaps[unit]
+
+	if not group or group.kind ~= "overlap" or blackboard ~= group.blackboard or blackboard.active_node ~= BTMeleeOverlapAttackAction
+		or blackboard.attack ~= group.attack or attack ~= group.attack or blackboard.attack_started_at_t ~= group.started_t then
+		return nil
+	end
+
+	local frame, new_frame
+
+	if group.window and hit_units == group.window_units then
+		frame, new_frame = 1, not group.window_started
+		group.window_started = true
+	else
+		group.box_frames = group.box_frames + 1
+		frame, new_frame = group.box_frames + (group.window and 1 or 0), true
+	end
+
+	local skip = monster_frame(group, frame, new_frame, pc.now())
+
+	if not skip then
+		return nil
+	end
+
+	return {
+		filter = attack.hit_only_players and "filter_player_hit_box_check" or "filter_player_and_enemy_hit_box_check",
+		units = skip,
+		dropped = {},
+		group = group,
+		frame = frame,
+		unit = unit,
+	}
+end
+
+-- Family E2, called around BTMeleeSlamAction.anim_cb_damage (bt_melee_slam_action.lua:140), once per slam.
+function host.slam_frame(unit, blackboard)
+	local group = overlaps[unit]
+
+	if not group or group.kind ~= "slam" or blackboard ~= group.blackboard or blackboard.active_node ~= BTMeleeSlamAction or blackboard.action ~= group.action
+		or blackboard.attack_started_at_t ~= group.started_t or blackboard.is_illusion then
+		return nil
+	end
+
+	group.box_frames = group.box_frames + 1
+
+	local frame = group.box_frames
+	local skip = monster_frame(group, frame, true, pc.now())
+
+	if not skip then
+		return nil
+	end
+
+	return {
+		filter = "filter_rat_ogre_melee_slam",
+		units = skip,
+		dropped = {},
+		group = group,
+		frame = frame,
+		unit = unit,
+	}
+end
+
+-- Family E: what the node would have done at this frame for a modded player its overlap found, for the debug log:
+-- the slam's dodge (bt_melee_slam_action.lua:173), an overlap attack passing over a player behind it
+-- (bt_melee_overlap_attack_action.lua:937), then the block. Nothing here has side effects.
+local function monster_would(scope, swing)
+	local unit = scope.unit
+	local target = swing.target
+	local group = scope.group
+	local status = Unit.alive(target) and ScriptUnit.has_extension(target, "status_system")
+	local self_position = POSITION_LOOKUP[unit]
+	local target_position = POSITION_LOOKUP[target]
+
+	if not status or not self_position or not target_position then
+		return "miss"
+	end
+
+	local forward = Quaternion.forward(Unit.local_rotation(unit, 0))
+
+	if group.kind == "slam" then
+		local centre = self_position + forward * (group.action.forward_offset or 0)
+
+		if status.is_dodging and Vector3.length_squared(Vector3.flat(target_position - centre)) > (group.action.dodge_mitigation_radius_squared or 0) then
+			return "miss"
+		elseif status:is_disabled() then
+			return "hit"
+		end
+	elseif group.attack.ignore_targets_behind and Vector3.dot(Vector3.normalize(target_position - self_position), forward) <= 0 then
+		return "miss"
+	end
+
+	local buff_extension = ScriptUnit.has_extension(target, "buff_system")
+
+	if status:is_blocking() and status:can_block(unit) and not (buff_extension and buff_extension:has_buff_perk("invulnerable")) then
+		return "blocked"
+	end
+
+	return "hit"
+end
+
+-- Family E, after the host's own overlap at that frame: the modded players it found and left out, for host_would.
+function host.overlap_noted(scope)
+	for target in pairs(scope.dropped) do
+		local swing = scope.group.by_target[target]
+
+		if swing and swing.would[scope.frame] == "miss" then
+			local ok, verdict = pcall(monster_would, scope, swing)
+
+			swing.would[scope.frame] = ok and verdict or "unknown"
+		end
+	end
+end
+
+-- Family E1, called around BTMeleeOverlapAttackAction.push_close_units (bt_melee_overlap_attack_action.lua:765): the
+-- players in front of an overlap attack are pushed aside. Every modded player's own screen pushes its own player
+-- (question 1 of the build 6 notes, D69), so the host's push leaves them out. Returns true once the side's list holds
+-- only the others, which host.push_restore puts back.
+function host.push_filter(unit, blackboard)
+	local side = blackboard.side
+	local units = side and side.ENEMY_PLAYER_AND_BOT_UNITS
+
+	if push_hidden or type(units) ~= "table" or not overlap_announceable(unit, blackboard) then
+		return false
+	end
+
+	local kept = nil
+
+	for i = 1, #units do
+		if host.client_judges(units[i]) then
+			kept = {}
+
+			break
+		end
+	end
+
+	if not kept then
+		return false
+	end
+
+	for i = 1, #units do
+		if not host.client_judges(units[i]) then
+			kept[#kept + 1] = units[i]
+		end
+	end
+
+	push_hidden = {
+		side = side,
+		units = units,
+	}
+	side.ENEMY_PLAYER_AND_BOT_UNITS = kept
+
+	return true
+end
+
+function host.push_restore()
+	if push_hidden then
+		push_hidden.side.ENEMY_PLAYER_AND_BOT_UNITS = push_hidden.units
+		push_hidden = nil
 	end
 end
 
@@ -1127,6 +1477,259 @@ local function book_shove(swing)
 	return "booked"
 end
 
+-- Family E: whether the enemy is still in the attack this swing announced.
+local function in_monster_attack(swing, blackboard)
+	local group = swing.group
+
+	if not group or blackboard ~= swing.blackboard or blackboard.attack_started_at_t ~= group.started_t or blackboard.action ~= swing.action then
+		return false
+	end
+
+	if group.kind == "slam" then
+		return blackboard.active_node == BTMeleeSlamAction
+	end
+
+	return blackboard.active_node == BTMeleeOverlapAttackAction and blackboard.attack == swing.attack
+end
+
+-- BTMeleeOverlapAttackAction.push_player (bt_melee_overlap_attack_action.lua:619), which tests nothing: the push away
+-- from the enemy, or the catapult (StatusUtils.set_catapulted_network). The player's own screen already showed it
+-- (D62), and drops this copy.
+local function push_player(attacker, target, speed, speed_z, catapult)
+	if speed then
+		BTMeleeOverlapAttackAction.push_player(BTMeleeOverlapAttackAction, attacker, target, speed, speed_z, catapult)
+	end
+end
+
+local function book_monster_without_attacker(swing, result)
+	if result ~= "hit" then
+		return "attacker gone"
+	end
+
+	local ok, message = pcall(book_hit_without_attacker, swing)
+
+	if not ok then
+		pc.print("host swing=%d could not book a hit without its attacker: %s", swing.id, tostring(message))
+
+		return "failed"
+	end
+
+	return "booked without attacker"
+end
+
+-- Family E1: what BTMeleeOverlapAttackAction.hit_player (bt_melee_overlap_attack_action.lua:638) does for one player
+-- its overlap found, for that player's answer: the damage or, through a block, the blocked damage, and the push or
+-- catapult unless they are knocked down; after a shield's ranged block ("shield") only the push; then the attack's
+-- hit_player_func. A block itself is booked first by book_block. Every player's answer is booked, also for an attack
+-- that hits one target only (question 3 of the build 6 notes, D69).
+local function book_overlap(swing, result, through_block)
+	local target = swing.target
+	local attacker = swing.attacker
+	local action = swing.action
+	local attack = swing.attack
+
+	if not Unit.alive(target) then
+		return "target gone"
+	end
+
+	if not same_attacker(swing) then
+		return book_monster_without_attacker(swing, result)
+	end
+
+	local blackboard = BLACKBOARDS[attacker]
+	local same_enemy = blackboard ~= nil and blackboard == swing.blackboard
+
+	if through_block and same_enemy then
+		blackboard.hit_through_block = true
+	end
+
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local knocked_down = status and status.knocked_down
+	local dealt_damage = false
+
+	if result == "hit" then
+		AiUtils.damage_target(target, attacker, action, action.damage)
+
+		dealt_damage = true
+
+		if not knocked_down then
+			push_player(attacker, target, attack.player_push_speed, attack.player_push_speed_z, attack.catapult_player)
+		end
+	elseif result == "blocked" then
+		if action.blocked_damage then
+			AiUtils.damage_target(target, attacker, action, action.blocked_damage)
+
+			dealt_damage = true
+		end
+
+		if not knocked_down then
+			push_player(attacker, target, attack.player_push_speed_blocked, attack.player_push_speed_blocked_z, attack.catapult_player)
+		end
+	else
+		push_player(attacker, target, attack.player_push_speed_blocked, attack.player_push_speed_blocked_z, false)
+	end
+
+	-- The attack's own follow-up (the rat ogre's notes that it dealt damage), only while the enemy is in that attack.
+	if attack.hit_player_func and same_enemy and HEALTH_ALIVE[attacker] and in_monster_attack(swing, blackboard) then
+		local ok, message = pcall(attack.hit_player_func, attacker, blackboard, target, action, attack, dealt_damage)
+
+		if not ok then
+			pc.print("host swing=%d: the attack's hit_player_func failed: %s", swing.id, tostring(message))
+		end
+	end
+
+	-- In a window the player is one the arm has hit, as for the node's own hits (:941).
+	local data = same_enemy and blackboard.continous_overlap_data
+	local window_units = swing.group and swing.group.window_units
+
+	if data and window_units and data.hit_units == window_units then
+		window_units[target] = true
+	end
+
+	return result == "hit" and "booked" or "blocked results booked"
+end
+
+-- Family E2: what BTMeleeSlamAction.anim_cb_damage (bt_melee_slam_action.lua:169 to :200) does for one player its
+-- capsule found, for that player's answer: a hit, a disabled player's too, deals the slam's damage; a block pushes the
+-- player back and deals the blocked damage; a shield's ranged block only pushes. Then the slam's hit_player_func for any
+-- damage. The player's own screen played the shield's block and told the host itself (DamageUtils.check_ranged_block).
+local function book_slam(swing, result)
+	local target = swing.target
+	local attacker = swing.attacker
+	local action = swing.action
+
+	if not Unit.alive(target) then
+		return "target gone"
+	end
+
+	if not same_attacker(swing) then
+		return book_monster_without_attacker(swing, result)
+	end
+
+	local blackboard = BLACKBOARDS[attacker]
+	local damage = nil
+
+	if result == "hit" then
+		damage = action.damage
+	else
+		local locomotion = ScriptUnit.has_extension(target, "locomotion_system")
+
+		if locomotion and action.player_push_speed_blocked then
+			locomotion:add_external_velocity(action.player_push_speed_blocked * Vector3.normalize(POSITION_LOOKUP[target] - POSITION_LOOKUP[attacker]))
+		end
+
+		if result == "blocked" then
+			damage = action.blocked_damage
+		end
+	end
+
+	if damage and action.hit_player_func and blackboard and blackboard == swing.blackboard and HEALTH_ALIVE[attacker] and in_monster_attack(swing, blackboard) then
+		local ok, message = pcall(action.hit_player_func, attacker, blackboard, target, damage)
+
+		if not ok then
+			pc.print("host swing=%d: the slam's hit_player_func failed: %s", swing.id, tostring(message))
+		end
+	end
+
+	if damage then
+		AiUtils.damage_target(target, attacker, action, damage)
+	end
+
+	return result == "hit" and "booked" or result == "blocked" and "blocked results booked" or "shield push booked"
+end
+
+-- Family E1, the chaos spawn's grab (D67): its arm grabs the first player it reaches, through a block too
+-- (breed_chaos_spawn.lua:860). The first answer that says it reached its player is booked, as one leap pins one player
+-- (D54), while the spawn is alive, not staggered, still in that attack and holding nobody: the block or the damage, then
+-- the attack's own hit_player_func, which grabs them unless they are disabled or invisible (breed_chaos_spawn.lua:863),
+-- and the arm's test stops, as at the node's own first hit (bt_melee_overlap_attack_action.lua:880). A disabled or
+-- invisible player is hit all the same, as in vanilla, and only the grab is refused. The tree's leave hook
+-- (check_if_victim_was_grabbed, bt_leave_hooks.lua:13) then takes the spawn to the chew, smash or throw, all the host's.
+-- A later answer is refused. Either way the client hears of it, and undoes the grab it showed if refused.
+local function book_grab(swing, result, multiplier, improved, direction)
+	local attacker = swing.attacker
+	local target = swing.target
+	local blackboard = BLACKBOARDS[attacker]
+	local status = Unit.alive(target) and ScriptUnit.has_extension(target, "status_system")
+	local refused = nil
+	local outcome = nil -- what was booked, if anything
+
+	if not status then
+		refused = "target gone"
+	elseif not same_attacker(swing) or not HEALTH_ALIVE[attacker] then
+		refused = "the spawn is dead"
+	elseif not blackboard or blackboard ~= swing.blackboard then
+		refused = "the spawn is gone"
+	elseif blackboard.stagger then
+		refused = "the spawn is staggered"
+	elseif not in_monster_attack(swing, blackboard) then
+		refused = "the grab was over"
+	elseif blackboard.victim_grabbed then
+		refused = "it holds someone already"
+	else
+		local action = swing.action
+		local attack = swing.attack
+		local takeable = not status:is_disabled() and not status:is_invisible()
+
+		if result == "blocked" then
+			outcome = book_block(swing, multiplier, improved, direction, nil)
+		else
+			AiUtils.damage_target(target, attacker, action, action.damage)
+
+			outcome = "booked"
+		end
+
+		local ok, message = pcall(attack.hit_player_func, attacker, blackboard, target, action, attack, result == "hit")
+
+		if not ok then
+			pc.print("host swing=%d: the grab's hit_player_func failed: %s", swing.id, tostring(message))
+		end
+
+		if blackboard.victim_grabbed ~= target then
+			refused = takeable and "the grab didn't take" or "the game wouldn't take them now"
+		end
+
+		local data = blackboard.continous_overlap_data
+
+		if data then
+			data.perform_overlap = false
+		end
+	end
+
+	mod:network_send("pc_reaction_ack", swing.peer, pc.VERSION, "grab", swing.id, refused and "rejected" or "applied")
+	pc.count(not refused and "host_grab_booked" or outcome and "host_grab_hit_only" or "host_grab_refused")
+
+	if not refused then
+		return outcome .. ", grabbed"
+	end
+
+	return outcome and outcome .. ", not grabbed: " .. refused or "refused: " .. refused
+end
+
+-- Family E: one modded player's answer for a monster's or lord's attack (D61).
+local function book_monster(swing, result, multiplier, improved, direction, through_block)
+	if swing.group and swing.group.grab then
+		-- The grab ignores shields (ignore_shield_block), so no screen says "shield" for it.
+		if result == "shield" then
+			return "nothing to book"
+		end
+
+		return book_grab(swing, result, multiplier, improved, direction)
+	end
+
+	-- A block shows as DamageUtils.check_block shows it on the host. A slam's shield block isn't a melee block at all
+	-- (bt_melee_slam_action.lua:182), and the player's own screen has sent it already.
+	local outcome = nil
+
+	if result == "blocked" or result == "shield" and swing.kind ~= "slam" then
+		outcome = book_block(swing, multiplier, improved, direction, nil)
+	end
+
+	local booked = swing.kind == "slam" and book_slam(swing, result) or book_overlap(swing, result, through_block)
+
+	return outcome and outcome .. ", " .. booked or booked
+end
+
 -- Family F: the game's own filter for who this disabler can take (ai_utils.lua): the packmaster's and the leech's
 -- nodes check theirs every frame (bt_pack_master_attack_action.lua:59, bt_corruptor_grab_action.lua:83), and the
 -- leap's sphere takes only a player the gutter runner's accepts (bt_crazy_jump_action.lua:425), which alone knows
@@ -1296,7 +1899,13 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 	-- What follows books what the client reported, which the damage-alone log leaves out (host.damage_alone).
 	host.booking = true
 
-	if result == "hit" then
+	if swing.family == "E" then
+		if result == "hit" or result == "blocked" or result == "shield" then
+			-- For the log line of a recoil left to the host (a bulwark's, after a block of its running attack).
+			swing.blocked_frame_t = swing.frame_t[frame]
+			outcome = book_monster(swing, result, multiplier, improved, direction, through_block)
+		end
+	elseif result == "hit" then
 		if swing.family == "C" then
 			outcome = book_box(swing, false, through_block)
 		elseif swing.family == "D" then
@@ -1347,7 +1956,7 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 
 	-- A cut-short swing never reached the client's damage frame, so it has no verdict to compare.
 	local disagree = would ~= "n/a" and would ~= "unknown" and result ~= "cut" and result ~= "unjudged" and would ~= result
-		and not (would == "aborted" and result == "miss")
+		and not (would == "aborted" and result == "miss") and not (would == "blocked" and result == "shield")
 
 	if disagree then
 		pc.count("host_disagree")
@@ -1403,6 +2012,98 @@ mod:hook_safe("BTStormVerminPushAction", "enter", function (self, unit, blackboa
 	end
 
 	announce(unit, blackboard, "D")
+end)
+
+-- Family E1 (D61): every overlap attack of a monster or lord starts here, and every step of a combo.
+mod:hook_safe("BTMeleeOverlapAttackAction", "_init_attack", function (self, unit, target_unit, blackboard, action, t, start_attack_index)
+	if pc.broken or not pc.is_server() or not pc.in_game() then
+		return
+	end
+
+	pc.guard("host overlap announce", host.announce_overlap, unit, blackboard, t)
+end)
+
+-- Family E2 (D61): a rat ogre's or chaos spawn's slam.
+mod:hook_safe("BTMeleeSlamAction", "enter", function (self, unit, blackboard, t)
+	if pc.broken or not pc.is_server() or not pc.in_game() then
+		return
+	end
+
+	pc.guard("host slam announce", host.announce_slam, unit, blackboard, t)
+end)
+
+-- After a family E test the host ran with the modded players left out (host.overlap_skip): puts the skip back, notes
+-- which of them the test found, for host_would, and passes the original's results through, however many there are.
+local function overlap_test_done(name, scope, previous, ...)
+	host.overlap_skip = previous
+
+	pc.guard(name, host.overlap_noted, scope)
+
+	return ...
+end
+
+-- Family E1: the host's own overlap test leaves out the players whose screens judge the attack (host.overlap_skip, used
+-- by the overlap hook below) and notes which of them it would have reached. Everything but the original runs through
+-- pc.guard.
+mod:hook("BTMeleeOverlapAttackAction", "overlap_checks", function (func, self, unit, blackboard, physics_world, t, action, attack, oobb_pos, box_rot, box_size, hit_units, overlap_update_radius, ...)
+	if pc.broken or not overlaps[unit] then
+		return func(self, unit, blackboard, physics_world, t, action, attack, oobb_pos, box_rot, box_size, hit_units, overlap_update_radius, ...)
+	end
+
+	local ok, scope = pc.guard("host overlap frame", host.overlap_frame, unit, blackboard, attack, hit_units)
+
+	if not ok or not scope then
+		return func(self, unit, blackboard, physics_world, t, action, attack, oobb_pos, box_rot, box_size, hit_units, overlap_update_radius, ...)
+	end
+
+	local previous = host.overlap_skip
+
+	host.overlap_skip = scope
+
+	return overlap_test_done("host overlap verdicts", scope, previous, func(self, unit, blackboard, physics_world, t, action, attack, oobb_pos, box_rot, box_size, hit_units, overlap_update_radius, ...))
+end)
+
+-- Family E2: the same for a slam's capsule.
+mod:hook("BTMeleeSlamAction", "anim_cb_damage", function (func, self, unit, blackboard, ...)
+	if pc.broken or not overlaps[unit] then
+		return func(self, unit, blackboard, ...)
+	end
+
+	local ok, scope = pc.guard("host slam frame", host.slam_frame, unit, blackboard)
+
+	if not ok or not scope then
+		return func(self, unit, blackboard, ...)
+	end
+
+	local previous = host.overlap_skip
+
+	host.overlap_skip = scope
+
+	return overlap_test_done("host slam verdicts", scope, previous, func(self, unit, blackboard, ...))
+end)
+
+-- After an overlap attack's push aside ran with the modded players left out (host.push_filter): puts the side's list
+-- back, with no pc.guard, so that it happens even once the mod has switched itself off, and passes the original's
+-- results through.
+local function push_done(...)
+	host.push_restore()
+
+	return ...
+end
+
+-- Family E1: an overlap attack's push aside leaves out the modded players, whose own screens push them (host.push_filter).
+mod:hook("BTMeleeOverlapAttackAction", "push_close_units", function (func, self, unit, blackboard, t, data, ...)
+	if pc.broken or not pc.is_server() then
+		return func(self, unit, blackboard, t, data, ...)
+	end
+
+	local ok, filtered = pc.guard("host push filter", host.push_filter, unit, blackboard)
+
+	if not ok or not filtered then
+		return func(self, unit, blackboard, t, data, ...)
+	end
+
+	return push_done(func(self, unit, blackboard, t, data, ...))
 end)
 
 -- Family F (D52): a disabler's hook, grab or pounce starts here.
@@ -1507,7 +2208,8 @@ mod:hook_safe("BTCrazyJumpAction", "leave", function (self, unit, blackboard, t,
 	end
 end)
 
-local function without_skipped(actors, skip)
+-- dropped: a set that gets the units left out, for family E's host_would.
+local function without_skipped(actors, skip, dropped)
 	local kept = {}
 
 	for i = 1, #actors do
@@ -1515,6 +2217,8 @@ local function without_skipped(actors, skip)
 
 		if not unit or not skip[unit] then
 			kept[#kept + 1] = actors[i]
+		elseif dropped then
+			dropped[unit] = true
 		end
 	end
 
@@ -1525,10 +2229,13 @@ end
 -- its overlap leaves out the players whose own screens judge the swing. Only that one overlap, the one that looks for
 -- player hit boxes (its 13th argument): host.box_skip is cleared as it is used. Family F: the same with host.leap_skip
 -- for a gutter runner's leap test (bt_crazy_jump_action.lua:418), whose sphere looks for players' triggers (its 11th
--- argument). A mod:hook on an engine function the whole game calls, so every other call goes straight through, and
--- its own work runs through pc.guard.
+-- argument). Family E: while host.overlap_skip is set, a monster's overlap test or slam is running
+-- (BTMeleeOverlapAttackAction.overlap_checks, BTMeleeSlamAction.anim_cb_damage), and every overlap with its filter (the
+-- 13th argument) leaves out the players whose screens judge it, for as long as that call runs. A mod:hook on an engine
+-- function the whole game calls, so every other call goes straight through, and its own work runs through pc.guard.
 mod:hook(PhysicsWorld, "immediate_overlap", function (func, ...)
 	local skip = nil
+	local dropped = nil
 
 	if host.box_skip and select(13, ...) == "filter_player_hit_box_check" then
 		skip = host.box_skip
@@ -1536,6 +2243,9 @@ mod:hook(PhysicsWorld, "immediate_overlap", function (func, ...)
 	elseif host.leap_skip and select(11, ...) == "filter_player_and_husk_trigger" then
 		skip = host.leap_skip
 		host.leap_skip = nil
+	elseif host.overlap_skip and select(13, ...) == host.overlap_skip.filter then
+		skip = host.overlap_skip.units
+		dropped = host.overlap_skip.dropped
 	else
 		return func(...)
 	end
@@ -1546,7 +2256,7 @@ mod:hook(PhysicsWorld, "immediate_overlap", function (func, ...)
 		return actors, count
 	end
 
-	local ok, kept, kept_count = pc.guard("host box filter", without_skipped, actors, skip)
+	local ok, kept, kept_count = pc.guard("host box filter", without_skipped, actors, skip, dropped)
 
 	if ok then
 		return kept, kept_count
@@ -1625,7 +2335,11 @@ function host.update()
 	host.suppress = nil
 	host.box_skip = nil
 	host.leap_skip = nil
+	host.overlap_skip = nil
 	host.booking = false
+
+	-- A push aside whose original call failed leaves the side's list filtered; it comes back here.
+	host.push_restore()
 
 	if not pc.is_server() or not pc.in_game() then
 		return
@@ -1666,6 +2380,12 @@ function host.update()
 			if leap and swing.group == leap and leap.swings[1] == swing then
 				leaps[swing.attacker] = nil
 			end
+
+			local monster = overlaps[swing.attacker]
+
+			if monster and swing.group == monster and monster.swings[1] == swing then
+				overlaps[swing.attacker] = nil
+			end
 		end
 	end
 end
@@ -1677,10 +2397,13 @@ function host.clear()
 	by_attacker = {}
 	boxes = {}
 	leaps = {}
+	overlaps = {}
 	host.suppress = nil
 	host.box_skip = nil
 	host.leap_skip = nil
+	host.overlap_skip = nil
 	host.booking = false
+	host.push_restore()
 
 	pc.host_reactions.clear()
 	pc.blasts.clear()

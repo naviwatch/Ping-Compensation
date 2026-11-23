@@ -13,18 +13,22 @@ local pc = mod.pc
 --   * if the host refuses (the special died or was staggered there first) or nothing confirms it within
 --     pc.GRAB_CONFIRM, the client undoes it with the game's own release statuses.
 -- The next steps (the drag, the hoist, the drain, the release) come from the host as in vanilla.
+-- Build 6 (D67): a chaos spawn's grab (its tentacle_grab, family E) shows the same way, with its own grab animation on
+-- this screen's copy of the spawn, whose echo is dropped too; the chew, smash and throw come from the host.
 
 local disablers = {}
 
 pc.disablers = disablers
 
 -- The status each kind's echo carries (BTPackMasterInitialPullAction.enter, BTCorruptorGrabAction.run,
--- BTTargetPouncedAction.enter).
+-- BTTargetPouncedAction.enter, and the chaos spawn's grab, breed_chaos_spawn.lua:870).
 local ECHO_STATUS = {
 	hook = "pack_master_pulling",
 	grab = "chaos_corruptor_grabbed",
 	pounce = "pounced_down",
+	spawn = "grabbed_by_chaos_spawn",
 }
+local SPAWN_GRAB_ANIM = "attack_grab_player" -- the animation the spawn's grab plays on every machine (breed_chaos_spawn.lua:869)
 
 local shown = {} -- swing id -> what this screen shows
 local by_unit = {} -- special unit -> the same record
@@ -45,8 +49,9 @@ function disablers.active()
 	return next(shown) ~= nil
 end
 
--- Client.lua: the swing's hook, grab or pounce landed on this screen, and its answer has gone to the host.
-function disablers.start(swing, unit, target)
+-- Client.lua: the swing's hook, grab or pounce landed on this screen, and its answer has gone to the host. kind: the
+-- swing's own (family F), or "spawn" for a chaos spawn's grab (family E).
+function disablers.start(swing, unit, target, kind)
 	local status = ScriptUnit.has_extension(target, "status_system")
 
 	if not status or not Unit.alive(unit) or not Unit.alive(target) then
@@ -54,7 +59,9 @@ function disablers.start(swing, unit, target)
 	end
 
 	local t = pc.now()
-	local kind = swing.kind
+
+	kind = kind or swing.kind
+
 	local record = {
 		id = swing.id,
 		kind = kind,
@@ -78,6 +85,12 @@ function disablers.start(swing, unit, target)
 		status:set_pounced_down(true, unit)
 	elseif kind == "hook" then
 		status:set_pack_master("pack_master_pulling", true, unit)
+	elseif kind == "spawn" then
+		-- What the host's status message does (StatusSystem.rpc_status_change_bool): the player's own grabbed state
+		-- holds them in the spawn's hand (player_character_state_grabbed_by_chaos_spawn.lua:54). And the spawn's own
+		-- animation for it, as its hit_player_func plays it on every machine.
+		status:set_grabbed_by_chaos_spawn(true, unit)
+		Managers.state.entity:system("animation_system"):anim_event(unit, SPAWN_GRAB_ANIM, true)
 	else
 		status:set_grabbed_by_corruptor("chaos_corruptor_grabbed", true, unit)
 
@@ -97,7 +110,8 @@ function disablers.start(swing, unit, target)
 end
 
 -- The game's own way out of each state, as the host's release messages do it (BTPackMasterAttackAction.leave,
--- BTCorruptorGrabAction.leave, BTTargetPouncedAction.leave).
+-- BTCorruptorGrabAction.leave, BTTargetPouncedAction.leave, and BTLeaveHooks.check_if_victim_was_grabbed,
+-- bt_leave_hooks.lua:22, for a chaos spawn's grab, which the player's grabbed state notices).
 local function undo(record, reason)
 	local target = record.target
 	local unit = record.unit
@@ -111,6 +125,10 @@ local function undo(record, reason)
 		elseif record.kind == "grab" then
 			if status.grabbed_by_corruptor and status.corruptor_unit == unit then
 				status:set_grabbed_by_corruptor("chaos_corruptor_released", false, unit)
+			end
+		elseif record.kind == "spawn" then
+			if status.grabbed_by_chaos_spawn and status.grabbed_by_chaos_spawn_unit == unit then
+				status:set_grabbed_by_chaos_spawn(false, unit)
 			end
 		elseif status.pounced_down and status.pouncer_unit == unit then
 			status:set_pounced_down(false, unit)
@@ -190,11 +208,26 @@ function disablers.beam_message(unit_id, state)
 end
 
 -- While a pin waits for the host, the host's animations for that gutter runner are from its own leap, still flying or
--- landing there. Returns true to drop them.
-function disablers.holds(unit)
+-- landing there. And a chaos spawn's grab animation, which this screen played as it showed the grab, would play again.
+-- Returns true to drop the host's animation anim for that unit.
+function disablers.holds(unit, anim)
 	local record = by_unit[unit]
 
-	return record ~= nil and record.kind == "pounce" and record.position ~= nil
+	if not record then
+		return false
+	end
+
+	if record.kind == "spawn" then
+		if anim == SPAWN_GRAB_ANIM and not record.anim_echoed then
+			record.anim_echoed = true
+
+			return true
+		end
+
+		return false
+	end
+
+	return record.kind == "pounce" and record.position ~= nil
 end
 
 -- Every frame after LocomotionSystem.update, which has just moved every enemy copy by the host's numbers.
@@ -251,6 +284,16 @@ end
 mod:hook("StatusSystem", "rpc_status_change_bool", function (func, self, channel_id, status_id, status_bool, game_object_id, other_object_id)
 	if not pc.broken and next(shown) ~= nil and not pc.is_server() then
 		local ok, drop = pc.guard("client grab echo", disablers.status_message, status_id, status_bool, game_object_id, other_object_id)
+
+		if ok and drop then
+			return
+		end
+	end
+
+	-- A knock-down this screen showed at once (HitResults.lua, D62): the host's echo would knock the player down again
+	-- once the knocked-down state has ended by itself (player_character_state_charged.lua:93).
+	if not pc.broken and pc.hit_results and not pc.is_server() then
+		local ok, drop = pc.guard("client knock-down echo", pc.hit_results.status_message, status_id, status_bool, game_object_id)
 
 		if ok and drop then
 			return
