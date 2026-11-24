@@ -61,6 +61,10 @@ local E_KINDS = {
 }
 local E_GRACE = 0.5 -- seconds past its attack's own length that a family E swing waits here for its copy's damage frame
 local JUMP_WAIT = 1.5 -- seconds a jump slam's landing waits here for its copy's damage frame
+-- Seconds a charge's test runs on here after the host's impact reaches this screen (the review of part (b)): the host
+-- may start its impact from its own view, for the look alone (D65), while this screen's copy of the charger still
+-- trails the host's by half a ping and the copy's smoothing. To tune from the logs (T22).
+local CHARGE_IMPACT_GRACE = 0.4
 local WAVE_FX_MEMORY = 1 -- seconds the anticipation effects of a lord's ground wave are kept for its swing
 local AXE_SEARCH = 4 -- metres from the champion's hand (2 m up, bt_throw_weapon_action.lua:81) its axe's copy appears
 local AXE_MEMORY = 2 -- seconds a thrown weapon's copy is kept for the swing that threw it
@@ -997,8 +1001,10 @@ end
 -- Family E4: the actor of this player's that a lord's upright cylinder (Geometry.lua, champion_cylinder) overlaps on this
 -- screen, with the game's own overlap and the attack's filter where it sees this player (after the original's
 -- prepare_actors_for_overlap, for an attack judged at its damage frame, bt_champion_attack_action.lua:635), else by
--- shape, where the player's middle stands in for the actor. Returns the actor's centre, or nil if it misses them.
-local function in_e_cylinder(swing, unit, target, centre, size, rotation, filter, prepare_radius)
+-- shape, where the player's middle stands in for the actor. accept, if given, is a further test of an actor's centre
+-- (a spin's swept angle): any of this player's actors that passes it counts, as the original tests each actor it
+-- found. Returns that actor's centre, or nil if it misses them.
+local function in_e_cylinder(swing, unit, target, centre, size, rotation, filter, prepare_radius, accept)
 	filter = filter or "filter_player_hit_box_check"
 
 	if overlap_sees(target, filter, "dynamics") then
@@ -1015,7 +1021,11 @@ local function in_e_cylinder(swing, unit, target, centre, size, rotation, filter
 
 		for _, actor in ipairs(actors or {}) do
 			if Actor.unit(actor) == target then
-				return Actor.center_of_mass(actor)
+				local actor_centre = Actor.center_of_mass(actor)
+
+				if not accept or accept(actor_centre) then
+					return actor_centre
+				end
 			end
 		end
 
@@ -1026,7 +1036,11 @@ local function in_e_cylinder(swing, unit, target, centre, size, rotation, filter
 
 	-- The overlap's size.y is half the cylinder's whole height, its rounded ends included (Geometry.lua).
 	if pc.geometry.player_in_capsule(position(target), centre, size.x, size.y) then
-		return position(target) + Vector3(0, 0, PLAYER_MIDDLE)
+		local middle = position(target) + Vector3(0, 0, PLAYER_MIDDLE)
+
+		if not accept or accept(middle) then
+			return middle
+		end
 	end
 
 	return nil
@@ -1411,7 +1425,9 @@ end
 -- impact that tests again for its hit_during_impact_t (:354, charge_seen). And it has no animations of its own (it
 -- leans, lunge.lean_variables), so its charging animation may still play, and fire the second cue, while it lunges,
 -- when the host's node ignores the cue; so a charge without lunge animations ignores it here too, and its test ends
--- with the host's next move. Every cue is logged, since the animations that fire them aren't in the game's Lua.
+-- with the host's next move. Once the host's impact has reached this screen, its test runs for its own time
+-- (charge_seen) and the cues no longer end or pause it, as the node's impact tests by time alone (:1000). Every cue is
+-- logged, since the animations that fire them aren't in the game's Lua.
 function client.charge_cue(unit, callback_name)
 	local swing = by_unit[unit]
 	local target = local_player_unit()
@@ -1431,7 +1447,7 @@ function client.charge_cue(unit, callback_name)
 			charge.open = true
 			swing.open = true
 		end
-	elseif charge.open then
+	elseif charge.open and not charge.until_t then
 		if callback_name == "anim_cb_disable_charge_collision" and action.hit_during_impact_t then
 			charge.paused = true
 		elseif callback_name ~= "anim_cb_charge_charging_finished" or lunge_animated then
@@ -1579,8 +1595,8 @@ end
 -- Family E4, radial_cylinder: copy of BTChampionAttackAction._update_radial_cylinder (bt_champion_attack_action.lua:655)
 -- on this screen's copy, every frame of the window: the cylinder round the lord (Geometry.lua), whose swing's angle
 -- turns from the lord's facing as the window opened, at the attack's own speed. This player is hit when the angle swept
--- since the last frame passes their trigger's centre (by shape, their middle), by the original's own maths. Returns
--- whether it reached them.
+-- since the last frame passes the centre of any of their actors in the cylinder (:691; by shape, their middle), by the
+-- original's own maths. Returns whether it reached them.
 local function radial_frame(swing, unit, target, t)
 	local champion = swing.champion
 	local action = swing.action
@@ -1600,27 +1616,28 @@ local function radial_frame(swing, unit, target, t)
 
 	champion.last_angle = new_angle
 
-	local centre, size, rotation = pc.geometry.champion_cylinder(action, self_position, self_rotation)
-	local mass_centre = in_e_cylinder(swing, unit, target, centre, size, rotation, action.collision_filter, nil)
-
-	if not mass_centre then
-		return false
-	end
-
-	local offset = mass_centre - self_position
-	local y = offset.y
-	local x = action.direction == "clockwise" and -offset.x or offset.x
-	local angle = math.atan2(y, x)
 	-- The original also passes the distance to math.tan, which ignores it (:712).
 	local radial_width = 2 * math.tan(RADIAL_CHECK_RADIUS)
-	local min_angle = (angle - radial_width - old_angle) % TWO_PI
-	local max_angle = (angle + radial_width - old_angle) % TWO_PI
 
-	if max_angle < min_angle then
-		min_angle = min_angle - TWO_PI
+	-- Whether the angle swept since the last frame passed this point, an actor's centre.
+	local function swept(mass_centre)
+		local offset = mass_centre - self_position
+		local y = offset.y
+		local x = action.direction == "clockwise" and -offset.x or offset.x
+		local angle = math.atan2(y, x)
+		local min_angle = (angle - radial_width - old_angle) % TWO_PI
+		local max_angle = (angle + radial_width - old_angle) % TWO_PI
+
+		if max_angle < min_angle then
+			min_angle = min_angle - TWO_PI
+		end
+
+		return min_angle < 0 and relative_angle < max_angle or min_angle > 0 and min_angle < relative_angle or max_angle > 0 and max_angle < relative_angle
 	end
 
-	return min_angle < 0 and relative_angle < max_angle or min_angle > 0 and min_angle < relative_angle or max_angle > 0 and max_angle < relative_angle
+	local centre, size, rotation = pc.geometry.champion_cylinder(action, self_position, self_rotation)
+
+	return in_e_cylinder(swing, unit, target, centre, size, rotation, action.collision_filter, nil, swept) ~= nil
 end
 
 -- Family E4, nav_mesh_wave: copy of BTChampionAttackAction._update_nav_mesh_wave (bt_champion_attack_action.lua:514):
@@ -1756,6 +1773,11 @@ local function champion_damage_frame(swing, unit, target, t)
 		champion_verdict(swing, unit, target, champion.frames, t, self_position)
 	else
 		e_send(swing, unit, target, champion.frames, "miss", action.collision_type == "cylinder" and "cylinder" or "box", nil, nil, nil, nil, rotation, facing, t, true)
+
+		-- A later damage frame of the same attack (a step of its attack_sequence) can come more than FACING_HOLD later,
+		-- so the swing is kept until the host's next move for the lord that isn't part of the attack
+		-- (client.animation_changed) or the swing's lifetime (the review of part (b)).
+		swing.release_t = math.huge
 	end
 end
 
@@ -2342,11 +2364,13 @@ local function own_attack_anim(swing, event)
 	return names(action.attack_anim, event)
 end
 
--- Family E3: the host's animations for a charge whose test runs on this screen. An impact (BTChargeAttackAction
--- ._start_impact, bt_charge_attack_action.lua:324) ends the test here, but for the minotaur's, which tests again for its
--- hit_during_impact_t after an impact that hit nobody (:354): this screen can't tell those apart, so it tests on for
--- that long after any. The charge stopped by a wall (charge_blocked_animation), cancelled or turning round to its
--- target is over.
+-- Family E3: the host's animations for a charge whose test runs on this screen. The charge stopped by a wall
+-- (charge_blocked_animation), cancelled or turning round to its target is over. An impact (BTChargeAttackAction
+-- ._start_impact, bt_charge_attack_action.lua:324) doesn't end the test at once: the host may have started it from its
+-- own view, for the look alone (D65), while this screen's copy of the charger still trails the host's, so the test
+-- runs on for CHARGE_IMPACT_GRACE, and the host books a hit that arrives during its impact (the review of part (b)).
+-- The minotaur's runs on for its hit_during_impact_t if that is longer, as its node tests again for that long after an
+-- impact that hit nobody (:354), which this screen can't tell from one after a hit on someone else.
 local function charge_seen(swing, unit, event)
 	local action = swing.action
 	local charge = swing.charge
@@ -2357,13 +2381,13 @@ local function charge_seen(swing, unit, event)
 
 	if names(action.charge_blocked_animation, event) or names(action.cancel_animation, event) or names(action.align_to_target_animation, event) then
 		e_close(swing, unit, local_player_unit(), tostring(event))
-	elseif names(action.impact_animation, event) then
-		if not action.hit_during_impact_t then
-			e_close(swing, unit, local_player_unit(), tostring(event))
-		elseif not charge.until_t then
-			charge.paused = false
-			charge.until_t = pc.now() + action.hit_during_impact_t
-		end
+	elseif names(action.impact_animation, event) and not charge.until_t then
+		local grace = math.max(action.hit_during_impact_t or 0, CHARGE_IMPACT_GRACE)
+
+		charge.paused = false
+		charge.until_t = pc.now() + grace
+
+		pc.log("client swing=%d enemy=%s: the host's charge impact (%s) reached this screen %.3fs after the swing began; its test runs on here for %.2fs", swing.id, swing.breed.name, tostring(event), pc.now() - swing.begin_t, grace)
 	end
 end
 
