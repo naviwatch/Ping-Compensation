@@ -646,8 +646,13 @@ local function apply_stagger(sender, id, go_id, stagger_type, duration, length, 
 
 	-- An empty animation: a stagger AiUtils.stagger refused on the client's screen (Reactions.lua), which shows nothing.
 	local procs_only = anim == ""
+	-- T15: vanilla's stagger_ai stops at a grudge mark's stagger immunity, before the stagger and its procs
+	-- (damage_utils.lua:3598). The client checks the immunity's buffs too, so this only catches one it didn't see. The
+	-- stagger_ai hook skipped nothing for such an enemy and checked nothing, so its answer goes into neither (review of
+	-- part (c)).
+	local immune = blackboard ~= nil and stagger_immune(blackboard, pc.now())
 
-	if unit then
+	if unit and not immune then
 		note_answer(unit)
 		check_answer(unit, sender, procs_only and 0 or stagger_type, id)
 	end
@@ -656,9 +661,7 @@ local function apply_stagger(sender, id, go_id, stagger_type, duration, length, 
 		return refuse("enemy dead, gone or not covered")
 	end
 
-	-- T15: vanilla's stagger_ai stops at a grudge mark's stagger immunity, before the stagger and its procs
-	-- (damage_utils.lua:3598). The client checks the immunity's buffs too, so this only catches one it didn't see.
-	if stagger_immune(blackboard, pc.now()) then
+	if immune then
 		pc.count("host_stagger_immune")
 
 		return refuse("stagger immune (a grudge mark)")
@@ -1626,11 +1629,9 @@ local function schedule_down(sender, id, go_id)
 		ack(sender, "down", id, "rejected")
 	end
 
-	-- It answers the stagger skipped here for that hit, as a kill does.
-	if unit then
-		note_answer(unit)
-	end
-
+	-- Unlike a kill, it doesn't answer the stagger skipped here for that hit: a blast's down is followed by its
+	-- procs-only stagger (Reactions.lua), which does, and a melee hit's skipped stagger goes unanswered, as any melee hit
+	-- on a monster's does (review of part (c)).
 	if not host.peer_decides_attacks(sender) then
 		return refuse("the host is deciding that player's hits")
 	end
