@@ -10,6 +10,8 @@ local host = pc.host
 --     round trip, so the enemy's next move reaches the client just as the stagger ends on their screen (D32).
 --   * A kill the client saw (pc_kill): if the hit left the enemy alive here, the host finishes it off, credited to
 --     that player.
+--   * A troll's down the client saw (pc_down, D63): if the hit left the troll up here, the host forces the down.
+--   * A grudge mark's stagger immunity (T15): the host refuses a client's stagger its own check calls immune.
 --   * A recoil the client played after a block: the host plays the same animation from where the client saw the
 --     enemy, and ends it one ping early (D14), so the enemy's next move reaches the blocker as their recoil ends. Like
 --     vanilla, it waits for both the recoil's timer and its animation's cue, each counted from the blocker's moment;
@@ -48,6 +50,7 @@ local recoils = {} -- enemy unit -> client recoil waiting for BTBlockedAction.en
 local timed_recoils = {} -- enemy unit -> running recoil whose end was brought forward (D14)
 local recoil_ends = {} -- enemy unit -> running recoil a client's block caused, until BTBlockedAction.leave logs why it ended
 local kills = {} -- enemy unit -> client kill waiting to be finished off
+local downs = {} -- client troll downs (pc_down) waiting to be forced, oldest first (D63)
 local stagger_watch = {} -- enemy unit -> the stagger animation the host is playing for it, until its end cue
 local playable = {} -- stagger action table -> set of every animation it can play
 local cue_watch = {} -- enemy unit -> the recoil animation the host is playing for it, until its cue
@@ -158,6 +161,48 @@ function host_reactions.client_decides(channel_id, attacker_unit_id, hit_unit_id
 	end
 
 	return hit_unit
+end
+
+-- T15: copy of the local is_stagger_immune (damage_utils.lua:3496): the stagger immunity a grudge mark gives
+-- (blackboard.stagger_immunity, make_stagger_immune, buff_settings_grudge_marks.lua:674), at which vanilla's stagger_ai
+-- stops before its maths and the hit's procs (:3598). Not copied: its debug note, and add_stagger_hit (:3474), which
+-- counts staggers towards an immunity that needs num_attacks, which no immunity in the 6.13 data sets.
+local function stagger_immune(blackboard, t)
+	local immunity = blackboard and blackboard.stagger_immunity
+
+	if type(immunity) ~= "table" then
+		return false
+	end
+
+	local health_percent = blackboard.current_health_percent or 1
+	local health_threshold = immunity.health_threshold
+
+	if health_threshold and health_threshold < health_percent then
+		return true
+	end
+
+	local damage_left = 0
+
+	if immunity.stagger_immune_at_health then
+		damage_left = (immunity.damage_threshold or 0) - (immunity.stagger_immune_at_health - health_percent)
+	end
+
+	local time_left = 0
+
+	if immunity.stagger_immune_at then
+		time_left = immunity.stagger_immune_at + (immunity.time or 0) - t
+	end
+
+	return damage_left > 0 and time_left > 0
+end
+
+-- D63: the plain troll's health extension (ChaosTrollHealthExtension), whose downs clients decide; the troll chief's
+-- fixed chunks are a lord's (D64). Returns it, or nil.
+local function troll_health(unit)
+	local health = ScriptUnit.has_extension(unit, "health_system")
+	local action = health and health.force_set_wounded ~= nil and health.action
+
+	return type(action) == "table" and type(action.become_downed_hp_percent) == "number" and not action.fixed_hp_chunks and health or nil
 end
 
 -- The engine's ping is the round trip: the testers' host logs match it to the time from the host's damage frame to
@@ -355,7 +400,7 @@ end
 -- included. The one thing it leaves on the enemy, a shield's blocked_previous_attack, is put back. One thing the skipped
 -- stagger_ai would have done is done here: an attack that ignores this stagger by restarting its wind-up (an elite's
 -- "reset_attack", damage_utils.lua:3565) is reset, as in vanilla, since the client sends nothing for a stagger its
--- enemy ignores. Not copied: a grudge mark's stagger immunity (T15).
+-- enemy ignores. A grudge mark's stagger immunity (T15) never gets here: the stagger_ai hook lets vanilla run for it.
 -- Returns the stagger type (0 for none), why there is none, and the stagger strength the maths worked out.
 local function host_would(damage_profile, target_index, power_level, target_unit, attacker_unit, hit_zone_name, boost_curve_multiplier, is_critical_strike, blocked, damage_source)
 	local blackboard = BLACKBOARDS[target_unit]
@@ -364,6 +409,13 @@ local function host_would(damage_profile, target_index, power_level, target_unit
 
 	if not blackboard or not attack_template or not attacker_unit or not Unit.alive(attacker_unit) then
 		return nil
+	end
+
+	-- D63: a downed troll's behaviour tree runs its downed branch before its stagger (BTConditions.troll_downed,
+	-- bt_conditions.lua:474), whose leave clears the stagger (bt_troll_downed_action.lua:59), so none shows, as on the
+	-- client's screen (Reactions.lua).
+	if blackboard.can_get_downed and blackboard.downed_state then
+		return 0, "the troll is down", 0
 	end
 
 	local shield = ScriptUnit.has_extension(target_unit, "ai_shield_system")
@@ -602,6 +654,14 @@ local function apply_stagger(sender, id, go_id, stagger_type, duration, length, 
 
 	if not breed or not pc.REACTION_BREEDS[breed.name] or not HEALTH_ALIVE[unit] then
 		return refuse("enemy dead, gone or not covered")
+	end
+
+	-- T15: vanilla's stagger_ai stops at a grudge mark's stagger immunity, before the stagger and its procs
+	-- (damage_utils.lua:3598). The client checks the immunity's buffs too, so this only catches one it didn't see.
+	if stagger_immune(blackboard, pc.now()) then
+		pc.count("host_stagger_immune")
+
+		return refuse("stagger immune (a grudge mark)")
 	end
 
 	local attacker = player_unit(sender)
@@ -1554,6 +1614,113 @@ mod:network_register("pc_kill", function (sender, version, id, go_id, hit_zone, 
 	pc.guard("host client kill", schedule_kill, sender, id, go_id, hit_zone, damage_type, dx, dy, dz, damage_source)
 end)
 
+-- D63: a client's hit took a troll under its line to go down on that client's screen. Like a stagger, it counts only
+-- while the host takes that player's hits from their screen; like a kill, it is forced a moment later if the hit left
+-- the troll up here (finish_down).
+local function schedule_down(sender, id, go_id)
+	local unit = Managers.state.unit_storage:unit(go_id)
+
+	local function refuse(reason)
+		pc.count("host_down_refused")
+		pc.log("host down=%d from=%s refused: %s", id, name_of(sender), reason)
+		ack(sender, "down", id, "rejected")
+	end
+
+	-- It answers the stagger skipped here for that hit, as a kill does.
+	if unit then
+		note_answer(unit)
+	end
+
+	if not host.peer_decides_attacks(sender) then
+		return refuse("the host is deciding that player's hits")
+	end
+
+	local blackboard = unit and BLACKBOARDS[unit]
+	local breed = blackboard and blackboard.breed
+
+	if not breed or not HEALTH_ALIVE[unit] or not pc.REACTION_BREEDS[breed.name] or not troll_health(unit) then
+		return refuse("not a living troll whose downs clients decide")
+	end
+
+	downs[#downs + 1] = {
+		id = id,
+		peer = sender,
+		unit = unit,
+		go_id = go_id,
+		breed_name = breed.name,
+		due = pc.now() + KILL_DELAY,
+	}
+end
+
+mod:network_register("pc_down", function (sender, version, id, go_id)
+	if pc.broken or not pc.is_server() or not pc.in_game() or version ~= pc.VERSION then
+		return
+	end
+
+	if type(id) ~= "number" or type(go_id) ~= "number" then
+		pc.count("host_rejected")
+		pc.print("host rejected a malformed down from %s", name_of(sender))
+
+		return
+	end
+
+	pc.count("host_down_received")
+	pc.guard("host client down", schedule_down, sender, id, go_id)
+end)
+
+-- What ChaosTrollHealthExtension.add_damage does when a hit takes an unhurt troll under its line
+-- (chaos_troll_health_extension.lua:210 to :231, :260 and :262): its damage starts again from nothing and it is down,
+-- which its behaviour tree takes up on its next update (BTConditions.troll_downed), whose BTTrollDownedAction.enter
+-- plays its fall for every client.
+local function force_down(unit, health)
+	local action = health.action
+	local t = Managers.time:time("game")
+
+	health.damage = 0
+	health.state = "down"
+	BLACKBOARDS[unit].downed_state = "downed"
+	health.start_reset_time = t + (AiUtils.downed_duration(action) + action.standup_anim_duration - action.reset_duration)
+	health.down_reset_timer = 0
+
+	AiUtils.set_material_property(health.skin_unit or unit, "damage_value", "mtr_skin", 1, true)
+
+	health._regen_paused_time = t + (health.regen_taken_damage_pause_time or 0)
+
+	health:sync_health_to_clients(nil)
+end
+
+local function finish_down(record)
+	local unit = record.unit
+
+	if not Unit.alive(unit) or not HEALTH_ALIVE[unit] or Managers.state.unit_storage:go_id(unit) ~= record.go_id or not BLACKBOARDS[unit] then
+		pc.count("host_down_refused")
+		pc.log("host down=%d from=%s refused: the troll died first", record.id, name_of(record.peer))
+		ack(record.peer, "down", record.id, "rejected")
+
+		return
+	end
+
+	local health = troll_health(unit)
+	local state = health and health.state
+
+	if state == "down" then
+		pc.count("host_down_itself")
+		pc.log("host down=%d from=%s enemy=%s: went down here itself", record.id, name_of(record.peer), record.breed_name)
+		ack(record.peer, "down", record.id, "applied")
+	elseif state == "unhurt" then
+		local left, max_health, line = health.health - health.damage, health.health, health.go_down_health
+
+		force_down(unit, health)
+		pc.count("host_down_forced")
+		pc.log("host down=%d from=%s enemy=%s: forced, with %.1f of %.1f health left here and its line at %.1f", record.id, name_of(record.peer), record.breed_name, left, max_health, line or 0)
+		ack(record.peer, "down", record.id, "applied")
+	else
+		pc.count("host_down_refused")
+		pc.log("host down=%d from=%s enemy=%s refused: it is %s here", record.id, name_of(record.peer), record.breed_name, tostring(state))
+		ack(record.peer, "down", record.id, "rejected")
+	end
+end
+
 local function finish_kill(unit, record)
 	if not Unit.alive(unit) or not HEALTH_ALIVE[unit] or Managers.state.unit_storage:go_id(unit) ~= record.go_id then
 		pc.count("host_kill_already_dead")
@@ -1563,6 +1730,17 @@ local function finish_kill(unit, record)
 	end
 
 	local attacker = record.attacker and Unit.alive(record.attacker) and record.attacker or nil
+
+	-- D63: AiUtils.kill_unit only damages, and only a wounded troll dies of damage (_should_die,
+	-- chaos_troll_health_extension.lua:188); an unhurt one would go down instead. A troll killed on a client's screen was
+	-- wounded there, so one that isn't here yet is made wounded first, as its own die does (:327).
+	local troll = troll_health(unit)
+
+	if troll and troll.state ~= "wounded" then
+		pc.count("host_kill_troll_made_wounded")
+		pc.log("host kill=%d from=%s: the troll was %s here, so it is made wounded first", record.id, name_of(record.peer), tostring(troll.state))
+		troll:force_set_wounded()
+	end
 
 	AiUtils.kill_unit(unit, attacker, record.hit_zone, record.damage_type, record.direction:unbox(), record.damage_source)
 	pc.count("host_kill_finished")
@@ -1577,6 +1755,19 @@ function host_reactions.update()
 			kills[unit] = nil
 
 			finish_kill(unit, record)
+		end
+	end
+
+	local i = 1
+
+	while i <= #downs do
+		local record = downs[i]
+
+		if t >= record.due then
+			table.remove(downs, i)
+			finish_down(record)
+		else
+			i = i + 1
 		end
 	end
 
@@ -1678,6 +1869,7 @@ function host_reactions.clear()
 	timed_recoils = {}
 	recoil_ends = {}
 	kills = {}
+	downs = {}
 	stagger_watch = {}
 	cue_watch = {}
 	late_recoils = {}
@@ -1833,6 +2025,18 @@ end
 mod:hook("DamageUtils", "stagger_ai", function (func, t, damage_profile, target_index, power_level, target_unit, ...)
 	if pc.debug and not pc.broken and (skip_stagger_for == nil or skip_stagger_for ~= target_unit) then
 		pc.guard("host own stagger maths", log_own_maths, damage_profile, target_index, power_level, target_unit, ...)
+	end
+
+	-- T15: vanilla stops at a grudge mark's stagger immunity before anything else (damage_utils.lua:3598), so it runs as
+	-- it would have, nothing waits for the client, and the client shows nothing for it either (Reactions.lua).
+	if skip_stagger_for ~= nil and skip_stagger_for == target_unit then
+		local ok, immune = pc.guard("host stagger immunity", stagger_immune, BLACKBOARDS[target_unit], t)
+
+		if ok and immune then
+			pc.count("host_stagger_immune_vanilla")
+
+			return func(t, damage_profile, target_index, power_level, target_unit, ...)
+		end
 	end
 
 	if skip_stagger_for ~= nil and skip_stagger_for == target_unit then

@@ -100,6 +100,21 @@ local pc = {
 		chaos_vortex_sorcerer = true,
 		chaos_corruptor_sorcerer = true,
 		beastmen_ungor_archer = true,
+		-- Build 6 part (c) (D63): the monsters. Only blasts and the stormfiend's weak spot stagger them; the troll's downs
+		-- and kills follow its phases (Reactions.lua). The lords' reactions stay with the host for now (D64, T21).
+		skaven_rat_ogre = true,
+		skaven_stormfiend = true,
+		chaos_spawn = true,
+		chaos_spawn_exalted_champion_norsca = true,
+		chaos_troll = true,
+		beastmen_minotaur = true,
+	},
+	-- T15: buffs that make an enemy stagger immune (make_stagger_immune, buff_settings_grudge_marks.lua:674), which
+	-- vanilla's stagger_ai checks before anything else (is_stagger_immune, damage_utils.lua:3496): a grudge mark's
+	-- (:195) and the termite boss's rage (:124). A client shows no stagger for an enemy whose copy carries one.
+	STAGGER_IMMUNE_BUFFS = {
+		"grudge_mark_unstaggerable",
+		"grudge_mark_termite_stagger_immune_buff",
 	},
 	-- Covered breeds whose stagger animations play faster when the stagger_scale variable is raised (the calibration
 	-- probe, 2026-11-14: 2x asked, 2x reached). The host plays a client's stagger of these faster (D32, D38). The other
@@ -117,8 +132,15 @@ local pc = {
 	-- Build 3.1 diagnostic: the clients decided "too weak to stagger" for hundreds of hits on these. For a client's
 	-- hits on them, the host still works out its own stagger, without applying it, and logs where it disagrees; both
 	-- sides log what their stagger maths used for every hit on them (pc.stagger_inputs, D45). Build 4 checks the elites
-	-- the same way, to show where the client's stand-in falls short for them, and build 5 the specials.
+	-- the same way, to show where the client's stand-in falls short for them, build 5 the specials and build 6 the
+	-- monsters.
 	CHECK_BREEDS = {
+		skaven_rat_ogre = true,
+		skaven_stormfiend = true,
+		chaos_spawn = true,
+		chaos_spawn_exalted_champion_norsca = true,
+		chaos_troll = true,
+		beastmen_minotaur = true,
 		skaven_pack_master = true,
 		skaven_gutter_runner = true,
 		skaven_ratling_gunner = true,

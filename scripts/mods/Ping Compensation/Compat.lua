@@ -26,12 +26,12 @@ local TOGGLES = {
 }
 
 -- The breeds whose data the client's maths reads: those whose reactions it decides (pc.REACTION_BREEDS), and every other
--- enemy whose attacks it judges. The host sends a client the attacks of any enemy that isn't a boss (Host.lua), so those
--- are every such breed whose behaviour tree has one of these nodes. In game version 6.13 that is the bulwark, the
--- ethereal skeletons of the wizard's tower map, the sorcerers of the skulking sorcerer mutator and of its Chaos Wastes
--- curse, the prologue's clan rat and marauder, chaos_skeleton, and the Necromancer's skeletons, which fight only
--- enemies. They are found from the game's own tables (fingerprint_breeds), so the list keeps up with the game (D57
--- review: all but the bulwark had been left out of the list written by hand).
+-- enemy whose attacks it judges. The host sends a client the attacks of any enemy, bosses included since build 6
+-- (Host.lua), so those are every breed whose behaviour tree has one of these nodes. In game version 6.13 that is the
+-- bulwark, the lords, the ethereal skeletons of the wizard's tower map, the sorcerers of the skulking sorcerer mutator
+-- and of its Chaos Wastes curse, the prologue's clan rat and marauder, chaos_skeleton, and the Necromancer's skeletons,
+-- which fight only enemies. They are found from the game's own tables (fingerprint_breeds), so the list keeps up with
+-- the game (D57 review: all but the bulwark had been left out of the list written by hand).
 local JUDGED_NODES = {
 	BTAttackAction = true, -- family A
 	BTComboAttackAction = true, -- B
@@ -44,13 +44,23 @@ local JUDGED_NODES = {
 	BTFireProjectileAction = true,
 	BTThrowPoisonGlobeAction = true, -- H
 	BTWarpfireThrowerShootAction = true,
+	BTMeleeOverlapAttackAction = true, -- E (build 6)
+	BTMeleeSlamAction = true,
+	BTChargeAttackAction = true,
+	BTChampionAttackAction = true,
+	BTJumpSlamImpactAction = true,
+	BTThrowWeaponAction = true,
 }
 
 local BREED_FIELDS = {
 	"armor_category",
+	"armored_boss_damage_reduction",
 	"berzerking_stagger_time",
 	"block_stagger_mod",
 	"block_stagger_mod_2",
+	"boost_curve_multiplier_override",
+	"boss",
+	"boss_damage_reduction",
 	"boss_staggers",
 	"diff_stagger_resist",
 	"dodge_timer",
@@ -58,6 +68,7 @@ local BREED_FIELDS = {
 	"hitzone_armor_categories",
 	"hitzone_multiplier_types",
 	"hitzone_primary_armor_categories",
+	"lord_damage_reduction",
 	"max_health",
 	"max_stagger_duration",
 	"no_random_stagger_duration",
@@ -68,6 +79,7 @@ local BREED_FIELDS = {
 	"race",
 	"radius",
 	"shield_opening_event",
+	"small_boss_staggers",
 	"stagger_armor_category",
 	"stagger_duration",
 	"stagger_duration_difficulty_mod",
@@ -122,56 +134,108 @@ local ACTION_NODES = {
 	-- Build 5.1 (D52): the archer's arrows (family G) and the globadier's throw, whose impact the client judges (family H).
 	BTFireProjectileAction = true,
 	BTThrowPoisonGlobeAction = true,
+	-- Build 6: the monsters' and lords' attacks (family E), and the troll's down, whose line the client's troll rule
+	-- reads (D63).
+	BTMeleeOverlapAttackAction = true,
+	BTMeleeSlamAction = true,
+	BTChargeAttackAction = true,
+	BTChampionAttackAction = true,
+	BTJumpSlamImpactAction = true,
+	BTThrowWeaponAction = true,
+	BTTrollDownedAction = true,
 }
 
 -- The fields of those action tables that the client's maths reads. Only these are fingerprinted, so state the host's
--- AI might keep in an action table can't make two machines look different.
+-- AI might keep in an action table can't make two machines look different. Family E's lists of attacks (attacks,
+-- running_attacks, attack_sequence) and the charge's lunge go in whole, each attack with all its own fields; none of
+-- the nodes writes to them (build 6).
 local ACTION_FIELDS = {
 	"aim_animation",
 	"aim_cooldown",
 	"aim_rotation_override_distance",
+	"align_to_target_animation",
+	"anim_driven",
+	"anticipation_fx",
 	"aoe_init_damage",
 	"attack_anim",
+	"attack_anims",
 	"attack_directions",
+	"attack_sequence",
+	"attack_time",
+	"attacks",
+	"become_downed_hp_percent",
 	"blocked_anim",
 	"blocked_anims",
 	"blocked_damage",
+	"blocked_velocity_scale",
 	"buff_name",
+	"cancel_animation",
 	"catapult",
+	"catapult_force_z",
+	"catapult_on_push_other_targets",
+	"catapult_on_push_z",
+	"catapult_player",
+	"catapult_players",
+	"catapult_within_radius",
+	"catapulted_player_speed",
+	"catch_animation",
+	"charge_blocked_animation",
+	"charging_animations",
+	"close_attack_animation",
 	"close_attack_cooldown",
 	"close_attack_range",
+	"collision_filter",
+	"collision_type",
 	"combo_attacks",
 	"damage",
 	"damage_type",
 	"difficulty_duration",
+	"direction",
 	"dodge_angle",
 	"dodge_distance",
+	"dodge_mitigation_radius_squared",
+	"dodge_past_push_speed",
 	"dodge_window_duration",
 	"dodge_window_start",
 	"fatigue_type",
 	"firing_time",
+	"fixed_hp_chunks",
+	"forward_offset",
 	"grab_delay",
 	"grabbing_stagger_anims",
+	"head_radius",
 	"height",
+	"hit_during_impact_t",
 	"hit_radius",
 	"hit_react_type",
 	"ignore_dodge",
+	"ignore_shield_block",
 	"ignore_staggers",
+	"impact_animation",
 	"impact_push_speed",
+	"impact_shove_multiplier",
 	"initial_radius",
 	"knocked_down_attack_anim",
 	"light_weight_projectile_template_name",
+	"lunge",
 	"max_distance_squared",
 	"max_impact_push_speed",
 	"max_player_push_speed",
 	"min_dodge_angle_squared",
+	"mode",
+	"movement_controlled_rotation",
 	"moving_attack",
 	"moving_stagger_minimum_destination_distance",
 	"moving_stagger_threshold",
 	"muzzle_node",
 	"no_block_stagger",
 	"offset_forward",
+	"offset_right",
 	"offset_up",
+	"overlap_end_angle_offset",
+	"overlap_end_time",
+	"overlap_start_angle_offset",
+	"overlap_start_time",
 	"player_dodged_cone",
 	"player_dodged_radius",
 	"player_push_speed",
@@ -179,6 +243,8 @@ local ACTION_FIELDS = {
 	"projectile_gravity",
 	"projectile_speed",
 	"push",
+	"push_speed",
+	"push_speed_z",
 	"radial_speed_feet_shooting",
 	"radial_speed_upper_body_shooting",
 	"radius",
@@ -186,19 +252,29 @@ local ACTION_FIELDS = {
 	"reset_attack_animations",
 	"rotation_time",
 	"rotation_time_step",
+	"running_attacks",
 	"scale_animation_speeds",
 	"shield_block_anims",
+	"shield_blocked_fatigue_type",
 	"shield_break_anims",
 	"shield_stagger_anims",
 	"shoot_animation",
 	"shoot_cooldown",
+	"shove_speed",
+	"shove_z_speed",
 	"stagger_animation_scale",
 	"stagger_anims",
 	"stagger_reduction",
 	"standard_stagger_anims",
+	"start_animation",
 	"step_attack_anim",
+	"target_dodged_radius",
+	"throw_animation",
 	"unblockable",
+	"unblockable_by_normal_blocks",
 	"use_box_range",
+	"wall_collision_anim",
+	"wave_speed",
 	"weapon_reach",
 	"width",
 }
@@ -379,7 +455,9 @@ end
 local judged_breeds = nil -- worked out once: the game's breeds and trees don't change while it runs
 
 -- The breeds to fingerprint, sorted by name so every machine feeds them in the same order: { name, decides }, where
--- decides says this client decides that enemy's reactions.
+-- decides says this client decides that enemy's reactions. Bosses count since build 6: the monsters' reactions are
+-- decided on clients (D63), and every boss's attacks are judged there (D61); the lords, whose reactions stay with the
+-- host (D64), get only the breed fields judging reads (REACH_FIELDS).
 local function fingerprint_breeds()
 	if judged_breeds then
 		return judged_breeds
@@ -391,7 +469,7 @@ local function fingerprint_breeds()
 		if type(breed) == "table" and breed.name == name then
 			local decides = pc.REACTION_BREEDS[name] == true
 
-			if decides or not breed.boss and not breed.is_player and has_judged_node(pc.tree_of(breed), 0) then
+			if decides or not breed.is_player and has_judged_node(pc.tree_of(breed), 0) then
 				list[#list + 1] = {
 					name = name,
 					decides = decides,

@@ -8,6 +8,8 @@ local pc = mod.pc
 --   * This player's hit kills an enemy by this machine's reckoning: it dies here at once and pc_kill tells the host,
 --     which finishes it off if the hit left it alive there.
 --   * This player blocks a swing: the enemy's recoil plays here at once. Client.lua sends the choice with the answer.
+--   * This player's hit takes a troll under its line to go down (D63): its fall plays here at once and pc_down tells
+--     the host, which forces the down if its own numbers fell short. Its kills follow its phases (troll_damage).
 -- The host's own copy of the reaction comes back a ping later (the echo) and is dropped. Until it arrives, the host's
 -- other animation changes for that enemy are held back as well: the host sent them before it applied this reaction,
 -- and the reaction replaces them there too. The host acknowledges every stagger and recoil. If it refuses one, the
@@ -27,12 +29,16 @@ local BLAST_ECHO_WAIT = 3 -- the same for a blast's stagger, which reaches the h
 local MAX_MESSAGE_LENGTH = 450 -- characters; VMF packs a message's values into one string of at most 500 (mod_manager.lua:626)
 local STAGGER_MARGIN = 2 -- seconds the position stays ours past the predicted end of a stagger, unless the host moves on
 local RECOIL_HOLD = 2.5 -- the same for a recoil
+-- Seconds a troll's fall shown here (show_down) is kept: past the echo's wait, and within its shortest down (3 s,
+-- min_downed_duration, breed_chaos_troll.lua:1106).
+local DOWN_HOLD = 2.5
 local DEAD_MEMORY = 5 -- seconds the host's messages about an enemy killed on this screen are ignored
 local SWEEP_INTERVAL = 1
 
 local fakes = {} -- enemy unit -> what this client knows of that enemy's stagger state, in the shape of the host's blackboard
 local predictions = {} -- enemy unit -> the reaction this screen is showing
-local by_key = {} -- "stagger:<id>" or "recoil:<swing id>" -> the same record, for the host's acknowledgement
+local by_key = {} -- "stagger:<id>", "recoil:<swing id>" or "down:<id>" -> the same record, for the host's acknowledgement
+local trolls = {} -- enemy unit -> { go_id, state, predicted, down } for a troll this player has hit (D63, troll_damage)
 local dead = {} -- enemy unit -> { health = its health extension, t } for enemies killed on this screen
 local stagger_lookup = {} -- breed name -> { [animation] = stagger type }
 local recoil_lookup = {} -- breed name -> { [animation] = true } for its recoil animations
@@ -178,6 +184,87 @@ local function add_attack_anims(lookup, anims, action)
 	end
 end
 
+-- An animation name, or a list or table of them by direction or distance, as the monsters' and lords' nodes keep them.
+local function add_anim_names(lookup, value, action, depth)
+	if type(value) == "string" then
+		lookup[value] = lookup[value] or action
+	elseif type(value) == "table" and depth < 3 then
+		for _, item in pairs(value) do
+			add_anim_names(lookup, item, action, depth + 1)
+		end
+	end
+end
+
+local function add_attack_list(list, add)
+	if type(list) ~= "table" then
+		return
+	end
+
+	for _, attack in pairs(list) do
+		if type(attack) == "table" then
+			add(attack.attack_anim)
+			add(attack.multi_attack_anims)
+			add(type(attack.wall_collision) == "table" and attack.wall_collision.animation or nil)
+		end
+	end
+end
+
+-- Build 6 part (c): the animations the monsters' and lords' attack nodes play while they run, besides
+-- ATTACK_ANIM_FIELDS, so this client knows the attack an enemy is in (and its ignore_staggers) from any of them.
+local NODE_ANIMS = {
+	-- Each attack's own animation, or one of its multi_attack_anims by the target's side, from attacks or, when the
+	-- target runs away, running_attacks (bt_melee_overlap_attack_action.lua:147 to :182); a charging attack's wall stun
+	-- (:268).
+	BTMeleeOverlapAttackAction = function (action, add)
+		add_attack_list(action.attacks, add)
+		add_attack_list(action.running_attacks, add)
+	end,
+	-- One of attack_anims by the target's side, else attack_anim (bt_melee_slam_action.lua:45 and :60).
+	BTMeleeSlamAction = function (action, add)
+		add(action.attack_anims)
+	end,
+	-- The charge's start, run, lunge, impact or blocked impact, and cancel (bt_charge_attack_action.lua:54, :296, :334 to
+	-- :341, :412 and :1037). Its align after the charge is left out: that animation is a plain turn (the bestigor's
+	-- turn_bwd), which other nodes play too.
+	BTChargeAttackAction = function (action, add)
+		add(action.start_animation)
+		add(action.charging_animations)
+		add(type(action.lunge) == "table" and action.lunge.animations or nil)
+		add(action.impact_animation)
+		add(action.charge_blocked_animation)
+		add(action.cancel_animation)
+	end,
+	-- Each step of a lord's attack sequence (bt_champion_attack_action.lua:356), and its lunge's wall stun (:500).
+	BTChampionAttackAction = function (action, add)
+		if type(action.attack_sequence) == "table" then
+			for _, step in pairs(action.attack_sequence) do
+				if type(step) == "table" then
+					add(step.attack_anim)
+				end
+			end
+		end
+
+		add(action.wall_collision_anim)
+	end,
+	-- The axe's throw, its catch and the close attack the lord makes instead (bt_throw_weapon_action.lua:20, :134 and
+	-- :341).
+	BTThrowWeaponAction = function (action, add)
+		add(action.throw_animation)
+		add(action.catch_animation)
+		add(action.close_attack_animation)
+	end,
+}
+
+local function add_node_anims(node, lookup, action)
+	local add_all = NODE_ANIMS[node[1]]
+
+	if add_all then
+		add_all(action, function (value)
+			add_anim_names(lookup, value, action, 0)
+		end)
+	end
+end
+
 local function collect_attack_anims(node, lookup, depth)
 	if type(node) ~= "table" or depth > 30 then
 		return
@@ -202,6 +289,8 @@ local function collect_attack_anims(node, lookup, depth)
 			for i = 1, #ATTACK_ANIM_FIELDS do
 				add_attack_anims(lookup, action[ATTACK_ANIM_FIELDS[i]], action)
 			end
+
+			add_node_anims(node, lookup, action)
 		end
 	end
 
@@ -234,8 +323,10 @@ local NOT_ATTACKS = {
 
 -- The attacks a block can make an enemy recoil from, each with the animations it plays: its single attacks
 -- (BTAttackAction) and, since every enemy is timed (D47), the other attack nodes of its tree, such as the elites'
--- sweeps and shoves (BTStormVerminAttackAction, BTStormVerminPushAction). A blocked frenzy step recoils only when its
--- combo goes on to "stagger" (bt_combo_attack_action.lua:313), which no covered enemy's does, so combos aren't listed.
+-- sweeps and shoves (BTStormVerminAttackAction, BTStormVerminPushAction), and from build 6 the monsters' and lords'
+-- (NODE_ANIMS; of these, the bulwark's running attacks and the bestigor's charge recoil after a block). A blocked frenzy
+-- step recoils only when its combo goes on to "stagger" (bt_combo_attack_action.lua:313), which no covered enemy's
+-- does, so combos aren't listed.
 local function collect_attacks(node, list, depth)
 	if type(node) ~= "table" or depth > 30 then
 		return
@@ -253,6 +344,8 @@ local function collect_attacks(node, list, depth)
 			for i = 1, #ATTACK_ANIM_FIELDS do
 				add_attack_anims(anims, action[ATTACK_ANIM_FIELDS[i]], action)
 			end
+
+			add_node_anims(node, anims, action)
 		end
 
 		if next(anims) ~= nil then
@@ -552,6 +645,53 @@ local function fake_of(unit)
 	local fake = fakes[unit]
 
 	return fake and fake.go_id == Managers.state.unit_storage:go_id(unit) and fake or nil
+end
+
+-- D63: the plain troll's own rule, from its husk's health extension (ChaosTrollHuskHealthExtension, whose action is its
+-- downed action, chaos_troll_husk_health_extension.lua:48): its health goes in phases, and it goes down below a share of
+-- it. The troll chief's fixed chunks are a lord's (D64), so its downs stay the host's. Returns the downed action.
+local function troll_rule(health)
+	local action = health and health.sync_damage_taken ~= nil and health.action
+
+	return type(action) == "table" and type(action.become_downed_hp_percent) == "number" and not action.fixed_hp_chunks and action or nil
+end
+
+-- Whether this troll is down on this screen: the host's numbers say so, or this screen is showing its fall (show_down).
+local function troll_down(unit)
+	local health = ScriptUnit.has_extension(unit, "health_system")
+
+	if not troll_rule(health) then
+		return false
+	end
+
+	if health.state == "down" then
+		return true
+	end
+
+	local record = trolls[unit]
+
+	return record ~= nil and record.down ~= nil and record.go_id == Managers.state.unit_storage:go_id(unit)
+end
+
+-- T15: the buff on this screen's copy of the enemy that makes it stagger immune, if any (pc.STAGGER_IMMUNE_BUFFS). The
+-- host adds a grudge mark's buffs as server-controlled buffs (TerrorEventUtils.apply_breed_enhancements,
+-- terror_event_utils.lua:101), which reach every client (BuffSystem.add_buff, buff_system.lua:305).
+local function immunity_buff(unit)
+	local buffs = ScriptUnit.has_extension(unit, "buff_system")
+
+	if not buffs or not buffs.has_buff_type then
+		return nil
+	end
+
+	for i = 1, #pc.STAGGER_IMMUNE_BUFFS do
+		local name = pc.STAGGER_IMMUNE_BUFFS[i]
+
+		if buffs:has_buff_type(name) then
+			return name
+		end
+	end
+
+	return nil
 end
 
 -- Whether this unit is an enemy killed on this screen, whose host messages are ignored. Only while the unit is still
@@ -1049,6 +1189,22 @@ local function finish_prediction(prediction, reason, catch_up)
 		end
 	end
 
+	-- A troll's fall shown here (D63): from now on the host's numbers alone say whether it is down. If the host refused
+	-- it or never played it, the troll is up again here too.
+	if prediction.kind == "down" then
+		local record = trolls[prediction.unit]
+
+		if record and record.down == prediction.id then
+			record.down = nil
+		end
+
+		-- The fall has no end of its own: with no newer change from the host to play instead, the troll gets up into its
+		-- idle here, and the host's next move takes it on from there.
+		if catch_up and not prediction.echo_seen and not held and Unit.alive(prediction.unit) and Unit.has_animation_state_machine(prediction.unit) and Unit.has_animation_event(prediction.unit, "idle") then
+			animation_system():anim_event(prediction.unit, "idle", true)
+		end
+	end
+
 	-- The host never played this reaction, so this screen plays the newest change the host did make, and the stand-in
 	-- follows it.
 	if catch_up and held and not prediction.echo_seen and Unit.alive(prediction.unit) and Unit.has_animation_state_machine(prediction.unit) then
@@ -1119,7 +1275,7 @@ function reactions.busy(unit)
 	-- Before the echo, the host started this swing without knowing of the reaction this screen shows, and that
 	-- reaction cancels the swing there as well. After the echo, a new swing means the host's reaction is over.
 	if not prediction.echo_seen then
-		return prediction.kind == "recoil" and "recoiling" or "staggered by you"
+		return prediction.kind == "recoil" and "recoiling" or prediction.kind == "down" and "downed by you" or "staggered by you"
 	end
 
 	finish_prediction(prediction, "the host started a new swing")
@@ -1221,8 +1377,8 @@ end
 -- What DamageUtils.stagger_ai (damage_utils.lua:3578) and AiUtils.stagger decide for this hit, on this client's
 -- stand-in for the host's blackboard. The stagger maths itself is the game's own DamageUtils.calculate_stagger_player,
 -- which reads BLACKBOARDS[unit]; enemies have none on a client, so the stand-in is put there for the call.
--- Not copied: is_stagger_immune (damage_utils.lua:3496), which only enemies with a grudge mark's stagger immunity
--- have (blackboard.stagger_immunity, buff_settings_grudge_marks.lua:674), mostly monsters and lords (T15).
+-- A grudge mark's stagger immunity, which vanilla checks first (is_stagger_immune, damage_utils.lua:3496), is checked
+-- before this, from the enemy's buffs (stagger, T15).
 local function work_out_stagger(unit, breed, fake, attacker, damage_profile, target_index, hit_zone_name, attack_direction, damage_source, t, profile_name)
 	local target_settings = damage_profile.targets and damage_profile.targets[target_index] or damage_profile.default_target
 	local attack_template = target_settings and DamageUtils.get_attack_template(target_settings.attack_template)
@@ -1285,6 +1441,10 @@ local function work_out_stagger(unit, breed, fake, attacker, damage_profile, tar
 		refused = "already blown back"
 	elseif breed.boss_staggers and stagger_type < stagger_types.explosion then
 		refused = "boss"
+	elseif troll_down(unit) then
+		-- D63: a downed troll's behaviour tree runs its downed branch before its stagger (troll_downed,
+		-- chaos_troll_behavior.lua:40), whose leave clears the stagger (bt_troll_downed_action.lua:59), so none shows.
+		refused = "the troll is down"
 	end
 
 	local direction = attack_direction
@@ -1482,6 +1642,17 @@ end
 
 -- batch: a blast's list of staggers (reactions.new_stagger_batch), which goes to the host after the blast is worked out.
 local function stagger(unit, breed, attacker, damage_profile, profile_name, target_index, hit_zone_name, attack_direction, damage_source_name, t, batch)
+	-- T15: vanilla's stagger_ai stops at a grudge mark's stagger immunity before its maths and the hit's on-stagger procs
+	-- (damage_utils.lua:3598), so nothing shows and nothing is sent. The host checks it too (HostReactions.lua).
+	local immune = immunity_buff(unit)
+
+	if immune then
+		pc.count("client_stagger_immune")
+		pc.log("client hit enemy=%s profile=%s no stagger: stagger immune (%s)", breed.name, tostring(profile_name), immune)
+
+		return
+	end
+
 	local fake = fake_for(unit, breed)
 	local stagger_type, duration, length, stagger_value, direction, anim_scale, always_stagger, is_push, refused = work_out_stagger(unit, breed, fake, attacker, damage_profile, target_index, hit_zone_name, attack_direction, damage_source_name, t, profile_name)
 
@@ -1651,6 +1822,80 @@ local function kill(unit, breed, attacker, health, damage, damage_profile, targe
 	pc.log("client kill=%d enemy=%s damage=%.1f", id, breed.name, damage)
 end
 
+local function troll_record(unit, health)
+	local go_id = Managers.state.unit_storage:go_id(unit)
+	local record = trolls[unit]
+
+	if not record or record.go_id ~= go_id then
+		record = {
+			go_id = go_id,
+			state = health.state, -- the phase the host's numbers last gave
+			predicted = 0, -- this screen's damage that the host's numbers don't have yet
+			down = nil, -- the id of the fall this screen is showing, until the host's numbers say it is down
+		}
+		trolls[unit] = record
+	end
+
+	return record
+end
+
+-- D63: a hit that takes an unhurt troll under its line (chaos_troll_health_extension.lua:210) shows its fall here at
+-- once, as BTTrollDownedAction.enter plays it on every machine (bt_troll_downed_action.lua:24), and pc_down tells the
+-- host, which forces the down if its own numbers fell short. As for a stagger, the host's echo is dropped and its other
+-- changes held back until it. The host's troll doesn't move while it is down (:20, with no root motion), so this copy
+-- goes on following the host's position, which stops as the host's troll goes down too.
+local function show_down(unit, breed, health, record, damage_taken, line, t)
+	next_id = next_id + 1
+
+	local id = next_id
+
+	send("pc_down", id, pc.network():unit_game_object_id(unit))
+
+	record.down = id
+
+	pc.client.reaction_started(unit, "downed by you")
+	animation_system():anim_event(unit, "downed_intro", true)
+	start_prediction("down", id, unit, breed, { "downed_intro" }, false, 1, DOWN_HOLD, t)
+
+	pc.count("client_troll_down")
+	pc.log("client down=%d enemy=%s go=%s health=%.1f damage=%.1f (this screen's own %.1f) line=%.1f", id, breed.name, tostring(record.go_id), health.health, damage_taken, record.predicted, line)
+end
+
+-- D63: the damage half of a hit on a troll, by its own rule (troll_rule). Its husk records no predicted damage
+-- (chaos_troll_husk_health_extension.lua:121), so this screen keeps its own, on top of the host's numbers
+-- (sync_damage_taken, :145), until the host's damage message for it arrives (troll_damaged). Returns true if it kills.
+local function troll_damage(unit, breed, attacker, health, action, amount, damage_profile, target_index, hit_zone_name, hit_position, attack_direction, damage_source_name, t)
+	local record = troll_record(unit, health)
+	local max_health = health.health
+
+	record.predicted = record.predicted + amount
+
+	local damage_taken = health.damage + record.predicted
+
+	if health.state == "unhurt" and not record.down then
+		-- Its line, from its health now, as the host works it out (respawn_thresholds, chaos_troll_health_extension.lua:62).
+		-- The husk's own go_down_health isn't worked out again when the host lowers its health after a down (:302).
+		local line = max_health * action.become_downed_hp_percent
+
+		if max_health - damage_taken < line then
+			show_down(unit, breed, health, record, damage_taken, line, t)
+		end
+
+		return false
+	end
+
+	-- Only a wounded troll dies (_should_die, :188); a downed one's damage stops short of its health (:233).
+	if health.state ~= "wounded" or damage_taken < max_health then
+		return false
+	end
+
+	pc.count("client_troll_kill")
+	pc.log("client troll kill enemy=%s go=%s damage=%.1f (this screen's own %.1f) of %.1f", breed.name, tostring(record.go_id), damage_taken, record.predicted, max_health)
+	kill(unit, breed, attacker, health, amount, damage_profile, target_index, hit_zone_name, hit_position, attack_direction, damage_source_name, t)
+
+	return true
+end
+
 -- The damage half of DamageUtils.server_apply_hit (damage_utils.lua:3666) and add_damage_network_player (:1864), as
 -- far as this client can follow it: the host's damage buffs (apply_buffs_to_damage) only run there, and they mostly
 -- add damage, so this guess falls short of a kill more often than past one. Returns true if the hit kills.
@@ -1697,6 +1942,13 @@ local function damage(unit, breed, attacker, damage_profile, target_index, hit_z
 
 	if amount <= 0 then
 		return false
+	end
+
+	-- D63: a troll goes down, then dies only once wounded; its husk predicts nothing, the projectile code's hits included.
+	local troll = troll_rule(health)
+
+	if troll then
+		return troll_damage(unit, breed, attacker, health, troll, amount, damage_profile, target_index, hit_zone_name, hit_position, attack_direction, damage_source_name, t)
 	end
 
 	-- The game's own record of damage a client expects (player_projectile_unit_extension.lua:765 does the same). The
@@ -2113,6 +2365,36 @@ function reactions.dialogue_message(unit_extension_data, go_id, is_level_unit)
 	return false
 end
 
+-- D63: the host's damage message for a troll reached its husk (HealthSystem.rpc_add_damage), so the host's numbers have
+-- that damage now, and it comes off what this screen still adds itself, as the game does for any other enemy's
+-- predicted damage (generic_health_extension.lua:372).
+function reactions.troll_damaged(unit, amount)
+	local record = trolls[unit]
+
+	if record and type(amount) == "number" and record.go_id == Managers.state.unit_storage:go_id(unit) then
+		record.predicted = math.max(record.predicted - amount, 0)
+	end
+end
+
+-- D63: the host's numbers for a troll (ChaosTrollHealthExtension.sync_health_to_clients, chaos_troll_health_extension.lua:351).
+-- Its damage starts again from nothing as it goes down and as it gets up (:213, :305), so what this screen added
+-- itself is dropped at each change of phase.
+function reactions.troll_synced(unit, health, set_max_health, state)
+	local record = trolls[unit]
+
+	if not record or set_max_health or state == record.state or record.go_id ~= Managers.state.unit_storage:go_id(unit) then
+		return
+	end
+
+	local breed = Unit.get_data(unit, "breed")
+
+	pc.log("client troll enemy=%s go=%s now %s (was %s): damage=%.1f of %.1f%s", breed and breed.name or "?", tostring(record.go_id), tostring(state), tostring(record.state), health.damage or 0, health.health or 0,
+		record.down and string.format(", its fall shown here (down=%d)", record.down) or "")
+
+	record.state = state
+	record.predicted = 0
+end
+
 mod:network_register("pc_reaction_ack", function (sender, version, kind, id, result)
 	if pc.is_server() or sender ~= pc.host_peer() or version ~= pc.VERSION then
 		return
@@ -2186,12 +2468,19 @@ function reactions.update(dt)
 			last_attacks[unit] = nil
 		end
 	end
+
+	for unit in pairs(trolls) do
+		if not Unit.alive(unit) or not HEALTH_ALIVE[unit] then
+			trolls[unit] = nil
+		end
+	end
 end
 
 function reactions.clear()
 	measuring = {}
 	last_attacks = {}
 	fakes = {}
+	trolls = {}
 	predictions = {}
 	by_key = {}
 	dead = {}
@@ -2338,4 +2627,19 @@ mod:hook("DialogueSystem", "rpc_interrupt_dialogue_event", function (func, self,
 	end
 
 	return func(self, channel_id, go_id, is_level_unit, ...)
+end)
+
+-- D63: a troll's husk only exists on clients. Every damage message the host sends for it ends here
+-- (HealthSystem.rpc_add_damage, health_system.lua:368), and so does every sync of its numbers (rpc_sync_damage_taken,
+-- :602). Only trolls this player has hit are followed.
+mod:hook_safe("ChaosTrollHuskHealthExtension", "add_damage", function (self, attacker_unit, damage_amount)
+	if not pc.broken and trolls[self.unit] then
+		pc.guard("client troll damage", reactions.troll_damaged, self.unit, damage_amount)
+	end
+end)
+
+mod:hook_safe("ChaosTrollHuskHealthExtension", "sync_damage_taken", function (self, damage, set_max_health, state)
+	if not pc.broken and trolls[self.unit] then
+		pc.guard("client troll sync", reactions.troll_synced, self.unit, self, set_max_health, state)
+	end
 end)
