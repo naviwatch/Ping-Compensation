@@ -6,7 +6,9 @@ local pc = mod.pc
 --      elite's sweep, only if this player is the one it attacks),
 --   2. judges the swing on the frame its copy of the enemy fires the damage animation event: reach and cone for single
 --      swings, frenzy steps and shoves, the game's box for an elite's sweep or overhead, and for a monster's or lord's
---      attack (family E, build 6) the node's own box, arm sweep or slam capsule, on every modded player's screen,
+--      attack (family E, build 6) the node's own box, arm sweep or slam capsule, on every modded player's screen; a
+--      charge, a lord's lunge, spin or ground wave and a thrown axe on every frame of their window, and the jump slam
+--      at its landing,
 --   3. plays its own block at once if it blocked, and sends the result to the host,
 --   4. shows the result at once: the enemy's recoil after a block (Reactions.lua) and, for a hit, the feedback,
 --      knockback and HP estimate (HitResults.lua).
@@ -52,8 +54,23 @@ local DISABLER_KINDS = {
 local E_KINDS = {
 	overlap = true, -- BTMeleeOverlapAttackAction
 	slam = true, -- BTMeleeSlamAction
+	charge = true, -- BTChargeAttackAction, the bestigor's and the minotaur's (part (b), D65)
+	champion = true, -- BTChampionAttackAction, the lords' attacks
+	jump = true, -- BTJumpSlamImpactAction, the landing of the rat ogre's jump slam
+	axe = true, -- BTThrowWeaponAction, the exalted champion's axe (D68)
 }
 local E_GRACE = 0.5 -- seconds past its attack's own length that a family E swing waits here for its copy's damage frame
+local JUMP_WAIT = 1.5 -- seconds a jump slam's landing waits here for its copy's damage frame
+local WAVE_FX_MEMORY = 1 -- seconds the anticipation effects of a lord's ground wave are kept for its swing
+local AXE_SEARCH = 4 -- metres from the champion's hand (2 m up, bt_throw_weapon_action.lua:81) its axe's copy appears
+local AXE_MEMORY = 2 -- seconds a thrown weapon's copy is kept for the swing that threw it
+local RADIAL_CHECK_RADIUS = 0.5 -- check_radius in BTChampionAttackAction._update_radial_cylinder (:686)
+local PLAYER_MIDDLE = 0.9 -- metres above a player's feet that stand in for their trigger's centre when judged by shape
+local TWO_PI = 2 * math.pi
+-- The animations a charge (BTChargeAttackAction) and a throw (BTThrowWeaponAction) play as part of themselves, besides
+-- the tables of them by distance (charging_animations, lunge.animations).
+local CHARGE_ANIM_FIELDS = { "start_animation", "impact_animation", "charge_blocked_animation", "cancel_animation", "align_to_target_animation" }
+local THROW_ANIM_FIELDS = { "throw_animation", "catch_animation", "close_attack_animation" }
 
 local LEAP_RADIUS = 1 -- the sphere round a gutter runner's neck (BTCrazyJumpAction.check_colliding_players)
 local SNAP_START = 2.7 -- enter_snap_state_distance (bt_crazy_jump_action.lua:107)
@@ -78,6 +95,8 @@ local swings = {} -- swing id -> record, kept for the stats and the debug log
 local by_unit = {} -- enemy unit -> its newest record
 local by_go_id = {} -- enemy network id -> the same record
 local recently_cut = {} -- enemy unit -> { id, by, t } for swings cut in the last CUT_MEMORY seconds
+local wave_fx = {} -- { t, fx, points } for effects the host sent without sounds lately, newest last: a ground wave's
+local thrown = {} -- { unit, t } for thrown weapons' copies that appeared lately, newest last: an axe's
 local hello_timer = 0
 local host_answered = false -- the host has replied to a hello since this mission started
 local contact_lost = false -- the player has been told the host went quiet
@@ -407,10 +426,11 @@ end
 -- side effects. It returns whether this player blocks the swing, the numbers the host needs to show the block to the
 -- other players, and whether the swing went through a block. A monster's or lord's attack (family E) is blockable
 -- whatever its data says, as its node never reads unblockable, and is blocked from no direction, as its node reads it
--- from blackboard.attack_anim, which it never sets (bt_melee_overlap_attack_action.lua:640).
+-- from blackboard.attack_anim, which it never sets (bt_melee_overlap_attack_action.lua:640). The jump slam's landing
+-- goes through the game's generic damage frame, which reads both (animation_callback_templates.lua:185).
 local function would_block(swing, unit, target, status)
 	local action = swing.action
-	local monster = swing.family == "E"
+	local monster = swing.family == "E" and swing.kind ~= "jump"
 
 	if action.unblockable and not monster or not status then
 		return false
@@ -955,11 +975,9 @@ local function update_slam_facing(swing, unit, target, dt)
 	ease_facing(swing, unit, dt)
 end
 
--- Family E1: whether this player is in an overlap attack's box on this screen, with the game's own overlap and the
--- attack's own filter where it sees this player's hit boxes, else with plain shapes.
-local function in_monster_box(swing, unit, target, centre, box_rotation, size)
-	local filter = swing.attack.hit_only_players and "filter_player_hit_box_check" or "filter_player_and_enemy_hit_box_check"
-
+-- Family E: whether this player is in a box on this screen, with the game's own overlap and the attack's filter where
+-- it sees this player's hit boxes, else with plain shapes (Geometry.lua).
+local function in_e_box(swing, unit, target, centre, box_rotation, size, filter)
 	if overlap_sees(target, filter, "dynamics") then
 		swing.box_method = "overlap"
 
@@ -969,6 +987,49 @@ local function in_monster_box(swing, unit, target, centre, box_rotation, size)
 	swing.box_method = "shape"
 
 	return pc.geometry.player_in_box(position(target), centre, box_rotation, size)
+end
+
+-- Family E1: whether this player is in an overlap attack's box on this screen, with the attack's own filter.
+local function in_monster_box(swing, unit, target, centre, box_rotation, size)
+	return in_e_box(swing, unit, target, centre, box_rotation, size, swing.attack.hit_only_players and "filter_player_hit_box_check" or "filter_player_and_enemy_hit_box_check")
+end
+
+-- Family E4: the actor of this player's that a lord's upright cylinder (Geometry.lua, champion_cylinder) overlaps on this
+-- screen, with the game's own overlap and the attack's filter where it sees this player (after the original's
+-- prepare_actors_for_overlap, for an attack judged at its damage frame, bt_champion_attack_action.lua:635), else by
+-- shape, where the player's middle stands in for the actor. Returns the actor's centre, or nil if it misses them.
+local function in_e_cylinder(swing, unit, target, centre, size, rotation, filter, prepare_radius)
+	filter = filter or "filter_player_hit_box_check"
+
+	if overlap_sees(target, filter, "dynamics") then
+		local physics_world = World.get_data(Unit.world(unit), "physics_world")
+
+		if prepare_radius and PhysicsWorld.prepare_actors_for_overlap then
+			PhysicsWorld.prepare_actors_for_overlap(physics_world, centre, prepare_radius)
+		end
+
+		local shape = size.y - size.x > 0 and "capsule" or "sphere"
+		local actors = PhysicsWorld.immediate_overlap(physics_world, "position", centre, "rotation", rotation, "size", size, "shape", shape, "types", "dynamics", "collision_filter", filter)
+
+		swing.box_method = "overlap"
+
+		for _, actor in ipairs(actors or {}) do
+			if Actor.unit(actor) == target then
+				return Actor.center_of_mass(actor)
+			end
+		end
+
+		return nil
+	end
+
+	swing.box_method = "shape"
+
+	-- The overlap's size.y is half the cylinder's whole height, its rounded ends included (Geometry.lua).
+	if pc.geometry.player_in_capsule(position(target), centre, size.x, size.y) then
+		return position(target) + Vector3(0, 0, PLAYER_MIDDLE)
+	end
+
+	return nil
 end
 
 -- Family E2: the slam's capsule on this screen (BTMeleeSlamAction._calculate_collision and anim_cb_damage,
@@ -1025,6 +1086,60 @@ local function distance_and_angle(unit, target, rotation)
 	return Vector3.length(offset), math.deg(math.acos(math.max(-1, math.min(1, cosine))))
 end
 
+-- Family E: what judges this swing's window on this screen, for the log.
+local function e_window(swing)
+	if swing.window then
+		return "arm"
+	elseif swing.champion then
+		return swing.champion.mode or "frame"
+	elseif swing.charge then
+		return "run"
+	elseif swing.axe then
+		return "axe"
+	elseif swing.kind == "jump" then
+		return "landing"
+	end
+
+	return "none"
+end
+
+-- Family E: one answer of a monster's or lord's swing on this screen, counted, sent and logged. The answer goes out
+-- before the local effects, so a problem in those can't leave the host without one. final: this player's last answer
+-- for the swing here, after which this screen's facing is let go once FACING_HOLD has passed (or the attack's length,
+-- if it is known).
+local function e_send(swing, unit, target, frame, result, reason, multiplier, improved, direction, through_block, rotation, facing, t, final)
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local distance, angle = distance_and_angle(unit, target, rotation)
+
+	swing.frames = math.max(swing.frames, frame)
+
+	if final then
+		swing.past_damage = true
+		swing.release_t = math.max(t + FACING_HOLD, swing.end_t and swing.end_t < math.huge and swing.end_t or 0)
+	end
+
+	pc.count("client_judged")
+	pc.count("client_judged_E")
+	pc.count("client_judged_E_" .. tostring(swing.kind))
+	pc.count(result == "miss" and "client_miss_" .. reason or "client_" .. result)
+
+	if swing.box_method then
+		pc.count("client_E_" .. swing.box_method)
+	end
+
+	if not swing.aimed then
+		pc.count("client_judged_E_not_aimed")
+	end
+
+	send_answer(swing, frame, result, multiplier, improved, direction, through_block, distance, angle)
+
+	if pc.debug then
+		pc.log("client swing=%d enemy=%s attack=%s frame=%d verdict=%s reason=%s distance=%.2f angle=%.1f facing=%s since_begin=%.3fs dodging=%s effective=%s dodged_in_swing=%s family=E:%s aimed=%s turn=%s method=%s window=%s",
+			swing.id, swing.breed.name, swing.action_name, frame, result, reason, distance, angle, facing, t - swing.begin_t, tostring(status ~= nil and status.is_dodging == true), tostring(status ~= nil and status:get_is_dodging() and true or false),
+			tostring(swing.dodged == true), tostring(swing.kind), tostring(swing.aimed == true), tostring(swing.attack and swing.attack.rotation_speed or swing.turn_speed), tostring(swing.box_method), e_window(swing))
+	end
+end
+
 -- Family E: the verdict at one frame of this screen's copy, in the node's own order. An overlap attack: the melee
 -- block, then a shield's ranged block unless the attack ignores it (bt_melee_overlap_attack_action.lua:643); a slam: a
 -- disabled player is hit, then the shield's block, then the melee block (bt_melee_slam_action.lua:180 to :187). The
@@ -1033,11 +1148,6 @@ local function monster_verdict(swing, unit, target, frame, miss_reason, rotation
 	local status = ScriptUnit.has_extension(target, "status_system")
 	local result, reason = "hit", "landed"
 	local multiplier, improved, direction, through_block
-	local distance, angle = distance_and_angle(unit, target, rotation)
-
-	swing.frames = math.max(swing.frames, frame)
-	swing.past_damage = true
-	swing.release_t = math.max(t + FACING_HOLD, swing.end_t or 0)
 
 	if miss_reason then
 		result, reason = "miss", miss_reason
@@ -1061,16 +1171,7 @@ local function monster_verdict(swing, unit, target, frame, miss_reason, rotation
 		end
 	end
 
-	pc.count("client_judged")
-	pc.count("client_judged_E")
-	pc.count("client_judged_E_" .. tostring(swing.kind))
-	pc.count(result == "miss" and "client_miss_" .. reason or "client_" .. result)
-
-	if not swing.aimed then
-		pc.count("client_judged_E_not_aimed")
-	end
-
-	send_answer(swing, frame, result, multiplier, improved, direction, through_block, distance, angle)
+	e_send(swing, unit, target, frame, result, reason, multiplier, improved, direction, through_block, rotation, facing, t, true)
 
 	if result == "blocked" or result == "shield" then
 		-- A slam's shield block is the shield's alone; an overlap attack's is its melee block, then the shield's.
@@ -1092,12 +1193,6 @@ local function monster_verdict(swing, unit, target, frame, miss_reason, rotation
 		if swing.grab and result ~= "shield" and status and not status:is_disabled() and not status:is_invisible() then
 			pc.guard("client grab shown", pc.disablers.start, swing, unit, target, "spawn")
 		end
-	end
-
-	if pc.debug then
-		pc.log("client swing=%d enemy=%s attack=%s frame=%d verdict=%s reason=%s distance=%.2f angle=%.1f facing=%s since_begin=%.3fs dodging=%s effective=%s dodged_in_swing=%s family=E:%s aimed=%s turn=%s method=%s window=%s",
-			swing.id, swing.breed.name, swing.action_name, frame, result, reason, distance, angle, facing, t - swing.begin_t, tostring(status ~= nil and status.is_dodging == true), tostring(status ~= nil and status:get_is_dodging() and true or false),
-			tostring(swing.dodged == true), tostring(swing.kind), tostring(swing.aimed == true), tostring(swing.attack and swing.attack.rotation_speed or swing.turn_speed), tostring(swing.box_method), swing.window and "arm" or "none")
 	end
 end
 
@@ -1195,12 +1290,688 @@ local function sweep(swing, unit, target, t)
 	end
 end
 
+-- Family E (part (b)): a window that ran on this screen without reaching this player, a charge's run, a lord's lunge,
+-- spin or ground wave, or a thrown axe: this player's miss.
+local function e_close(swing, unit, target, reason)
+	if swing.past_damage then
+		return
+	end
+
+	local t = pc.now()
+
+	if target and Unit.alive(target) and Unit.alive(unit) then
+		local rotation, facing = monster_rotation(swing, unit)
+
+		e_send(swing, unit, target, 1, "miss", reason, nil, nil, nil, nil, rotation, facing, t, true)
+
+		return
+	end
+
+	swing.frames = math.max(swing.frames, 1)
+	swing.past_damage = true
+	swing.release_t = t
+
+	send_answer(swing, 1, "miss", 0, false, "", false, 0, 0)
+end
+
+-- Family E3: the charge's test on this screen found this player close in front of the charger's copy
+-- (BTChargeAttackAction._hit_player, bt_charge_attack_action.lua:553): its target or anyone else is hit, once. The
+-- melee block first, unless weapons can't block the charge (the minotaur's), then a shield's, both played here as the
+-- original runs both; the answer goes out before what they show (HitResults.lua).
+local function charge_head(swing, unit, target, status, t)
+	local action = swing.action
+	local melee, multiplier, improved, direction, through_block = false, nil, nil, nil, nil
+
+	if not action.unblockable_by_normal_blocks then
+		melee, multiplier, improved, direction, through_block = would_block(swing, unit, target, status)
+	end
+
+	local shield = would_shield_block(unit, target, status)
+	local result = shield and "shield" or melee and "blocked" or "hit"
+	local reason = shield and "shield" or melee and (improved and "in arc" or "outer arc") or through_block and "through block" or "landed"
+
+	swing.box_method = "distance"
+
+	e_send(swing, unit, target, 1, result, reason, multiplier, improved, direction, through_block, Unit.local_rotation(unit, 0), "host", t, true)
+
+	if melee then
+		play_block(swing, unit, status, multiplier, improved, direction)
+	end
+
+	-- Plays the shield's block here and tells the host, as the game's own call does on a client (damage_utils.lua:2821).
+	if shield then
+		pc.guard("client shield block", DamageUtils.check_ranged_block, unit, target, action.shield_blocked_fatigue_type or "ogre_shove")
+	end
+
+	pc.guard("client charge results", pc.hit_results.charge, swing, unit, target, result, swing.charge.speed)
+end
+
+-- Family E3, every frame after LocomotionSystem.update: copy of BTChargeAttackAction._check_overlap
+-- (bt_charge_attack_action.lua:443 to :486) between this screen's copy of the charger, as the host moves it (question 2
+-- of the build 6 notes, D69), and this player, while the charge's test runs here (client.charge_cue, charge_seen). In
+-- front of the charger, within head_radius (target_dodged_radius while this player's dodge counts), the hit
+-- (charge_head); else within radius, a push aside, once, as frame 2, which leaves the hit to come. The copy's speed is
+-- kept for the minotaur's throw, which goes at the charger's speed (_charged_at_player, :520).
+local function update_charge(swing, unit, target, t, dt, status)
+	local charge = swing.charge
+	local root = Unit.local_position(unit, 0)
+
+	if charge.last then
+		if dt > 0 then
+			charge.speed = math.lerp(charge.speed, Vector3.length(root - charge.last:unbox()) / dt, 0.5)
+		end
+
+		charge.last:store(root)
+	else
+		charge.last = Vector3Box(root)
+	end
+
+	if not charge.open then
+		return
+	end
+
+	-- A charge can run for longer than a swing is remembered (the minotaur's runs up to 30 s at full speed).
+	swing.expires = math.max(swing.expires, t + 1)
+
+	if charge.until_t and t > charge.until_t then
+		e_close(swing, unit, target, "impact over")
+
+		return
+	end
+
+	if charge.paused then
+		return
+	end
+
+	local to_target = position(target) - root
+	local distance = Vector3.length(to_target)
+
+	if distance <= 0 or not status or status:is_invisible() or Vector3.dot(to_target / distance, Quaternion.forward(Unit.local_rotation(unit, 0))) <= 0 then
+		return
+	end
+
+	local action = swing.action
+	local head_radius = is_dodging(status) and action.target_dodged_radius or action.head_radius
+
+	if distance < (head_radius or 0) then
+		charge_head(swing, unit, target, status, t)
+	elseif not charge.pushed and distance < (action.radius or 0) then
+		charge.pushed = true
+		swing.box_method = "distance"
+
+		e_send(swing, unit, target, 2, "pushed", "passed close", nil, nil, nil, nil, Unit.local_rotation(unit, 0), "host", t, false)
+		pc.guard("client charge results", pc.hit_results.charge, swing, unit, target, "pushed", charge.speed)
+	end
+end
+
+-- Family E3: the copy's charge cues, from the animation callback hook in Ping Compensation.lua. The charge's test
+-- starts with the end of its start animation (anim_cb_charge_start_finished, bt_charge_attack_action.lua:1125) and
+-- ends with the lunge's anim_cb_disable_charge_collision (:1161), or with anim_cb_charge_charging_finished for a charge
+-- that never lunged (:1149). The minotaur's lunge only pauses at the first: a lunge that ends without a hit starts an
+-- impact that tests again for its hit_during_impact_t (:354, charge_seen). And it has no animations of its own (it
+-- leans, lunge.lean_variables), so its charging animation may still play, and fire the second cue, while it lunges,
+-- when the host's node ignores the cue; so a charge without lunge animations ignores it here too, and its test ends
+-- with the host's next move. Every cue is logged, since the animations that fire them aren't in the game's Lua.
+function client.charge_cue(unit, callback_name)
+	local swing = by_unit[unit]
+	local target = local_player_unit()
+
+	if not swing or swing.kind ~= "charge" or swing.past_damage or target ~= swing.target then
+		return
+	end
+
+	local charge = swing.charge
+	local action = swing.action
+	local lunge_animated = type(action.lunge) == "table" and type(action.lunge.animations) == "table"
+
+	pc.log("client swing=%d enemy=%s charge cue %s here %.3fs after it began", swing.id, swing.breed.name, tostring(callback_name), pc.now() - swing.begin_t)
+
+	if callback_name == "anim_cb_charge_start_finished" then
+		if not charge.open then
+			charge.open = true
+			swing.open = true
+		end
+	elseif charge.open then
+		if callback_name == "anim_cb_disable_charge_collision" and action.hit_during_impact_t then
+			charge.paused = true
+		elseif callback_name ~= "anim_cb_charge_charging_finished" or lunge_animated then
+			e_close(swing, unit, target, callback_name)
+		end
+	end
+end
+
+-- Family E4: the points of a lord's ground wave (nav_mesh_wave), as the host sent them as its anticipation effects when
+-- the attack started (BTChampionAttackAction._init_attack, bt_champion_attack_action.lua:188), just before the swing's
+-- announcement: the newest of the attack's anticipation_fx, whose first point lies just ahead of this screen's copy.
+local function wave_points(swing, unit, t)
+	local action = swing.action
+	local fx = type(action.anticipation_fx) == "string" and rawget(NetworkLookup.effects, action.anticipation_fx)
+	local origin = position(unit)
+	local reach = math.abs(action.offset_forward or 0) + 3
+
+	if not fx then
+		return nil
+	end
+
+	for i = #wave_fx, 1, -1 do
+		local record = wave_fx[i]
+
+		if record.fx == fx and t - record.t <= WAVE_FX_MEMORY and record.points[1] and Vector3.length(Vector3.flat(record.points[1]:unbox() - origin)) <= reach then
+			table.remove(wave_fx, i)
+
+			return record.points
+		end
+	end
+
+	return nil
+end
+
+-- Family E4: what this screen needs to follow a lord's attack (BTChampionAttackAction._init_attack,
+-- bt_champion_attack_action.lua:60): its turning time, and the window its mode tests in, from this screen's start of the
+-- attack: a box along its movement (continuous_overlap), a sweeping cylinder (radial_cylinder) or a wave along the
+-- ground (nav_mesh_wave); without a mode, it is judged at its damage frames. Returns false and why if this screen can't
+-- follow it.
+local function init_champion(swing, t)
+	local action = swing.action
+	local mode = action.mode
+	local rotation_time = type(action.rotation_time) == "number" and action.rotation_time or 0
+	local champion = {
+		mode = mode,
+		frames = 0, -- damage frames of this screen's copy so far, for an attack without a mode
+		start_t = t + (type(action.overlap_start_time) == "number" and action.overlap_start_time or 0),
+		end_t = t + (type(action.overlap_end_time) == "number" and action.overlap_end_time or 0),
+	}
+
+	swing.rotation_timer = t + rotation_time
+	swing.facing_ours = rotation_time > 0
+	swing.end_t = math.huge -- until the host's next move for the lord, or the swing's lifetime
+
+	if mode == "continuous_overlap" then
+		champion.last = Vector3Box(position(swing.unit))
+		champion.last_t = t
+	elseif mode == "radial_cylinder" then
+		local span = champion.end_t - champion.start_t
+
+		champion.angle_speed = span > 0 and ((action.overlap_end_angle_offset or 0) - (action.overlap_start_angle_offset or 0)) / span or 0
+	elseif mode == "nav_mesh_wave" then
+		champion.points = wave_points(swing, swing.unit, t)
+		champion.last_index = 0
+
+		if not champion.points then
+			return false, "its wave's points never arrived"
+		end
+	elseif mode ~= nil then
+		return false, "its mode is " .. tostring(mode)
+	end
+
+	swing.champion = champion
+
+	return true
+end
+
+-- Family E4: copy of BTChampionAttackAction._update_rotation (bt_champion_attack_action.lua:379), fed from this
+-- player's live state, on the screen of the player the lord attacks: towards them until the attack's rotation time,
+-- unless within 0.3 m, stopping for good once they dodge or turn invisible, or once the attack has reached them. Then it
+-- keeps the facing it last aimed at.
+local function update_champion_facing(swing, unit, target, t, dt, status)
+	if status and (is_dodging(status) or status:is_invisible()) then
+		swing.dodged_during_attack = true
+	end
+
+	local self_position = Unit.local_position(unit, 0)
+	local target_position = Unit.local_position(target, 0)
+
+	if t < swing.rotation_timer and not swing.dodged_during_attack and not swing.champion.done and Vector3.distance_squared(self_position, target_position) > 0.09 then
+		local rotation = flat_rotation(self_position, target_position)
+
+		if rotation then
+			swing.wanted:store(rotation)
+		end
+	end
+
+	ease_facing(swing, unit, dt)
+end
+
+-- Family E4, continuous_overlap: copy of BTChampionAttackAction._update_overlap (bt_champion_attack_action.lua:411) on
+-- this screen's copy, every frame of the window: a box along the lord's movement since the last frame, clipped to the
+-- window, facing the lord's way (or its movement's, with movement_controlled_rotation), reaching ahead by the attack's
+-- range, which can be a function of the window's progress. Returns whether it reached this player, and where it hit from.
+local function lunge_frame(swing, unit, target, t)
+	local champion = swing.champion
+	local action = swing.action
+	local start_t, end_t, last_t = champion.start_t, champion.end_t, champion.last_t
+	local new_position = position(unit)
+	local reached, from = false, nil
+
+	if start_t < t and last_t < end_t and t > last_t then
+		local old_position = champion.last:unbox()
+
+		from = last_t < start_t and Vector3.lerp(old_position, new_position, (start_t - last_t) / (t - last_t)) or old_position
+
+		local to = end_t < t and Vector3.lerp(old_position, new_position, (end_t - last_t) / (t - last_t)) or new_position
+		local delta = to - from
+		local rotation, forward
+
+		if action.movement_controlled_rotation then
+			forward = Vector3.normalize(delta)
+			rotation = Quaternion.look(forward, Vector3.up())
+		else
+			rotation = Unit.local_rotation(unit, 0)
+			forward = Quaternion.forward(rotation)
+		end
+
+		local up = Quaternion.up(rotation)
+		local base_range = type(action.range) == "function" and action.range((t - start_t) / (end_t - start_t)) or tonumber(action.range) or 0
+		local range = base_range + (action.movement_controlled_rotation and Vector3.length(delta) or Vector3.dot(delta, forward))
+		local half_range = range * 0.5
+		local half_height = (action.height or 0) * 0.5
+		local centre = from + forward * ((action.offset_forward or 0) + half_range) + up * ((action.offset_up or 0) + half_height)
+
+		reached = in_e_box(swing, unit, target, centre, rotation, Vector3((action.width or 0) * 0.5, half_range, half_height), "filter_player_hit_box_check")
+	end
+
+	champion.last:store(new_position)
+	champion.last_t = t
+
+	return reached, from
+end
+
+-- Family E4, radial_cylinder: copy of BTChampionAttackAction._update_radial_cylinder (bt_champion_attack_action.lua:655)
+-- on this screen's copy, every frame of the window: the cylinder round the lord (Geometry.lua), whose swing's angle
+-- turns from the lord's facing as the window opened, at the attack's own speed. This player is hit when the angle swept
+-- since the last frame passes their trigger's centre (by shape, their middle), by the original's own maths. Returns
+-- whether it reached them.
+local function radial_frame(swing, unit, target, t)
+	local champion = swing.champion
+	local action = swing.action
+	local self_position = Unit.local_position(unit, 0)
+	local self_rotation = Unit.local_rotation(unit, 0)
+
+	if not champion.start_angle then
+		local forward = Quaternion.forward(self_rotation)
+
+		champion.start_angle = math.atan2(forward.y, forward.x) + (action.overlap_start_angle_offset or 0)
+		champion.last_angle = champion.start_angle
+	end
+
+	local old_angle = champion.last_angle
+	local new_angle = champion.start_angle + (t - champion.start_t) * champion.angle_speed
+	local relative_angle = new_angle - old_angle
+
+	champion.last_angle = new_angle
+
+	local centre, size, rotation = pc.geometry.champion_cylinder(action, self_position, self_rotation)
+	local mass_centre = in_e_cylinder(swing, unit, target, centre, size, rotation, action.collision_filter, nil)
+
+	if not mass_centre then
+		return false
+	end
+
+	local offset = mass_centre - self_position
+	local y = offset.y
+	local x = action.direction == "clockwise" and -offset.x or offset.x
+	local angle = math.atan2(y, x)
+	-- The original also passes the distance to math.tan, which ignores it (:712).
+	local radial_width = 2 * math.tan(RADIAL_CHECK_RADIUS)
+	local min_angle = (angle - radial_width - old_angle) % TWO_PI
+	local max_angle = (angle + radial_width - old_angle) % TWO_PI
+
+	if max_angle < min_angle then
+		min_angle = min_angle - TWO_PI
+	end
+
+	return min_angle < 0 and relative_angle < max_angle or min_angle > 0 and min_angle < relative_angle or max_angle > 0 and max_angle < relative_angle
+end
+
+-- Family E4, nav_mesh_wave: copy of BTChampionAttackAction._update_nav_mesh_wave (bt_champion_attack_action.lua:514):
+-- from the window's start the wave reaches its next points at the attack's wave_speed, and the boxes between the points
+-- it reached since the last frame are tested. Once it has reached its last point, the original keeps testing that
+-- point's box until the attack ends (its window runs num_points times wave_speed seconds, :193), so this screen does
+-- too, until the attack is over here. Returns whether a box reached this player.
+local function wave_frame(swing, unit, target, t)
+	local champion = swing.champion
+	local action = swing.action
+	local points = champion.points
+
+	if t < champion.start_t or #points == 0 then
+		return false
+	end
+
+	local new_index = math.min(math.floor((t - champion.start_t) * (action.wave_speed or 0) + 1), #points)
+	local start_index = math.min(champion.last_index + 1, new_index)
+	local half_width = (action.width or 0) * 0.5
+	local half_height = (action.height or 0) * 0.5
+	local reached = false
+
+	for i = start_index, new_index do
+		local point = points[i]:unbox()
+		local to = points[i + 1] and points[i + 1]:unbox() or point
+		local from = points[i - 1] and points[i - 1]:unbox() or position(unit)
+		local rotation = Quaternion.look(to - from, Vector3.up())
+		local size = Vector3(half_width, math.max(Vector3.length(to - point), Vector3.length(from - point)), half_height)
+		local centre = (to + from) * 0.5 + Quaternion.up(rotation) * half_height
+
+		if not reached and in_e_box(swing, unit, target, centre, rotation, size, "filter_player_hit_box_check") then
+			reached = true
+		end
+	end
+
+	champion.last_index = new_index
+
+	return reached
+end
+
+-- Family E4: a lord's attack reached this player on this screen: the melee block (no lord's attack tries a shield's),
+-- the answer, then what it shows (HitResults.lua). One answer that reaches them per attack, as the original hits each
+-- player once (hit_players). from: where it hit from.
+local function champion_verdict(swing, unit, target, frame, t, from)
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local blocked, multiplier, improved, direction, through_block = would_block(swing, unit, target, status)
+	local result = blocked and "blocked" or "hit"
+	local reason = blocked and (improved and "in arc" or "outer arc") or through_block and "through block" or "landed"
+	local rotation, facing = monster_rotation(swing, unit)
+
+	swing.champion.done = true
+
+	e_send(swing, unit, target, frame, result, reason, multiplier, improved, direction, through_block, rotation, facing, t, true)
+
+	if blocked then
+		play_block(swing, unit, status, multiplier, improved, direction)
+	end
+
+	pc.guard("client lord's results", pc.hit_results.champion, swing, unit, target, result, from)
+end
+
+-- Family E4, every frame after LocomotionSystem.update: the screen of the player the lord attacks turns it, and every
+-- screen tests its own player against the attack's window, if its mode has one.
+local function update_champion(swing, unit, target, t, dt, status)
+	local champion = swing.champion
+
+	if swing.aimed and swing.facing_ours then
+		update_champion_facing(swing, unit, target, t, dt, status)
+	end
+
+	if champion.done or swing.past_damage or not champion.mode then
+		return
+	end
+
+	local mode = champion.mode
+	local reached, from = false, nil
+
+	if mode == "continuous_overlap" then
+		reached, from = lunge_frame(swing, unit, target, t)
+	elseif mode == "radial_cylinder" then
+		if t > champion.end_t then
+			e_close(swing, unit, target, "window over")
+
+			return
+		end
+
+		if t >= champion.start_t then
+			reached = radial_frame(swing, unit, target, t)
+		end
+	else
+		reached = wave_frame(swing, unit, target, t)
+	end
+
+	if t >= champion.start_t then
+		swing.open = true
+	end
+
+	if reached then
+		champion_verdict(swing, unit, target, 1, t, from)
+	elseif mode == "continuous_overlap" and t > champion.end_t then
+		e_close(swing, unit, target, "window over")
+	end
+end
+
+-- Family E4, an attack without a mode: copy of BTChampionAttackAction.anim_cb_damage (bt_champion_attack_action.lua:598)
+-- at this screen's copy's damage frame: the box in front (the same as an elite's, Geometry.lua) or the upright cylinder
+-- round the lord (collision_type), each damage frame a frame of the swing, until one reaches this player.
+local function champion_damage_frame(swing, unit, target, t)
+	local champion = swing.champion
+	local action = swing.action
+
+	if champion.done or champion.frames >= MAX_FRAMES then
+		return
+	end
+
+	champion.frames = champion.frames + 1
+
+	local rotation, facing = monster_rotation(swing, unit)
+	local self_position = Unit.local_position(unit, 0)
+	local reached
+
+	if action.collision_type == "cylinder" then
+		local centre, size, cylinder_rotation = pc.geometry.champion_cylinder(action, self_position, rotation)
+
+		reached = in_e_cylinder(swing, unit, target, centre, size, cylinder_rotation, action.collision_filter, action.radius) ~= nil
+	else
+		local centre, box_rotation, size = pc.geometry.elite_box(action, self_position, rotation)
+
+		reached = in_e_box(swing, unit, target, centre, box_rotation, size, "filter_player_hit_box_check")
+	end
+
+	if reached then
+		champion_verdict(swing, unit, target, champion.frames, t, self_position)
+	else
+		e_send(swing, unit, target, champion.frames, "miss", action.collision_type == "cylinder" and "cylinder" or "box", nil, nil, nil, nil, rotation, facing, t, true)
+	end
+end
+
+-- Family E, the rat ogre's jump slam, at its copy's damage frame as it lands on this screen. Its target's screen judges
+-- the hit as the game's generic damage frame does (family A's reach and cone, then the block,
+-- animation_callback_templates.lua:175 to :216), as frame 1; every screen then throws its own player if they are within
+-- the landing's catapult radius of the copy (BTJumpSlamImpactAction.catapult_player, bt_jump_slam_impact_action.lua:78),
+-- as frame 2. The flight was the host's, as a gutter runner's leap is (T17), so nothing turns here.
+local function jump_damage_frame(swing, unit, target, t)
+	if swing.landed then
+		return
+	end
+
+	swing.landed = true
+
+	local action = swing.action
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local rotation = Unit.local_rotation(unit, 0)
+
+	if swing.aimed then
+		local forward = Quaternion.forward(rotation)
+		local offset = position(target) - position(unit)
+		local in_reach, in_front = pc.geometry.single_target(offset.x, offset.y, offset.z, forward.x, forward.y, false, action, swing.breed, 0, 0, 0)
+		local result, reason = "hit", "landed"
+		local blocked, multiplier, improved, direction, through_block
+
+		if not in_reach then
+			result, reason = "miss", "reach"
+		elseif not in_front then
+			result, reason = "miss", "cone"
+		else
+			blocked, multiplier, improved, direction, through_block = would_block(swing, unit, target, status)
+
+			if blocked then
+				result, reason = "blocked", improved and "in arc" or "outer arc"
+			elseif through_block then
+				reason = "through block"
+			end
+		end
+
+		swing.box_method = "reach"
+
+		e_send(swing, unit, target, 1, result, reason, multiplier, improved, direction, through_block, rotation, "host", t, false)
+
+		if blocked then
+			play_block(swing, unit, status, multiplier, improved, direction)
+		elseif result == "hit" then
+			pc.guard("client hit results", pc.hit_results.hit, swing, unit, target)
+		end
+	end
+
+	local caught = action.catapult_players and Vector3.length(position(target) - position(unit)) <= (action.catapult_within_radius or 0)
+
+	swing.box_method = "radius"
+
+	e_send(swing, unit, target, 2, caught and "pushed" or "miss", caught and "thrown" or "radius", nil, nil, nil, nil, rotation, "host", t, true)
+
+	if caught then
+		pc.guard("client jump catapult", pc.hit_results.jump_catapult, swing, unit, target)
+	end
+end
+
+-- Family E, the exalted champion's axe (D68): this screen's copy of it is the thrown weapon that appeared after the
+-- swing began, nearest the champion's hand.
+local function claim_axe(swing)
+	local unit = swing.unit
+
+	if not Unit.alive(unit) then
+		return
+	end
+
+	local hand = position(unit) + Vector3(0, 0, 2)
+	local best, best_distance = nil, AXE_SEARCH
+
+	for i = #thrown, 1, -1 do
+		local record = thrown[i]
+
+		if record.t >= swing.begin_t and Unit.alive(record.unit) then
+			local distance = Vector3.distance(Unit.local_position(record.unit, 0), hand)
+
+			if distance <= best_distance then
+				best, best_distance = i, distance
+			end
+		end
+	end
+
+	if best then
+		swing.axe.unit = thrown[best].unit
+		swing.open = true
+
+		table.remove(thrown, best)
+		pc.log("client swing=%d enemy=%s: its axe appeared here %.3fs after it began, %.2f m from its hand", swing.id, swing.breed.name, pc.now() - swing.begin_t, best_distance)
+	end
+end
+
+-- Family E, the axe, every frame after LocomotionSystem.update: copy of BTThrowWeaponAction.check_overlap
+-- (bt_throw_weapon_action.lua:286) between this screen's copy of the axe and this player, out and back, until it is
+-- gone. Within its radius on the flat (target_dodged_radius while this player's dodge counts), unless invisible, this
+-- player is thrown, then hit unless they blocked; once per throw. The axe flies where the host's champion faced
+-- (question 2 of the build 6 notes, D69).
+local function update_axe(swing, unit, target, t, status)
+	local axe = swing.axe
+
+	if not axe.unit then
+		claim_axe(swing)
+
+		if not axe.unit then
+			return
+		end
+	end
+
+	if not Unit.alive(axe.unit) then
+		e_close(swing, unit, target, "axe gone")
+
+		return
+	end
+
+	swing.expires = math.max(swing.expires, t + 1)
+
+	local action = swing.action
+	local axe_position = Unit.local_position(axe.unit, 0)
+	local radius = status and is_dodging(status) and action.target_dodged_radius or action.radius
+
+	if not status or status:is_invisible() or Vector3.length(Vector3.flat(position(target) - axe_position)) >= (radius or 0) then
+		return
+	end
+
+	local blocked, multiplier, improved, direction, through_block = would_block(swing, unit, target, status)
+	local result = blocked and "blocked" or "hit"
+	local reason = blocked and (improved and "in arc" or "outer arc") or through_block and "through block" or "landed"
+
+	swing.box_method = "distance"
+
+	e_send(swing, unit, target, 1, result, reason, multiplier, improved, direction, through_block, Unit.local_rotation(unit, 0), "host", t, true)
+
+	if blocked then
+		play_block(swing, unit, status, multiplier, improved, direction)
+	end
+
+	pc.guard("client axe results", pc.hit_results.axe, swing, unit, target, result, axe_position)
+end
+
+-- Family E, the axe: a thrown weapon's copy appeared on this screen (ThrownUnitHuskExtension.init,
+-- thrown_unit_husk_extension.lua:8). It is kept for a moment for the swing that threw it.
+function client.thrown_spawned(unit)
+	local t = pc.now()
+
+	thrown[#thrown + 1] = {
+		unit = unit,
+		t = t,
+	}
+
+	while thrown[1] and (#thrown > 4 or t - thrown[1].t > AXE_MEMORY) do
+		table.remove(thrown, 1)
+	end
+
+	for _, swing in pairs(by_unit) do
+		if swing.kind == "axe" and not swing.axe.unit and not swing.past_damage then
+			claim_axe(swing)
+		end
+	end
+end
+
+-- Family E4: effects the host played for every client (WeaponSystem.rpc_play_fx, weapon_system.lua:867). Those without
+-- sounds may be a lord's ground wave's anticipation, whose positions are the wave's points (wave_points).
+function client.effects_played(vfx_array, sfx_array, position_array)
+	if type(vfx_array) ~= "table" or type(position_array) ~= "table" or #vfx_array == 0 or #position_array == 0 or type(sfx_array) == "table" and #sfx_array > 0 then
+		return
+	end
+
+	local points = {}
+
+	for i = 1, #position_array do
+		points[i] = Vector3Box(position_array[i])
+	end
+
+	wave_fx[#wave_fx + 1] = {
+		t = pc.now(),
+		fx = vfx_array[1],
+		points = points,
+	}
+
+	while #wave_fx > 4 do
+		table.remove(wave_fx, 1)
+	end
+end
+
 -- Family E, every frame after LocomotionSystem.update: the screen of the player the enemy attacks turns it; every
--- screen pushes its own player aside where the attack does so every frame, and sweeps an arm's window.
+-- screen pushes its own player aside where the attack does so every frame, and sweeps an arm's window, or follows the
+-- part (b) kinds' windows: a charge's run, a lord's lunge, spin or wave, a thrown axe.
 function client.update_monster(swing, unit, target, t, dt)
 	local status = ScriptUnit.has_extension(target, "status_system")
 
 	note_dodges(swing, status)
+
+	local kind = swing.kind
+
+	if kind == "charge" then
+		if not swing.past_damage then
+			update_charge(swing, unit, target, t, dt, status)
+		end
+
+		return
+	elseif kind == "champion" then
+		update_champion(swing, unit, target, t, dt, status)
+
+		return
+	elseif kind == "axe" then
+		if not swing.past_damage then
+			update_axe(swing, unit, target, t, status)
+		end
+
+		return
+	elseif kind == "jump" then
+		return
+	end
 
 	if swing.kind == "slam" then
 		if swing.aimed and swing.facing_ours then
@@ -1236,6 +2007,24 @@ function client.monster_frame(swing, unit, callback_name)
 	end
 
 	local t = pc.now()
+	local kind = swing.kind
+
+	-- Part (b): a lord's attack with a mode has its window instead (the node's own anim_cb_damage does nothing then,
+	-- bt_champion_attack_action.lua:602); a charge and a thrown axe have no damage frame.
+	if kind == "champion" then
+		if not swing.champion.mode then
+			champion_damage_frame(swing, unit, target, t)
+		end
+
+		return
+	elseif kind == "jump" then
+		jump_damage_frame(swing, unit, target, t)
+
+		return
+	elseif kind == "charge" or kind == "axe" then
+		return
+	end
+
 	local rotation, facing = monster_rotation(swing, unit)
 
 	if swing.kind == "slam" then
@@ -1489,9 +2278,26 @@ local function names(list, name)
 	return false
 end
 
--- Family E: the animations an overlap attack or a slam plays as part of itself, whichever of them the host picked.
+-- Whether a table keyed by anything (a charge's animations by distance) holds this animation, alone or in a list.
+local function names_any(list, name)
+	if type(list) == "table" then
+		for _, entry in pairs(list) do
+			if names(entry, name) then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+-- Family E: the animations an attack plays as part of itself, whichever of them the host picked: an overlap attack's or
+-- a slam's, the steps of a lord's attack_sequence (BTChampionAttackAction._next_in_sequence,
+-- bt_champion_attack_action.lua:354), a charge's (BTChargeAttackAction, bt_charge_attack_action.lua:54 to :414) and a
+-- throw's (BTThrowWeaponAction, bt_throw_weapon_action.lua:22, :136 and :341).
 local function own_attack_anim(swing, event)
 	local attack = swing.attack
+	local action = swing.action
 
 	if attack then
 		if names(attack.attack_anim, event) then
@@ -1507,7 +2313,58 @@ local function own_attack_anim(swing, event)
 		end
 	end
 
-	return names(swing.action.attack_anim, event)
+	if swing.kind == "champion" and type(action.attack_sequence) == "table" then
+		for i = 1, #action.attack_sequence do
+			local step = action.attack_sequence[i]
+
+			if type(step) == "table" and names(step.attack_anim, event) then
+				return true
+			end
+		end
+	elseif swing.kind == "charge" then
+		for i = 1, #CHARGE_ANIM_FIELDS do
+			if names(action[CHARGE_ANIM_FIELDS[i]], event) then
+				return true
+			end
+		end
+
+		if names_any(action.charging_animations, event) or type(action.lunge) == "table" and names_any(action.lunge.animations, event) then
+			return true
+		end
+	elseif swing.kind == "axe" then
+		for i = 1, #THROW_ANIM_FIELDS do
+			if names(action[THROW_ANIM_FIELDS[i]], event) then
+				return true
+			end
+		end
+	end
+
+	return names(action.attack_anim, event)
+end
+
+-- Family E3: the host's animations for a charge whose test runs on this screen. An impact (BTChargeAttackAction
+-- ._start_impact, bt_charge_attack_action.lua:324) ends the test here, but for the minotaur's, which tests again for its
+-- hit_during_impact_t after an impact that hit nobody (:354): this screen can't tell those apart, so it tests on for
+-- that long after any. The charge stopped by a wall (charge_blocked_animation), cancelled or turning round to its
+-- target is over.
+local function charge_seen(swing, unit, event)
+	local action = swing.action
+	local charge = swing.charge
+
+	if not charge.open or swing.past_damage then
+		return
+	end
+
+	if names(action.charge_blocked_animation, event) or names(action.cancel_animation, event) or names(action.align_to_target_animation, event) then
+		e_close(swing, unit, local_player_unit(), tostring(event))
+	elseif names(action.impact_animation, event) then
+		if not action.hit_during_impact_t then
+			e_close(swing, unit, local_player_unit(), tostring(event))
+		elseif not charge.until_t then
+			charge.paused = false
+			charge.until_t = pc.now() + action.hit_during_impact_t
+		end
+	end
 end
 
 function client.animation_changed(go_id, anim_id)
@@ -1523,10 +2380,26 @@ function client.animation_changed(go_id, anim_id)
 		return
 	end
 
-	-- Family E: another of the attack's own animations, the host's copy of what this screen plays (a slam is announced
-	-- with the animation the host noted last, Host.lua).
-	if swing.family == "E" and own_attack_anim(swing, event) then
-		return
+	if swing.family == "E" then
+		-- A charge's impact, cancel or turning round changes what its test does here.
+		if swing.kind == "charge" then
+			charge_seen(swing, swing.unit, event)
+		end
+
+		-- Another of the attack's own animations, the host's copy of what this screen plays (a slam is announced with the
+		-- animation the host noted last, Host.lua).
+		if own_attack_anim(swing, event) then
+			return
+		end
+
+		-- Any other move means the attack is over. A window that had opened here (part (b): a charge's run, a lord's
+		-- lunge, spin or wave, a thrown axe) ran without reaching this player: a miss.
+		if swing.open and not swing.past_damage then
+			e_close(swing, swing.unit, local_player_unit(), tostring(event))
+			forget(swing)
+
+			return
+		end
 	end
 
 	-- Family F: a gutter runner's leap plays these as part of it, and its landing ends it here without reaching this
@@ -1627,13 +2500,42 @@ end
 
 -- Family E: what this screen needs to follow the attack, from its own copy of the data: an overlap attack's turning,
 -- length and window (BTMeleeOverlapAttackAction._init_attack, bt_melee_overlap_attack_action.lua:161 to :259), a slam's
--- (BTMeleeSlamAction.init_attack, bt_melee_slam_action.lua:44).
+-- (BTMeleeSlamAction.init_attack, bt_melee_slam_action.lua:44), a lord's (init_champion). A charge, a jump slam's
+-- landing and a thrown axe are never turned here (question 2 of the build 6 notes, D69). Returns false and why if this
+-- screen can't follow the attack.
 local function init_monster(swing, t)
 	local action = swing.action
 	local attack = swing.attack
+	local kind = swing.kind
 
 	swing.box_frames = 0 -- damage frames of this screen's copy so far
 	swing.grab = pc.GRAB_ATTACKS[swing.action_name] == true -- the chaos spawn's grab (D67)
+
+	if kind == "charge" then
+		swing.facing_ours = false
+		swing.end_t = math.huge -- until its test ends here (client.charge_cue, charge_seen)
+		swing.charge = {
+			open = false, -- its test runs from the copy's anim_cb_charge_start_finished
+			speed = 0, -- the copy's speed here
+		}
+
+		return true
+	elseif kind == "jump" then
+		swing.facing_ours = false
+		swing.end_t = t + JUMP_WAIT
+
+		return true
+	elseif kind == "axe" then
+		swing.facing_ours = false
+		swing.end_t = math.huge -- until its axe is gone here
+		swing.axe = {}
+
+		claim_axe(swing)
+
+		return true
+	elseif kind == "champion" then
+		return init_champion(swing, t)
+	end
 
 	if swing.kind == "slam" then
 		local anim_driven = action.anim_driven == true
@@ -1820,10 +2722,17 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 		attack = attack, -- family E1: the overlap attack, from action.attacks or action.running_attacks
 	}
 
-	if family == "E" and not pc.guard("client monster swing", init_monster, swing, t) then
-		send_answer({ id = id }, 1, "unjudged")
+	if family == "E" then
+		local ok, ready, why = pc.guard("client monster swing", init_monster, swing, t)
 
-		return
+		if not ok or ready == false then
+			-- The host judges a swing this screen can't, as it does one whose client has gone quiet (Host.lua).
+			pc.count("client_unjudged")
+			pc.print("client swing=%d enemy=%s attack=%s can't be judged here: %s", id, breed.name, action_name, ok and tostring(why) or "an error")
+			send_answer({ id = id }, 1, "unjudged")
+
+			return
+		end
 	end
 
 	swings[id] = swing
@@ -1863,6 +2772,25 @@ mod:hook_safe("LocomotionSystem", "update", function (self, context, t)
 	if pc.shots and pc.shots.has_turning() then
 		pc.guard("client shooters", pc.shots.after_locomotion, t, context.dt)
 	end
+end)
+
+-- Family E, the exalted champion's axe (D68): every thrown weapon's copy on this screen, for the swing that threw it.
+mod:hook_safe("ThrownUnitHuskExtension", "init", function (self, extension_init_context, unit, extension_init_data)
+	if pc.broken or pc.is_server() or not pc.in_game() then
+		return
+	end
+
+	pc.guard("client thrown weapon", client.thrown_spawned, unit)
+end)
+
+-- Family E4: the effects the host plays for every client, among them a lord's ground wave's anticipation, whose
+-- positions are the wave's points (BTChampionAttackAction._init_attack, bt_champion_attack_action.lua:188).
+mod:hook_safe("WeaponSystem", "rpc_play_fx", function (self, channel_id, vfx_array, sfx_array, position_array)
+	if self.is_server or pc.broken or not pc.in_game() then
+		return
+	end
+
+	pc.guard("client wave points", client.effects_played, vfx_array, sfx_array, position_array)
 end)
 
 -- The host's animation messages are hooked in Reactions.lua, which passes the ones it doesn't hold back to here.
@@ -2049,6 +2977,8 @@ function client.clear()
 	by_unit = {}
 	by_go_id = {}
 	recently_cut = {}
+	wave_fx = {}
+	thrown = {}
 	hello_timer = 0
 	host_answered = false
 	contact_lost = false

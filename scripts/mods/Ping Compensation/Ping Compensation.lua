@@ -40,6 +40,14 @@ local DAMAGE_CALLBACKS = {
 	anim_cb_stormvermin_push = true,
 }
 
+-- A charge's cues (family E3, build 6 part (b)), which start and end its test on a client's copy (Client.lua,
+-- client.charge_cue; bt_charge_attack_action.lua:1125, :1149 and :1161).
+local CHARGE_CALLBACKS = {
+	anim_cb_charge_start_finished = true,
+	anim_cb_charge_charging_finished = true,
+	anim_cb_disable_charge_collision = true,
+}
+
 -- The one place where both sides meet the game's damage frame. An enemy's attack animation fires anim_cb_damage on
 -- every machine that plays it: on the host, where vanilla judges the swing, and on each client, where vanilla does
 -- nothing with it.
@@ -81,6 +89,8 @@ mod:hook("AnimationSystem", "animation_callback", function (func, self, unit, ca
 		elseif callback_name == "anim_cb_attack_overlap_done" and not self.is_server then
 			-- Family E1 (build 6): a monster's arm window is over on this screen's copy (Client.lua, client.window_done).
 			pc.guard("client overlap window", pc.client.window_done, unit)
+		elseif CHARGE_CALLBACKS[callback_name] and not self.is_server then
+			pc.guard("client charge cue", pc.client.charge_cue, unit, callback_name)
 		end
 
 		return func(self, unit, callback_name, param)
@@ -315,6 +325,8 @@ local function print_stats(to_chat, as_host)
 		out("Frenzy combo steps announced %d. Next moves that waited for the answer %d (average %.0f ms), went by the host's guess %d (%d after the wait ran out).", stat("host_announced_B"), stat("host_combo_waited"), waits > 0 and stat("host_combo_wait_sum") / waits * 1000 or 0, stat("host_combo_guessed"), stat("host_combo_wait_ran_out"))
 		out("Elite sweeps and overheads sent %d (one per modded player), elite shoves %d.", stat("host_announced_C"), stat("host_announced_D"))
 		out("Disablers' hooks, grabs and pounces sent %d (a pounce to every modded player). Clients' grabs and pins booked %d, refused %d. Held open for the answer %d.", stat("host_announced_F"), stat("host_grab_booked"), stat("host_grab_refused"), stat("host_grab_waited"))
+		out("Monsters' and lords' attacks sent %d (one per modded player): overlaps %d, slams %d, charges %d, lords' attacks %d, jump slams %d, axes %d. Charge impacts started for the look %d, by a client's hit %d. Chaos spawn hits that couldn't grab %d. Swings a client couldn't judge, left to the host %d.", stat("host_announced_E"), stat("host_announced_E_overlap"), stat("host_announced_E_slam"), stat("host_announced_E_charge"), stat("host_announced_E_champion"),
+			stat("host_announced_E_jump"), stat("host_announced_E_axe"), stat("host_charge_look"), stat("host_charge_client_impact"), stat("host_grab_hit_only"), stat("host_judged_unjudged"))
 		out("Enemy shots: streams aimed at a modded player %d, archers aiming at one %d. Arrows %d, %d of them rolled a miss; the others sent to %d modded players in all. Own shots stopped at modded players %d. Clients' shots %d (bullets %d, arrows %d): booked %d, blocked on their screen %d, ignored from a client gone quiet %d.", stat("host_streams_aimed"), stat("host_archers_aimed"), stat("host_arrows"), stat("host_arrows_missed_roll"), stat("host_arrows_sent"), stat("host_shot_stopped"), stat("host_shots"), stat("host_shot_bullet"), stat("host_shot_arrow"), stat("host_shot_booked"), stat("host_shot_blocked"), stat("host_shot_ignored_stale"))
 		out("Enemy areas: jets sent to modded players %d (one per player; new targets %d), modded players left out of the host's jet sweeps %d and of gas clouds' tests %d. Clients' reports %d: ticks %d (booked: gas %d, ground fire %d, jet %d; late %d, lost %d), impacts %d (booked %d), ground fire %d (entered %d, left %d), jet hits %d (booked %d), vortex catches %d (booked %d). Host burning ticks left to clients %d. Ignored from a client gone quiet %d.", stat("host_jets_aimed"), stat("host_jets_retargeted"), stat("host_jet_left_out"), stat("host_gas_left_to_client"), stat("host_area_reports"), stat("host_area_tick"), stat("host_gas_ticks"), stat("host_fire_ticks"), stat("host_jet_ticks"), stat("host_ticks_late"), stat("host_ticks_lost"),
 			stat("host_area_impact"), stat("host_gas_impacts"), stat("host_area_fire"), stat("host_fire_entered"), stat("host_fire_left"), stat("host_area_jet"), stat("host_jet_hits"), stat("host_area_vortex"), stat("host_vortex_catches"), stat("host_burn_ticks_left_to_client"), stat("host_area_ignored_stale"))
@@ -355,6 +367,8 @@ local function print_stats(to_chat, as_host)
 		out("Your blasts worked out here %d, covered enemies in them %d, blasts left to the host %d.", stat("client_blasts"), stat("client_blast_targets"), stat("client_blast_not_followed"))
 		out("Elite sweeps and overheads judged %d (%d where you weren't the one attacked; hit boxes found by the game's overlap %d, by shape %d), elite shoves judged %d.", stat("client_judged_C"), stat("client_judged_C_not_aimed"), stat("client_box_overlap"), stat("client_box_shape"), stat("client_judged_D"))
 		out("Disablers' hooks, grabs and pounces judged %d: dodged %d, out of sight %d, landed without reaching you %d, when the game wouldn't take you %d. Grabs and pins shown at once %d: confirmed by the host %d, refused %d, never confirmed %d, undone %d.", stat("client_judged_F"), stat("client_miss_dodged"), stat("client_miss_line of sight"), stat("client_miss_landed"), stat("client_miss_untakeable"), stat("client_grab_shown"), stat("client_grab_confirmed"), stat("client_grab_refused"), stat("client_grab_timeout"), stat("client_grab_undone"))
+		out("Monsters' and lords' attacks judged %d (%d where you weren't the one attacked): overlaps %d, slams %d, charges %d, lords' attacks %d, jump slams %d, axes %d; by the game's overlap %d, by shape %d. Shield blocks %d, pushed or thrown without a hit %d, pushed aside %d. Catapults shown at once %d (host copies dropped %d), knock-downs %d (dropped %d), never echoed %d.", stat("client_judged_E"), stat("client_judged_E_not_aimed"), stat("client_judged_E_overlap"), stat("client_judged_E_slam"), stat("client_judged_E_charge"),
+			stat("client_judged_E_champion"), stat("client_judged_E_jump"), stat("client_judged_E_axe"), stat("client_E_overlap"), stat("client_E_shape"), stat("client_shield"), stat("client_pushed"), stat("client_pushed_aside"), stat("client_catapult_shown"), stat("client_catapult_message_dropped"), stat("client_knock_down_shown"), stat("client_knock_down_message_dropped"), stat("client_status_never_echoed"))
 		out("Enemy shots judged on you %d (bullets %d, arrows %d): hit %d, blocked %d. Streams aimed at you %d (%d ran here). Archers aiming at you %d (ended %d). Arrows told of %d, aimed again at you %d; hit something else first %d, lost %d, never seen %d; host removals held back %d, dropped for arrows already gone here %d.", stat("client_shot_bullet") + stat("client_shot_arrow"), stat("client_shot_bullet"), stat("client_shot_arrow"), stat("client_shot_hit"), stat("client_shot_blocked"), stat("client_streams_announced"), stat("client_streams_aimed"),
 			stat("client_archers_aimed"), stat("client_archers_ended"), stat("client_arrows"), stat("client_arrows_aimed"), stat("client_arrow_stopped"), stat("client_arrow_lost"), stat("client_arrow_never_seen"), stat("client_arrow_despawn_held"), stat("client_arrow_despawn_dropped"))
 		out("Enemy areas on you: gas ticks %d, impacts %d; ground fire entered %d, left %d; jets judged here %d (aimed at you %d, new targets %d; hits %d, blocked %d, their target off the gun %d, ended %d); burnings started here %d, their ticks shown and sent %d (ground fire %d, jet %d; blocked %d, outside the fire %d, lost %d), host copies dropped %d, own copies released %d; vortex pulls %d, catches shown %d: confirmed %d, refused %d, never confirmed %d, undone %d.", stat("client_gas_ticks"), stat("client_gas_impacts"), stat("client_fire_entered"), stat("client_fire_left"),

@@ -9,8 +9,10 @@ local pc = mod.pc
 -- overheads (BTStormVerminAttackAction), which reach every modded player near their box; D, elites' shoves
 -- (BTStormVerminPushAction); F, disablers (D52): the packmaster's hook (BTPackMasterAttackAction), the leech's grab
 -- (BTCorruptorGrabAction) and the gutter runner's pounce (BTCrazyJumpAction), which reaches every modded player; E,
--- monsters' and lords' attacks (build 6, D61), which reach every modded player: overlap sweeps (BTMeleeOverlapAttackAction)
--- and slams (BTMeleeSlamAction) so far.
+-- monsters' and lords' attacks (build 6, D61), which reach every modded player: overlap sweeps (BTMeleeOverlapAttackAction),
+-- slams (BTMeleeSlamAction), and from part (b) the charges (BTChargeAttackAction), the lords' attacks
+-- (BTChampionAttackAction), the rat ogre's jump slam (BTJumpSlamImpactAction) and the exalted champion's axe
+-- (BTThrowWeaponAction).
 -- Bots, the host's own hero and players without the mod never get a record here, so they stay vanilla.
 
 local host = {
@@ -20,6 +22,8 @@ local host = {
 	-- Family E: while a monster's overlap test or slam runs, { filter, units, dropped, ... }: every overlap with that
 	-- filter (its 13th argument) leaves those player units out, and notes the ones it dropped.
 	overlap_skip = nil,
+	-- Family E, the jump slam: while its landing's catapult runs, { units, group }: those player units are left out.
+	jump_skip = nil,
 	booking = false, -- true while the host books what a client reported, so the damage-alone log leaves it out (D56)
 }
 
@@ -426,14 +430,47 @@ local function overlap_announceable(unit, blackboard)
 		and attack_index_of(action, blackboard.attack) ~= nil and action_set_name(action, breed) ~= nil and pc.network():unit_game_object_id(unit) ~= nil
 end
 
+-- Family E, part (b): the node of each new kind. Looked up when used, not as the file loads.
+local function e_node(kind)
+	if kind == "charge" then
+		return BTChargeAttackAction
+	elseif kind == "champion" then
+		return BTChampionAttackAction
+	elseif kind == "jump" then
+		return BTJumpSlamImpactAction
+	elseif kind == "axe" then
+		return BTThrowWeaponAction
+	end
+
+	return nil
+end
+
+-- Family E, part (b): the table each new kind's node makes as an attack starts and clears as it leaves, which tells
+-- one attack from the next of the same action: a charge's and a throw's hit_units (bt_charge_attack_action.lua:71 and
+-- :165, bt_throw_weapon_action.lua:34 and :70), a lord's attack_rotation (bt_champion_attack_action.lua:89 and :278),
+-- the jump slam's jump_slam_data (bt_prepare_jump_slam_action.lua:16, bt_jump_slam_impact_action.lua:31).
+local function e_token(kind, blackboard)
+	if kind == "charge" or kind == "axe" then
+		return blackboard.hit_units
+	elseif kind == "champion" then
+		return blackboard.attack_rotation
+	elseif kind == "jump" then
+		return blackboard.jump_slam_data
+	end
+
+	return nil
+end
+
 -- Family E (D61): a monster's or lord's attack that can reach several players goes to every modded player it is an
--- enemy of, wherever they are, each as a swing of their own, aimed for its target, whose screen turns the enemy. The
--- Necromancer's skeletons attack enemies only, so they never send one. Returns the attack's group, or nil.
-local function announce_monster(unit, blackboard, kind, attack, attack_anim, attack_index, t)
+-- enemy of, wherever they are, each as a swing of their own, aimed for its target (blackboard.attacking_target, unless
+-- aimed_at says), whose screen turns the enemy. The Necromancer's skeletons attack enemies only, and their charge too
+-- (pet_skeleton_behavior.lua:388), so they never send one. Returns the attack's group, or nil.
+local function announce_monster(unit, blackboard, kind, attack, attack_anim, attack_index, t, aimed_at)
 	local action = blackboard.action
 	local breed = blackboard.breed
 
-	-- Both nodes deal action.damage (bt_melee_overlap_attack_action.lua:658, bt_melee_slam_action.lua:195), and the
+	-- Every node deals action.damage (bt_melee_overlap_attack_action.lua:658, bt_melee_slam_action.lua:195,
+	-- bt_charge_attack_action.lua:560, bt_champion_attack_action.lua:845, bt_throw_weapon_action.lua:327), and the
 	-- game's damage frame reaches them only with it (animation_callback_templates.lua:141).
 	if type(action) ~= "table" or not action.damage or not breed or type(attack_anim) ~= "string" then
 		return nil
@@ -446,7 +483,8 @@ local function announce_monster(unit, blackboard, kind, attack, attack_anim, att
 		return nil
 	end
 
-	local aimed_at = blackboard.attacking_target
+	aimed_at = aimed_at or blackboard.attacking_target
+
 	local side_manager = Managers.state.side
 	local group = {
 		kind = kind,
@@ -454,6 +492,7 @@ local function announce_monster(unit, blackboard, kind, attack, attack_anim, att
 		attack = attack,
 		blackboard = blackboard,
 		started_t = blackboard.attack_started_at_t,
+		token = e_token(kind, blackboard), -- part (b)'s kinds: this attack's own table
 		swings = {},
 		by_target = {},
 		box_frames = 0, -- damage frames of the host's copy so far
@@ -475,6 +514,7 @@ local function announce_monster(unit, blackboard, kind, attack, attack_anim, att
 			group.swings[#group.swings + 1] = swing
 			group.by_target[player_unit] = swing
 
+			pc.count("host_announced_E_" .. kind)
 			send_begin(swing, blackboard, swing.aimed)
 		end
 	end
@@ -529,6 +569,72 @@ function host.announce_slam(unit, blackboard, t)
 	local attack_anim = pc.host_reactions.last_attack_anim(unit) or "slam"
 
 	overlaps[unit] = announce_monster(unit, blackboard, "slam", nil, attack_anim, 0, t)
+end
+
+-- The first entry of a field that names one animation or a list of them to pick from.
+local function first_anim(anims)
+	if type(anims) == "table" then
+		anims = anims[1]
+	end
+
+	return type(anims) == "string" and anims or nil
+end
+
+-- Family E3, called after BTChargeAttackAction.enter (bt_charge_attack_action.lua:23): the bestigor's and the
+-- minotaur's charges, both the same way (D65). The run is the host's (question 2 of the build 6 notes, D69): every
+-- screen judges its own player against its copy as the host moves it.
+function host.announce_charge(unit, blackboard, t)
+	overlaps[unit] = nil
+
+	if blackboard.active_node ~= BTChargeAttackAction or type(blackboard.hit_units) ~= "table" or type(blackboard.action) ~= "table" then
+		return
+	end
+
+	overlaps[unit] = announce_monster(unit, blackboard, "charge", nil, first_anim(blackboard.action.start_animation) or "charge_start", 0, t)
+end
+
+-- Family E4, called after BTChampionAttackAction.enter (bt_champion_attack_action.lua:21), with the attack's first
+-- animation. An attack without one hit inside enter, before anything could be announced (:82), so it stays the host's
+-- (the Drachenfels sorcerer's death_explosion, an enemy blast for build 6.1, D66).
+function host.announce_champion(unit, blackboard, t)
+	overlaps[unit] = nil
+
+	local action = blackboard.action
+
+	if type(action) ~= "table" or blackboard.active_node ~= BTChampionAttackAction or blackboard.attack_finished or not blackboard.attack_rotation then
+		return
+	end
+
+	local sequence = type(action.attack_sequence) == "table" and action.attack_sequence[1]
+	local attack_anim = first_anim(type(sequence) == "table" and sequence.attack_anim or action.attack_anim)
+
+	if attack_anim then
+		overlaps[unit] = announce_monster(unit, blackboard, "champion", nil, attack_anim, 0, t)
+	end
+end
+
+-- Family E, called after BTJumpSlamImpactAction.enter (bt_jump_slam_impact_action.lua:16): the rat ogre's jump slam
+-- lands. Its flight was the host's, aimed where it saw its target, as a gutter runner's leap is (T17).
+function host.announce_jump(unit, blackboard, t)
+	overlaps[unit] = nil
+
+	if blackboard.active_node == BTJumpSlamImpactAction and type(blackboard.jump_slam_data) == "table" then
+		overlaps[unit] = announce_monster(unit, blackboard, "jump", nil, "attack_jump_land", 0, t)
+	end
+end
+
+-- Family E, called after BTThrowWeaponAction.enter (bt_throw_weapon_action.lua:13): the exalted champion's axe (D68),
+-- aimed for its target_unit, which it turns to until the throw. The axe flies where the host's champion faced.
+function host.announce_axe(unit, blackboard, t)
+	overlaps[unit] = nil
+
+	local action = blackboard.action
+
+	if blackboard.active_node ~= BTThrowWeaponAction or type(blackboard.hit_units) ~= "table" or type(action) ~= "table" then
+		return
+	end
+
+	overlaps[unit] = announce_monster(unit, blackboard, "axe", nil, first_anim(action.throw_animation) or "throw_weapon", 0, t, blackboard.target_unit)
 end
 
 -- Family E at a frame of the host's copy: notes the frame on each player's swing and returns the players whose own
@@ -627,6 +733,24 @@ function host.slam_frame(unit, blackboard)
 	}
 end
 
+-- Family E: whether the host sees this player blocking this enemy now, as DamageUtils.check_block would decide it
+-- (damage_utils.lua:2697), for host_would: "blocked" or "hit". Nothing here has side effects.
+local function block_would(unit, target)
+	local status = Unit.alive(target) and ScriptUnit.has_extension(target, "status_system")
+
+	if not status then
+		return "miss"
+	end
+
+	local buff_extension = ScriptUnit.has_extension(target, "buff_system")
+
+	if status:is_blocking() and status:can_block(unit) and not (buff_extension and buff_extension:has_buff_perk("invulnerable")) then
+		return "blocked"
+	end
+
+	return "hit"
+end
+
 -- Family E: what the node would have done at this frame for a modded player its overlap found, for the debug log:
 -- the slam's dodge (bt_melee_slam_action.lua:173), an overlap attack passing over a player behind it
 -- (bt_melee_overlap_attack_action.lua:937), then the block. Nothing here has side effects.
@@ -656,13 +780,7 @@ local function monster_would(scope, swing)
 		return "miss"
 	end
 
-	local buff_extension = ScriptUnit.has_extension(target, "buff_system")
-
-	if status:is_blocking() and status:can_block(unit) and not (buff_extension and buff_extension:has_buff_perk("invulnerable")) then
-		return "blocked"
-	end
-
-	return "hit"
+	return block_would(unit, target)
 end
 
 -- Family E, after the host's own overlap at that frame: the modded players it found and left out, for host_would.
@@ -724,6 +842,333 @@ function host.push_restore()
 		push_hidden.side.ENEMY_PLAYER_AND_BOT_UNITS = push_hidden.units
 		push_hidden = nil
 	end
+end
+
+-- Family E3: whether the charge's impact can still start on a hit, as BTChargeAttackAction._check_unit_and_wall_collision
+-- starts it (bt_charge_attack_action.lua:424), which runs while charging (:879) and lunging, until the lunge's
+-- collision ends (:970). A hit while approaching on a path starts none (:785).
+local function charge_can_impact(blackboard)
+	return blackboard.charge_state == "charging" or blackboard.charge_state == "lunge" and not blackboard.anim_cb_disable_charge_collision
+end
+
+-- Family E3, called around BTChargeAttackAction._check_overlap (bt_charge_attack_action.lua:443), every frame of the run
+-- and of the minotaur's impact after a miss (:1001): the modded players the charge went to go into its hit and push
+-- lists for the call, so that the node passes them over, and come back out after it (charge_test_done). Their own
+-- screens judge the charge. The host notes what its own test would have done to each of them, for host_would, and
+-- whether it would have hit the charge's target, which then starts the impact here for the look alone (D65). Every swing
+-- of the charge is kept for as long as it runs, which can be longer than a swing is remembered. Returns the scope, or nil.
+function host.charge_frame(unit, blackboard, action)
+	local group = overlaps[unit]
+
+	if not group or group.kind ~= "charge" or blackboard ~= group.blackboard or blackboard.active_node ~= BTChargeAttackAction or action ~= group.action or blackboard.is_illusion
+		or blackboard.hit_units ~= group.token or type(blackboard.pushed_units) ~= "table" then
+		return nil
+	end
+
+	local t = pc.now()
+	local hit_units = blackboard.hit_units
+	local pushed_units = blackboard.pushed_units
+	local self_position = Unit.local_position(unit, 0)
+	local forward = Quaternion.forward(Unit.local_rotation(unit, 0))
+	local scope = nil
+
+	for i = 1, #group.swings do
+		local swing = group.swings[i]
+		local target = swing.target
+
+		swing.expires = math.max(swing.expires, t + pc.SWING_LIFETIME)
+
+		if not swing.host_judged then
+			if peer_is_fresh(swing.peer) and Unit.alive(target) then
+				if swing.frames == 0 then
+					-- Frame 1 is the hit, frame 2 a push aside (Client.lua).
+					swing.frames = 2
+					swing.frame_t[1] = t
+					swing.frame_t[2] = t
+					swing.would[1] = "miss"
+					swing.would[2] = "miss"
+				end
+
+				scope = scope or {
+					group = group,
+					blackboard = blackboard,
+					saved = {},
+				}
+
+				-- What the node's own test would have done to this player now (:460 to :486), from the host's view.
+				local status = ScriptUnit.has_extension(target, "status_system")
+				local target_position = POSITION_LOOKUP[target]
+
+				if not hit_units[target] and status and target_position and not status:is_invisible() then
+					local to_target = target_position - self_position
+					local distance = Vector3.length(to_target)
+
+					if distance > 0 and Vector3.dot(to_target / distance, forward) > 0 then
+						local head_radius = status:get_is_dodging() and action.target_dodged_radius or action.head_radius
+
+						if distance < (head_radius or 0) then
+							if swing.would[1] == "miss" then
+								swing.would[1] = not action.unblockable_by_normal_blocks and block_would(unit, target) or "hit"
+							end
+
+							if swing.aimed and not group.impact_started and charge_can_impact(blackboard) then
+								scope.look = distance
+								scope.look_swing = swing
+							end
+						elseif not pushed_units[target] and distance < (action.radius or 0) and swing.would[1] == "miss" then
+							swing.would[2] = "pushed"
+						end
+					end
+				end
+
+				scope.saved[target] = {
+					hit = hit_units[target],
+					pushed = pushed_units[target],
+				}
+			else
+				swing.host_judged = true
+
+				pc.count("host_judged_quiet_client")
+			end
+		end
+	end
+
+	return scope
+end
+
+-- Family E3, before the charge's own test: the modded players of the scope go into its hit and push lists, so that it
+-- passes them over. Plain table work, outside pc.guard, so that it can't stop halfway.
+local function charge_skip(scope)
+	local blackboard = scope.blackboard
+
+	for target in pairs(scope.saved) do
+		blackboard.hit_units[target] = true
+		blackboard.pushed_units[target] = true
+	end
+end
+
+-- Family E3, after the charge's own test ran with the modded players in its lists: they come back out, with no
+-- pc.guard, so that it happens even once the mod has switched itself off. Where the host would have hit the charge's
+-- target (scope.look), the test reports a hit, which starts the impact there as vanilla's would (:428), for the look
+-- alone: the host books only what the target's own screen says (D65, T22). Passes the original's results through.
+local function charge_test_done(scope, hit_target, blocked, ...)
+	local blackboard = scope.blackboard
+
+	if type(blackboard.hit_units) == "table" and type(blackboard.pushed_units) == "table" then
+		for target, saved in pairs(scope.saved) do
+			blackboard.hit_units[target] = saved.hit
+			blackboard.pushed_units[target] = saved.pushed
+		end
+	end
+
+	if scope.look and not hit_target then
+		local swing = scope.look_swing
+
+		scope.group.impact_started = "look"
+
+		pc.count("host_charge_look")
+		pc.log("host swing=%d enemy=%s charge impact started here for the look alone (T22): its target %.2f m away as the host sees them", swing.id, swing.breed_name, scope.look)
+
+		return true, blocked, ...
+	end
+
+	return hit_target, blocked, ...
+end
+
+-- Family E4, called around BTChampionAttackAction._deal_damage (bt_champion_attack_action.lua:767): at each damage frame
+-- of an attack without a mode (anim_cb_damage, :598), and every frame of a window (a lunge, a spin, a wave; :477, :729,
+-- :593), all of which are its frame 1. Returns the scope for champion_filter, or nil.
+function host.champion_frame(unit, blackboard, action)
+	local group = overlaps[unit]
+
+	if not group or group.kind ~= "champion" or blackboard ~= group.blackboard or blackboard.active_node ~= BTChampionAttackAction or action ~= group.action
+		or blackboard.attack_rotation ~= group.token then
+		return nil
+	end
+
+	local frame, new_frame
+
+	if action.mode then
+		frame, new_frame = 1, not group.window_started
+		group.window_started = true
+	else
+		group.box_frames = group.box_frames + 1
+		frame, new_frame = group.box_frames, true
+	end
+
+	local skip = monster_frame(group, frame, new_frame, pc.now())
+
+	if not skip then
+		return nil
+	end
+
+	return {
+		units = skip,
+		group = group,
+		frame = frame,
+		unit = unit,
+	}
+end
+
+-- Family E4: the actors a lord's attack reached, without those of the modded players whose own screens judge it, who
+-- are noted for host_would. A list of its own, since the original may pass one it reuses (:535).
+local function champion_filter(scope, hit_actors, actor_count)
+	local kept = {}
+
+	for i = 1, actor_count do
+		local actor = hit_actors[i]
+		local target = actor and Actor.unit(actor)
+
+		if target and scope.units[target] then
+			local swing = scope.group.by_target[target]
+
+			if swing and swing.would[scope.frame] == "miss" then
+				swing.would[scope.frame] = block_would(scope.unit, target)
+			end
+		elseif actor then
+			kept[#kept + 1] = actor
+		end
+	end
+
+	return kept, #kept
+end
+
+-- Family E, the rat ogre's jump slam, at the generic damage frame of its landing (animation_callback_templates.lua:175
+-- to :216), whose test reaches only its target: that player's swing is the one whose test is switched off there, as
+-- family A's is (check_distance), as its frame 1. Returns it, or nil, and whether this is its first time.
+local function jump_frame(unit, group)
+	local blackboard = BLACKBOARDS[unit]
+
+	if not blackboard or blackboard ~= group.blackboard or blackboard.active_node ~= BTJumpSlamImpactAction or blackboard.action ~= group.action or blackboard.jump_slam_data ~= group.token then
+		return nil
+	end
+
+	local swing = blackboard.attacking_target and group.by_target[blackboard.attacking_target]
+
+	if not swing or swing.host_judged then
+		return nil
+	end
+
+	-- Its test runs again if the frame fires again before the impact clears the target (bt_jump_slam_impact_action.lua:48).
+	if swing.frames > 0 then
+		return swing, false
+	end
+
+	if not peer_is_fresh(swing.peer) then
+		swing.host_judged = true
+
+		pc.count("host_judged_quiet_client")
+
+		return nil
+	end
+
+	local t = pc.now()
+
+	swing.frames = 1
+	swing.frame_t[1] = t
+	swing.expires = math.max(swing.expires, t + pc.SWING_LIFETIME)
+
+	return swing, true
+end
+
+-- Family E, called around BTJumpSlamImpactAction.jump_slam_impact (bt_jump_slam_impact_action.lua:56), once per landing:
+-- notes where the host's copy landed, for the catapults that screens report, and the frame of the catapult of every
+-- player within 7 m (catapult_players, :70), its frame 2. Returns the scope for the catapult hook, or nil.
+function host.jump_impact(unit, blackboard)
+	local group = overlaps[unit]
+
+	if not group or group.kind ~= "jump" or blackboard ~= group.blackboard or blackboard.active_node ~= BTJumpSlamImpactAction or blackboard.jump_slam_data ~= group.token then
+		return nil
+	end
+
+	local landing = POSITION_LOOKUP[unit]
+
+	group.landing = landing and Vector3Box(landing) or nil
+
+	local skip = monster_frame(group, 2, true, pc.now())
+
+	if not skip then
+		return nil
+	end
+
+	return {
+		units = skip,
+		group = group,
+	}
+end
+
+-- Family E, the jump slam's catapult: the players it throws (BTJumpSlamImpactAction.catapult_players, :70), without the
+-- modded players whose own screens judge it, who are noted for host_would.
+local function jump_filter(scope, unit_list, impact_position, radius)
+	local kept = {}
+
+	for i = 1, #unit_list do
+		local target = unit_list[i]
+
+		if scope.units[target] then
+			local swing = scope.group.by_target[target]
+			local target_position = POSITION_LOOKUP[target]
+
+			if swing and target_position and impact_position and type(radius) == "number" and Vector3.length(target_position - impact_position) <= radius then
+				swing.would[2] = "pushed"
+			end
+		else
+			kept[#kept + 1] = target
+		end
+	end
+
+	return kept
+end
+
+-- Family E, the exalted champion's axe (D68), called around BTThrowWeaponAction.check_overlap
+-- (bt_throw_weapon_action.lua:286), per player per frame of the axe's flight: a modded player the throw went to is passed
+-- over, since their own screen judges it against its own copy of the axe, and what the node would have done to them is
+-- noted for host_would. Returns true to pass the original over for this player.
+function host.axe_overlap(unit, blackboard, thrown_unit, target)
+	local group = overlaps[unit]
+
+	if not group or group.kind ~= "axe" or blackboard ~= group.blackboard or blackboard.active_node ~= BTThrowWeaponAction or blackboard.hit_units ~= group.token then
+		return false
+	end
+
+	local swing = group.by_target[target]
+
+	if not swing or swing.host_judged then
+		return false
+	end
+
+	if not peer_is_fresh(swing.peer) then
+		swing.host_judged = true
+
+		pc.count("host_judged_quiet_client")
+
+		return false
+	end
+
+	local t = pc.now()
+
+	if swing.frames == 0 then
+		swing.frames = 1
+		swing.frame_t[1] = t
+		swing.would[1] = "miss"
+	end
+
+	swing.expires = math.max(swing.expires, t + pc.SWING_LIFETIME)
+
+	-- What the node's own test would have done (:291 to :307), from the host's view.
+	local action = group.action
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local target_position = POSITION_LOOKUP[target]
+
+	if swing.would[1] == "miss" and not blackboard.hit_units[target] and status and target_position and thrown_unit and Unit.alive(thrown_unit) and not status:is_invisible() then
+		local radius = status:get_is_dodging() and action.target_dodged_radius or action.radius
+
+		if Vector3.length(Vector3.flat(target_position - Unit.local_position(thrown_unit, 0))) < (radius or 0) then
+			swing.would[1] = block_would(unit, target)
+		end
+	end
+
+	return true
 end
 
 -- Family F: what the packmaster's damage frame and BTPackMasterAttackAction.attack_success
@@ -945,6 +1390,22 @@ function host.before_damage_frame(unit, callback_name)
 		if blackboard and blackboard.active_node == BTStormVerminAttackAction then
 			return box_frame(unit, blackboard)
 		end
+	end
+
+	-- Family E, the rat ogre's jump slam: its landing's hit on its target goes through this generic damage frame, as no
+	-- other part of family E does (the other nodes have their own, animation_callback_templates.lua:169).
+	local monster = overlaps[unit]
+
+	if callback_name == "anim_cb_damage" and monster and monster.kind == "jump" then
+		local swing, first = jump_frame(unit, monster)
+
+		if swing and first then
+			local ok, verdict = pcall(would_have_judged, swing, BLACKBOARDS[unit], unit)
+
+			swing.would[1] = ok and verdict or "unknown"
+		end
+
+		return swing
 	end
 
 	local swing = by_attacker[unit]
@@ -1477,11 +1938,22 @@ local function book_shove(swing)
 	return "booked"
 end
 
--- Family E: whether the enemy is still in the attack this swing announced.
+-- Family E: whether the enemy is still in the attack this swing announced. Part (b)'s kinds tell one attack from the
+-- next by the table their node makes for each (e_token).
 local function in_monster_attack(swing, blackboard)
 	local group = swing.group
 
-	if not group or blackboard ~= swing.blackboard or blackboard.attack_started_at_t ~= group.started_t or blackboard.action ~= swing.action then
+	if not group or blackboard ~= swing.blackboard or blackboard.action ~= swing.action then
+		return false
+	end
+
+	local node = e_node(group.kind)
+
+	if node then
+		return blackboard.active_node == node and group.token ~= nil and e_token(group.kind, blackboard) == group.token
+	end
+
+	if blackboard.attack_started_at_t ~= group.started_t then
 		return false
 	end
 
@@ -1706,15 +2178,286 @@ local function book_grab(swing, result, multiplier, improved, direction)
 	return outcome and outcome .. ", not grabbed: " .. refused or "refused: " .. refused
 end
 
--- Family E: one modded player's answer for a monster's or lord's attack (D61).
-local function book_monster(swing, result, multiplier, improved, direction, through_block)
+-- Family E3: BTChargeAttackAction._push_player (bt_charge_attack_action.lua:531), with whether the player is the
+-- charge's target from the swing, since the charge may be over by the time its answer arrives: pushed away from the
+-- charger, harder after a block, or for the minotaur's other targets thrown (catapult_on_push_other_targets).
+local function charge_push(attacker, target, action, aimed, blocked)
+	local speed = action.dodge_past_push_speed
+
+	if not speed then
+		return
+	end
+
+	local velocity = speed * Vector3.normalize(POSITION_LOOKUP[target] - POSITION_LOOKUP[attacker])
+
+	if not aimed and action.catapult_on_push_other_targets then
+		Vector3.set_z(velocity, action.catapult_on_push_z or 3)
+		StatusUtils.set_catapulted_network(target, true, velocity)
+
+		return
+	end
+
+	if blocked and action.blocked_velocity_scale then
+		velocity = velocity * action.blocked_velocity_scale
+	end
+
+	local locomotion = ScriptUnit.has_extension(target, "locomotion_system")
+
+	if locomotion then
+		locomotion:add_external_velocity(velocity)
+	end
+end
+
+-- Family E3: what BTChargeAttackAction._hit_player (bt_charge_attack_action.lua:553) and the radius's push (:482) do for
+-- one player, for that player's answer. The target, hit or blocked with a weapon, is knocked down or thrown
+-- (_charged_at_player, :517), and takes the damage unless it blocked; after a shield's block it is pushed. Anyone else
+-- the charge reached is pushed (the minotaur's thrown) and takes no damage. "pushed": only the push aside. A block
+-- shows first as check_block shows it, unless weapons can't block the charge (the minotaur's); its recoil, the
+-- bestigor's, is the host's. While the charge is in its run, the player goes into its lists, and a hit on its target
+-- that arrives before the host's look starts the impact too (D65).
+local function book_charge(swing, result, multiplier, improved, direction)
+	local target = swing.target
+	local attacker = swing.attacker
+	local action = swing.action
+
+	if not Unit.alive(target) then
+		return "target gone"
+	end
+
+	if not same_attacker(swing) then
+		return book_monster_without_attacker(swing, swing.aimed and result or "push")
+	end
+
+	local blackboard = BLACKBOARDS[attacker]
+	local current = blackboard ~= nil and HEALTH_ALIVE[attacker] and in_monster_attack(swing, blackboard)
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local knocked_down = status and status.knocked_down
+	local outcome = nil
+
+	if (result == "blocked" or result == "shield") and not action.unblockable_by_normal_blocks then
+		outcome = book_block(swing, multiplier, improved, direction, nil)
+	end
+
+	if result == "pushed" then
+		charge_push(attacker, target, action, swing.aimed, false)
+
+		if current and type(blackboard.pushed_units) == "table" then
+			blackboard.pushed_units[target] = true
+		end
+
+		return "push booked"
+	end
+
+	if swing.aimed and result ~= "shield" then
+		if result == "hit" then
+			AiUtils.damage_target(target, attacker, action, action.damage)
+		end
+
+		if action.player_push_speed and not knocked_down and blackboard then
+			BTChargeAttackAction._charged_at_player(BTChargeAttackAction, attacker, target, blackboard, action)
+
+			-- The charge's leave takes the knock-down's status back (:144), which monsters' target choice reads
+			-- (target_selection_utils.lua:1425). Once it has left, the status goes at once; the player's own
+			-- knocked-down state ends by its own timer (player_character_state_charged.lua:133).
+			if not current and not action.catapult_player then
+				StatusUtils.set_charged_network(target, false)
+			end
+		end
+	elseif action.player_push_speed and not knocked_down then
+		charge_push(attacker, target, action, swing.aimed, result ~= "hit")
+	end
+
+	local booked = not swing.aimed and "pushed, not its target" or result == "hit" and "booked" or result == "blocked" and "charged at through the block" or "pushed after the shield"
+
+	if current then
+		if type(blackboard.hit_units) == "table" then
+			blackboard.hit_units[target] = true
+		end
+
+		-- The original starts the impact for a hit on its target (:428), blocked or not.
+		local group = swing.group
+
+		if swing.aimed and not group.impact_started and charge_can_impact(blackboard) then
+			group.impact_started = "client"
+
+			BTChargeAttackAction._start_impact(BTChargeAttackAction, attacker, blackboard, true, false, nil)
+			pc.count("host_charge_client_impact")
+			pc.log("host swing=%d enemy=%s charge impact started by its target's %s (T22): the host's charger %.2f m from them", swing.id, swing.breed_name, result, Vector3.distance(POSITION_LOOKUP[attacker], POSITION_LOOKUP[target]))
+
+			booked = booked .. ", impact started"
+		end
+	end
+
+	return outcome and outcome .. ", " .. booked or booked
+end
+
+-- Family E4: what BTChampionAttackAction._deal_damage (bt_champion_attack_action.lua:767) does for one player it reached,
+-- for that player's answer: through a block the blocked push and the blocked damage, else the damage; then the throw
+-- with the attack's shove_speed, through a block too (_catapult_player, :872). The player is one the attack has hit,
+-- which stops its turning (:390). Every answer is booked, so a block no longer ends the hits of that frame on the
+-- players after the blocker (question 3 of the build 6 notes, D69). A block itself is booked first by book_block.
+local function book_champion(swing, result)
+	local target = swing.target
+	local attacker = swing.attacker
+	local action = swing.action
+
+	if not Unit.alive(target) then
+		return "target gone"
+	end
+
+	if not same_attacker(swing) then
+		return book_monster_without_attacker(swing, result)
+	end
+
+	local blackboard = BLACKBOARDS[attacker]
+
+	if blackboard and HEALTH_ALIVE[attacker] and in_monster_attack(swing, blackboard) and type(blackboard.hit_players) == "table" then
+		blackboard.hit_players[target] = true
+	end
+
+	local direction = Vector3.normalize(POSITION_LOOKUP[target] - POSITION_LOOKUP[attacker])
+
+	if result == "blocked" then
+		local locomotion = ScriptUnit.has_extension(target, "locomotion_system")
+
+		if action.player_push_speed_blocked and locomotion then
+			locomotion:add_external_velocity(action.player_push_speed_blocked * direction)
+		end
+
+		if action.blocked_damage then
+			AiUtils.damage_target(target, attacker, action, action.blocked_damage)
+		end
+	else
+		AiUtils.damage_target(target, attacker, action, action.damage)
+	end
+
+	local shove_speed = action.shove_speed
+
+	if action.impact_shove_multiplier and blackboard and blackboard.locomotion_extension then
+		shove_speed = Vector3.length(blackboard.locomotion_extension:current_velocity()) * action.impact_shove_multiplier
+	end
+
+	if shove_speed and action.shove_z_speed then
+		BTChampionAttackAction._catapult_player(BTChampionAttackAction, attacker, shove_speed, action.shove_z_speed, target, result == "blocked", direction)
+	end
+
+	return result == "hit" and "booked" or "blocked results booked"
+end
+
+-- Family E, the rat ogre's jump slam. Frame 1, its target's hit, as the game's generic damage frame books family A's
+-- (book_hit); frame 2, the throw of a player within its radius, with the node's own catapult from where the host's copy
+-- landed (BTJumpSlamImpactAction.catapult_player, bt_jump_slam_impact_action.lua:78), without its radius test: that
+-- player's screen found them within its own copy's radius and has shown it (D62, D5).
+local function book_jump(swing, frame, result, multiplier, improved, direction, through_block)
+	if frame == 1 then
+		if result == "hit" then
+			return book_hit(swing, through_block)
+		elseif result == "blocked" then
+			return book_block(swing, multiplier, improved, direction, nil)
+		end
+
+		return "nothing to book"
+	end
+
+	local target = swing.target
+	local attacker = swing.attacker
+	local action = swing.action
+	local group = swing.group
+	local landing = group and group.landing and group.landing:unbox() or Unit.alive(attacker) and POSITION_LOOKUP[attacker]
+
+	if result ~= "pushed" or not action.catapulted_player_speed then
+		return "nothing to book"
+	elseif not Unit.alive(target) then
+		return "target gone"
+	elseif not landing then
+		return "attacker gone"
+	end
+
+	BTJumpSlamImpactAction.catapult_player(target, landing, math.huge, action.catapulted_player_speed)
+
+	return "throw booked"
+end
+
+-- Family E, the exalted champion's axe (D68): what BTThrowWeaponAction.check_overlap (bt_throw_weapon_action.lua:286)
+-- does for one player it reached, for that player's answer: they are thrown away from the axe (pushed, if the throw
+-- doesn't catapult), through a block too, then take the damage unless they blocked. The player is one the throw has
+-- hit. A block shows as check_block shows it.
+local function book_axe(swing, result, multiplier, improved, direction)
+	local target = swing.target
+	local attacker = swing.attacker
+	local action = swing.action
+
+	if not Unit.alive(target) then
+		return "target gone"
+	end
+
+	if not same_attacker(swing) then
+		return book_monster_without_attacker(swing, result)
+	end
+
+	local blackboard = BLACKBOARDS[attacker]
+	local current = blackboard ~= nil and HEALTH_ALIVE[attacker] and in_monster_attack(swing, blackboard)
+	local axe = current and blackboard.thrown_unit
+	local feet = POSITION_LOOKUP[target]
+	local from = axe and Unit.alive(axe) and Unit.local_position(axe, 0) or POSITION_LOOKUP[attacker]
+	local velocity = (action.push_speed or 0) * Vector3.normalize(feet - Vector3(from.x, from.y, feet.z))
+
+	if action.push_speed_z then
+		Vector3.set_z(velocity, action.push_speed_z)
+	end
+
+	if action.catapult_players then
+		StatusUtils.set_catapulted_network(target, true, velocity)
+	else
+		local locomotion = ScriptUnit.has_extension(target, "locomotion_system")
+
+		if locomotion then
+			locomotion:add_external_velocity(velocity)
+		end
+	end
+
+	if current and type(blackboard.hit_units) == "table" then
+		blackboard.hit_units[target] = true
+	end
+
+	if result == "blocked" then
+		return "thrown, " .. book_block(swing, multiplier, improved, direction, nil)
+	end
+
+	AiUtils.damage_target(target, attacker, action, action.damage)
+
+	return "booked"
+end
+
+-- Family E: one modded player's answer for a monster's or lord's attack (D61). frame: which of the swing's frames it
+-- answers (the jump slam's 1 is its target's hit, its 2 the throw).
+local function book_monster(swing, frame, result, multiplier, improved, direction, through_block)
 	if swing.group and swing.group.grab then
 		-- The grab ignores shields (ignore_shield_block), so no screen says "shield" for it.
-		if result == "shield" then
+		if result == "shield" or result == "pushed" then
 			return "nothing to book"
 		end
 
 		return book_grab(swing, result, multiplier, improved, direction)
+	end
+
+	local kind = swing.kind
+
+	if kind == "charge" then
+		return book_charge(swing, result, multiplier, improved, direction)
+	elseif kind == "jump" then
+		return book_jump(swing, frame, result, multiplier, improved, direction, through_block)
+	elseif result == "pushed" or result == "shield" and (kind == "champion" or kind == "axe") then
+		-- Only a charge and a jump slam push or throw without a hit, and neither a lord's attack nor the axe tries a
+		-- shield's block, so no screen says these for them.
+		return "nothing to book"
+	elseif kind == "champion" then
+		local outcome = result == "blocked" and book_block(swing, multiplier, improved, direction, nil) or nil
+		local booked = book_champion(swing, result)
+
+		return outcome and outcome .. ", " .. booked or booked
+	elseif kind == "axe" then
+		return book_axe(swing, result, multiplier, improved, direction)
 	end
 
 	-- A block shows as DamageUtils.check_block shows it on the host. A slam's shield block isn't a melee block at all
@@ -1894,16 +2637,24 @@ mod:network_register("pc_swing_answer", function (sender, version, id, frame, re
 	swing.answers[frame] = result
 	swing.answered = true
 
+	-- A client that can't judge a swing (it can't find the attack or the enemy, or a lord's wave's points) leaves it to
+	-- the host, as a client gone quiet does: the host's own test reaches that player from now on.
+	if result == "unjudged" then
+		swing.host_judged = true
+
+		pc.count("host_judged_unjudged")
+	end
+
 	local outcome = "nothing to book"
 
 	-- What follows books what the client reported, which the damage-alone log leaves out (host.damage_alone).
 	host.booking = true
 
 	if swing.family == "E" then
-		if result == "hit" or result == "blocked" or result == "shield" then
+		if result == "hit" or result == "blocked" or result == "shield" or result == "pushed" then
 			-- For the log line of a recoil left to the host (a bulwark's, after a block of its running attack).
 			swing.blocked_frame_t = swing.frame_t[frame]
-			outcome = book_monster(swing, result, multiplier, improved, direction, through_block)
+			outcome = book_monster(swing, frame, result, multiplier, improved, direction, through_block)
 		end
 	elseif result == "hit" then
 		if swing.family == "C" then
@@ -2032,6 +2783,24 @@ mod:hook_safe("BTMeleeSlamAction", "enter", function (self, unit, blackboard, t)
 	pc.guard("host slam announce", host.announce_slam, unit, blackboard, t)
 end)
 
+-- Family E, part (b): a charge, a lord's attack, the jump slam's landing and the axe's throw start here.
+local E_ANNOUNCERS = {
+	BTChargeAttackAction = "announce_charge",
+	BTChampionAttackAction = "announce_champion",
+	BTJumpSlamImpactAction = "announce_jump",
+	BTThrowWeaponAction = "announce_axe",
+}
+
+for node_name, announcer in pairs(E_ANNOUNCERS) do
+	mod:hook_safe(node_name, "enter", function (self, unit, blackboard, t)
+		if pc.broken or not pc.is_server() or not pc.in_game() then
+			return
+		end
+
+		pc.guard("host " .. announcer, host[announcer], unit, blackboard, t)
+	end)
+end
+
 -- After a family E test the host ran with the modded players left out (host.overlap_skip): puts the skip back, notes
 -- which of them the test found, for host_would, and passes the original's results through, however many there are.
 local function overlap_test_done(name, scope, previous, ...)
@@ -2104,6 +2873,105 @@ mod:hook("BTMeleeOverlapAttackAction", "push_close_units", function (func, self,
 	end
 
 	return push_done(func(self, unit, blackboard, t, data, ...))
+end)
+
+-- Family E3: the charge's own test passes over the modded players its swings went to (host.charge_frame, charge_skip),
+-- who come back out of its lists after it (charge_test_done), and it may start the impact for the look (D65).
+mod:hook("BTChargeAttackAction", "_check_overlap", function (func, self, unit, blackboard, action, ...)
+	if pc.broken or not overlaps[unit] then
+		return func(self, unit, blackboard, action, ...)
+	end
+
+	local ok, scope = pc.guard("host charge test", host.charge_frame, unit, blackboard, action)
+
+	if not ok or not scope then
+		return func(self, unit, blackboard, action, ...)
+	end
+
+	charge_skip(scope)
+
+	return charge_test_done(scope, func(self, unit, blackboard, action, ...))
+end)
+
+-- Family E4: a lord's attack deals its damage to every player it reached but the modded players its swings went to
+-- (host.champion_frame, champion_filter). Everything but the original runs through pc.guard.
+mod:hook("BTChampionAttackAction", "_deal_damage", function (func, self, unit, blackboard, action, self_pos, hit_actors, actor_count, is_animation_callback, ...)
+	if pc.broken or not overlaps[unit] or type(hit_actors) ~= "table" or type(actor_count) ~= "number" then
+		return func(self, unit, blackboard, action, self_pos, hit_actors, actor_count, is_animation_callback, ...)
+	end
+
+	local ok, scope = pc.guard("host lord's attack frame", host.champion_frame, unit, blackboard, action)
+	local kept, kept_count
+
+	if ok and scope then
+		ok, kept, kept_count = pc.guard("host lord's attack filter", champion_filter, scope, hit_actors, actor_count)
+	end
+
+	if not ok or not scope then
+		return func(self, unit, blackboard, action, self_pos, hit_actors, actor_count, is_animation_callback, ...)
+	end
+
+	return func(self, unit, blackboard, action, self_pos, kept, kept_count, is_animation_callback, ...)
+end)
+
+-- Family E, the jump slam: puts the skip back after its landing, with no pc.guard, and passes the original's results
+-- through.
+local function jump_done(previous, ...)
+	host.jump_skip = previous
+
+	return ...
+end
+
+-- Family E, the jump slam: its landing throws every player within its radius but the modded players its swings went to
+-- (host.jump_impact, then the catapult hook below).
+mod:hook("BTJumpSlamImpactAction", "jump_slam_impact", function (func, self, unit, blackboard, t, ...)
+	if pc.broken or not overlaps[unit] then
+		return func(self, unit, blackboard, t, ...)
+	end
+
+	local ok, scope = pc.guard("host jump landing", host.jump_impact, unit, blackboard)
+
+	if not ok or not scope then
+		return func(self, unit, blackboard, t, ...)
+	end
+
+	local previous = host.jump_skip
+
+	host.jump_skip = scope
+
+	return jump_done(previous, func(self, unit, blackboard, t, ...))
+end)
+
+-- Family E, the jump slam's throw (BTJumpSlamImpactAction.catapult_players, bt_jump_slam_impact_action.lua:70, a plain
+-- function rather than a method): while host.jump_skip is set, its list leaves out the modded players whose own screens
+-- judge it.
+mod:hook("BTJumpSlamImpactAction", "catapult_players", function (func, unit_list, impact_position, radius, speed, ...)
+	local scope = host.jump_skip
+
+	if pc.broken or not scope or type(unit_list) ~= "table" then
+		return func(unit_list, impact_position, radius, speed, ...)
+	end
+
+	local ok, kept = pc.guard("host jump throw filter", jump_filter, scope, unit_list, impact_position, radius)
+
+	if not ok then
+		return func(unit_list, impact_position, radius, speed, ...)
+	end
+
+	return func(kept, impact_position, radius, speed, ...)
+end)
+
+-- Family E, the axe (D68): its own test passes over the modded players its swing went to (host.axe_overlap).
+mod:hook("BTThrowWeaponAction", "check_overlap", function (func, self, action, thrown_unit, unit, blackboard, target_unit, ...)
+	if not pc.broken and overlaps[unit] then
+		local ok, skip = pc.guard("host axe test", host.axe_overlap, unit, blackboard, thrown_unit, target_unit)
+
+		if ok and skip then
+			return
+		end
+	end
+
+	return func(self, action, thrown_unit, unit, blackboard, target_unit, ...)
 end)
 
 -- Family F (D52): a disabler's hook, grab or pounce starts here.
@@ -2336,6 +3204,7 @@ function host.update()
 	host.box_skip = nil
 	host.leap_skip = nil
 	host.overlap_skip = nil
+	host.jump_skip = nil
 	host.booking = false
 
 	-- A push aside whose original call failed leaves the side's list filtered; it comes back here.
@@ -2402,6 +3271,7 @@ function host.clear()
 	host.box_skip = nil
 	host.leap_skip = nil
 	host.overlap_skip = nil
+	host.jump_skip = nil
 	host.booking = false
 	host.push_restore()
 

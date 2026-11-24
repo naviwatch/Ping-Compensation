@@ -167,6 +167,22 @@ function geometry.player_in_capsule(feet, centre, radius, half_height)
 	return flat * flat + gap * gap <= reach * reach
 end
 
+-- Family E4, a lord's attack (build 6 part (b)): the upright cylinder it hits at its damage frame or sweeps round in a
+-- spin, built from the enemy's position and facing as BTChampionAttackAction._calculate_cylinder_collision builds it
+-- (bt_champion_attack_action.lua:734). Returns its centre, the size the overlap takes (the radius, half the height, the
+-- radius: with half the height no more than the radius it is a sphere, :633) and the overlap's rotation, whose forward
+-- is the enemy's up. player_in_capsule tests the same shape. If a game patch changes the original, change this.
+function geometry.champion_cylinder(action, position, rotation)
+	local radius = action.radius or 0
+	local half_height = (action.height or 0) * 0.5
+	local forward = Quaternion.forward(rotation)
+	local up = Quaternion.up(rotation)
+	local right = Quaternion.right(rotation)
+	local centre = position + forward * (radius + (action.offset_forward or 0)) + up * (half_height + (action.offset_up or 0)) + right * (action.offset_right or 0)
+
+	return centre, Vector3(radius, half_height, radius), Quaternion.look(up, Vector3.up())
+end
+
 -- Copy of the local closest_point_on_line in bt_melee_overlap_attack_action.lua:17: the point of the segment p1 to p2
 -- nearest p, and whether p lies beyond either end.
 function geometry.closest_point_on_line(p, p1, p2)

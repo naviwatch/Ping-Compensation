@@ -223,8 +223,11 @@ local function push(target, speed, limit, direction, t)
 end
 
 -- D62: the player's own catapulted state, now, as the host's StatusUtils.set_catapulted_network would start it a ping
--- later. Its own setter tells the host, which passes it on to everyone else. Returns whether it was shown.
-function hit_results.catapult(target, velocity, t)
+-- later. Its own setter tells the host, which passes it on to everyone else. Returns whether it was shown. any_speed:
+-- the host's copy is dropped whatever its speed, for a throw at the speed the thrower had at the hit (the minotaur's
+-- charge, BTChargeAttackAction._charged_at_player, bt_charge_attack_action.lua:520), which the host's booking a ping
+-- later doesn't have.
+function hit_results.catapult(target, velocity, t, any_speed)
 	local status = ScriptUnit.has_extension(target, "status_system")
 
 	-- The setter does nothing for a disabled player (generic_status_extension.lua:1620).
@@ -237,6 +240,7 @@ function hit_results.catapult(target, velocity, t)
 	pending_catapults[#pending_catapults + 1] = {
 		speed = Vector3.length(velocity),
 		t = t,
+		any_speed = any_speed == true,
 	}
 
 	pc.count("client_catapult_shown")
@@ -450,6 +454,182 @@ function hit_results.monster(swing, unit, target, result)
 	end
 
 	pc.log("client swing=%d %s %s shown at once: estimate=%.1f moved=%s", swing.id, tostring(swing.kind), result, amount, moved)
+end
+
+-- Family E3: BTChargeAttackAction._push_player (bt_charge_attack_action.lua:531) on this player, from this screen's
+-- positions: pushed away from the charger, harder after a block, or for the minotaur's other targets thrown
+-- (catapult_on_push_other_targets). aimed: whether this player is the charge's target. Returns what it did, for the log.
+local function charge_push(unit, target, action, aimed, blocked, t)
+	local speed = action.dodge_past_push_speed
+
+	if not speed then
+		return "none"
+	end
+
+	local velocity = speed * Vector3.normalize(position(target) - position(unit))
+
+	if not aimed and action.catapult_on_push_other_targets then
+		Vector3.set_z(velocity, action.catapult_on_push_z or 3)
+
+		return hit_results.catapult(target, velocity, t) and "catapult" or "none"
+	end
+
+	if blocked and action.blocked_velocity_scale then
+		velocity = velocity * action.blocked_velocity_scale
+	end
+
+	push_velocity(target, velocity, nil, t)
+
+	return "push"
+end
+
+-- Called by Client.lua for a charge (family E3, D65) that reached this player: what BTChargeAttackAction._hit_player and
+-- _push_player (bt_charge_attack_action.lua:553 and :531) do to them, at once. Its target, hit or blocked with a
+-- weapon, is knocked down (the bestigor's, D62) or thrown at the charger's speed on this screen (the minotaur's), and
+-- takes the damage unless it blocked; after a shield's block it is only pushed. Anyone else it reached is pushed, or
+-- for the minotaur thrown, and takes no damage. "pushed": it only passed close to this player, who is pushed aside.
+-- speed: the charger's copy's speed here.
+function hit_results.charge(swing, unit, target, result, speed)
+	if not showing() then
+		return
+	end
+
+	local action = swing.action
+	local t = pc.now()
+	local status = ScriptUnit.has_extension(target, "status_system")
+	local knocked_down = status ~= nil and status.knocked_down
+	local to_target = position(target) - position(unit)
+	local amount = 0
+	local moved = "none"
+
+	if result == "pushed" then
+		-- The radius's push has no knocked-down check (:482).
+		moved = charge_push(unit, target, action, swing.aimed, false, t)
+	elseif swing.aimed and result ~= "shield" then
+		if result == "hit" then
+			amount = show_damage(swing, unit, target, action.damage, Vector3.normalize(to_target), t)
+		end
+
+		-- BTChargeAttackAction._charged_at_player (:517), through a weapon's block too.
+		if action.player_push_speed and not knocked_down then
+			if action.catapult_player then
+				local velocity = (speed or 0) * Vector3.normalize(to_target)
+
+				Vector3.set_z(velocity, action.catapult_force_z or 3)
+
+				moved = hit_results.catapult(target, velocity, t, true) and "catapult" or "none"
+			else
+				moved = hit_results.knock_down(target, t) and "knock-down" or "none"
+			end
+		end
+	elseif action.player_push_speed and not knocked_down then
+		moved = charge_push(unit, target, action, swing.aimed, result ~= "hit", t)
+	end
+
+	pc.log("client swing=%d charge %s shown at once: estimate=%.1f moved=%s speed=%.2f", swing.id, result, amount, moved, speed or 0)
+end
+
+-- Called by Client.lua for a lord's attack (family E4) judged "hit" or "blocked" on this player: what
+-- BTChampionAttackAction._deal_damage (bt_champion_attack_action.lua:767) does to them, at once. Through a block the
+-- blocked push and the blocked damage, else the damage; then the catapult with the attack's shove_speed, through a
+-- block too, unless the player is knocked down or dead (_catapult_player, :872). from: where the attack hit from (the
+-- lord, or the start of a lunge's box).
+function hit_results.champion(swing, unit, target, result, from)
+	if not showing() then
+		return
+	end
+
+	local action = swing.action
+	local t = pc.now()
+	local direction = Vector3.normalize(position(target) - (from or position(unit)))
+	local amount = 0
+	local moved = "none"
+
+	if result == "blocked" then
+		if action.player_push_speed_blocked then
+			push_velocity(target, action.player_push_speed_blocked * direction, nil, t)
+
+			moved = "push"
+		end
+
+		if action.blocked_damage then
+			amount = show_damage(swing, unit, target, action.blocked_damage, direction, t)
+		end
+	else
+		amount = show_damage(swing, unit, target, nil, direction, t)
+	end
+
+	-- No lord's attack in the 6.13 data scales its throw by its own speed (impact_shove_multiplier, :777); one that did
+	-- is left to the host, whose copy then plays as in vanilla.
+	local status = ScriptUnit.has_extension(target, "status_system")
+
+	if action.shove_speed and action.shove_z_speed and not action.impact_shove_multiplier and status and not status:is_knocked_down() and not status:is_dead() then
+		local velocity = direction * action.shove_speed
+
+		Vector3.set_z(velocity, action.shove_z_speed)
+
+		if hit_results.catapult(target, velocity, t) then
+			moved = "catapult"
+		end
+	end
+
+	pc.log("client swing=%d lord's attack %s shown at once: estimate=%.1f moved=%s", swing.id, result, amount, moved)
+end
+
+-- Called by Client.lua when the rat ogre's jump slam lands within its catapult radius of this player on this screen:
+-- BTJumpSlamImpactAction.catapult_player (bt_jump_slam_impact_action.lua:78), from where this screen's copy landed, at
+-- once (D62). Returns whether it was shown.
+function hit_results.jump_catapult(swing, unit, target)
+	if not showing() then
+		return false
+	end
+
+	local speed = swing.action.catapulted_player_speed or 0
+	local angle = math.pi / 6
+	local velocity = Vector3.normalize(Vector3.flat(position(target) - position(unit))) * (speed * math.cos(angle))
+
+	Vector3.set_z(velocity, speed * math.sin(angle))
+
+	local shown = hit_results.catapult(target, velocity, pc.now())
+
+	pc.log("client swing=%d jump slam threw this player at once: %s", swing.id, tostring(shown))
+
+	return shown
+end
+
+-- Called by Client.lua when the exalted champion's axe (D68) reaches this player on this screen: what
+-- BTThrowWeaponAction.check_overlap (bt_throw_weapon_action.lua:286) does to them, at once. They are thrown away from
+-- the axe (pushed, if the throw doesn't catapult), through a block too, then take the damage unless they blocked.
+-- axe_position: this screen's copy of the axe.
+function hit_results.axe(swing, unit, target, result, axe_position)
+	if not showing() then
+		return
+	end
+
+	local action = swing.action
+	local t = pc.now()
+	local feet = position(target)
+	local direction = Vector3.normalize(feet - Vector3(axe_position.x, axe_position.y, feet.z))
+	local velocity = (action.push_speed or 0) * direction
+	local moved = "push"
+
+	if action.push_speed_z then
+		Vector3.set_z(velocity, action.push_speed_z)
+	end
+
+	if action.catapult_players then
+		moved = hit_results.catapult(target, velocity, t) and "catapult" or "none"
+	else
+		push_velocity(target, velocity, nil, t)
+	end
+
+	local amount = 0
+
+	if result == "hit" then
+		amount = show_damage(swing, unit, target, nil, direction, t)
+	end
+
+	pc.log("client swing=%d axe %s shown at once: estimate=%.1f moved=%s", swing.id, result, amount, moved)
 end
 
 -- Called by Client.lua at an elite's shove (family D) judged "hit": the damage and the knockback along the enemy's
@@ -668,7 +848,7 @@ function hit_results.catapult_message(unit_id, catapulted, velocity)
 	for i = 1, #pending_catapults do
 		local record = pending_catapults[i]
 
-		if t - record.t <= STATUS_WINDOW and math.abs(speed - record.speed) <= record.speed * CATAPULT_TOLERANCE + 0.5 then
+		if t - record.t <= STATUS_WINDOW and (record.any_speed or math.abs(speed - record.speed) <= record.speed * CATAPULT_TOLERANCE + 0.5) then
 			table.remove(pending_catapults, i)
 			pc.count("client_catapult_message_dropped")
 			pc.log("client: the host's copy of a catapult shown here dropped, %.3fs later", t - record.t)
