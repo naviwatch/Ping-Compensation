@@ -183,6 +183,60 @@ function geometry.champion_cylinder(action, position, rotation)
 	return centre, Vector3(radius, half_height, radius), Quaternion.look(up, Vector3.up())
 end
 
+-- The squared distance between the segments p1 to q1 and p2 to q2, at their nearest points.
+local function segment_distance_squared(p1, q1, p2, q2)
+	local d1 = q1 - p1
+	local d2 = q2 - p2
+	local r = p1 - p2
+	local a = Vector3.dot(d1, d1)
+	local e = Vector3.dot(d2, d2)
+	local f = Vector3.dot(d2, r)
+	local s, t
+
+	if a <= 1e-8 and e <= 1e-8 then
+		return Vector3.dot(r, r)
+	elseif a <= 1e-8 then
+		s = 0
+		t = math.clamp(f / e, 0, 1)
+	else
+		local c = Vector3.dot(d1, r)
+
+		if e <= 1e-8 then
+			t = 0
+			s = math.clamp(-c / a, 0, 1)
+		else
+			local b = Vector3.dot(d1, d2)
+			local denominator = a * e - b * b
+
+			s = denominator > 1e-8 and math.clamp((b * f - c * e) / denominator, 0, 1) or 0
+			t = (b * s + f) / e
+
+			if t < 0 then
+				t = 0
+				s = math.clamp(-c / a, 0, 1)
+			elseif t > 1 then
+				t = 1
+				s = math.clamp((b - c) / a, 0, 1)
+			end
+		end
+	end
+
+	local gap = p1 + d1 * s - (p2 + d2 * t)
+
+	return Vector3.dot(gap, gap)
+end
+
+-- Build 6.1: a sphere radius wide swept from a to b (the troll's vomit, the stormfiend's beam), for when the game's own
+-- sweep can't see this player: the player is the upright capsule of player_in_box, and two capsules meet when their core
+-- segments come within the sum of their radii. Returns whether they meet.
+function geometry.player_near_segment(feet, a, b, radius)
+	local low = feet + Vector3(0, 0, PLAYER_BOX_RADIUS)
+	local high = feet + Vector3(0, 0, PLAYER_BOX_HEIGHT - PLAYER_BOX_RADIUS)
+	local reach = radius + PLAYER_BOX_RADIUS
+
+	return segment_distance_squared(low, high, a, b) <= reach * reach
+end
+
 -- Copy of the local closest_point_on_line in bt_melee_overlap_attack_action.lua:17: the point of the segment p1 to p2
 -- nearest p, and whether p lies beyond either end.
 function geometry.closest_point_on_line(p, p1, p2)

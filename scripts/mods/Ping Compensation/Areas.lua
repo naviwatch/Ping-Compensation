@@ -33,19 +33,34 @@ pc.areas = areas
 local GAS_TEMPLATES = {
 	globadier_area_dot_damage = true,
 }
--- The burning buffs whose ticks this mod moves to the burning player's own screen (D58): the ground fire's
--- (damage_blob_templates.lua:11) and the jet's (breed_skaven_warpfire_thrower.lua:265). A thrower's own buff_name is
--- added when its action is found, since a mutator can swap in another (mutator_elite_specials.lua:52).
+-- The buffs whose ticks this mod moves to the player's own screen (D58), by name, with the kind of each, which says who
+-- books and shows its ticks: the warpfire's ground fire (damage_blob_templates.lua:11) and jet
+-- (breed_skaven_warpfire_thrower.lua:265) here, and from build 6.1 in BossAreas.lua the troll's vomit, the bile pools,
+-- the stormfiend's beam and fire wall, and the plague waves' and the grey seer's. A thrower's own buff_name is added when
+-- its action is found, since a mutator can swap in another (mutator_elite_specials.lua:52). Two of the tick functions
+-- tick two of these each (update_vomit_in_face the vomit's and the plague wave's, update_moving_through_warpfire the
+-- ground fire's and the fire wall's), so the buff's name decides.
 local BURNS = {
-	warpfire_thrower_ground_base = true,
-	warpfire_thrower_face_base = true,
-	warpfire_thrower_face_base_mutator = true,
+	warpfire_thrower_ground_base = "fire",
+	warpfire_thrower_face_base = "jet",
+	warpfire_thrower_face_base_mutator = "jet",
+	bile_troll_vomit_face_base = "vomit", -- buff_templates.lua:8462
+	bile_troll_vomit_ground_base = "pool", -- :7651
+	bile_troll_vomit_ground_downed = "pool", -- :7734
+	stormfiend_warpfire_ground_base = "pool", -- :8843
+	stormfiend_warpfire_face_base = "beam", -- :8926
+	plague_wave_face_base = "wave", -- :8229
+	vermintide_face_base = "wave", -- :8346
 }
--- Their tick functions (BuffFunctionTemplates.functions, buff_function_templates.lua:1401 and :1788), and which burning
--- each ticks.
+-- Their tick functions (BuffFunctionTemplates.functions, buff_function_templates.lua), which the game looks up by name for
+-- every tick.
 local BURN_UPDATES = {
-	update_moving_through_warpfire = "fire",
-	update_warpfirethrower_in_face = "jet",
+	update_moving_through_warpfire = true, -- :1401
+	update_warpfirethrower_in_face = true, -- :1788
+	update_vomit_in_face = true, -- :1225
+	update_moving_through_vomit = true, -- :775
+	update_warpfire_in_face = true, -- :1890
+	update_vermintide_in_face = true, -- :1117
 }
 local PLAYER_RADIUS = 0.35 -- about a player's width, for judging by shape
 local PLAYER_HEIGHT = 1.8
@@ -83,7 +98,7 @@ local function jet_action(breed)
 	jet_actions[breed.name] = action
 
 	if action and type(action.buff_name) == "string" then
-		BURNS[action.buff_name] = true
+		BURNS[action.buff_name] = "jet"
 	end
 
 	return action or nil
@@ -265,7 +280,8 @@ local function tick_source(unit)
 		}
 	end
 
-	return nil
+	-- Build 6.1: a troll's vomit, a stormfiend's beam, a pool's buff or pulse, a wave's face buff.
+	return pc.boss_areas and pc.boss_areas.tick_source(unit) or nil
 end
 
 -- One tick this player's screen showed (D58): a gas cloud's, booked with its template's own do_damage
@@ -317,8 +333,32 @@ local function book_tick(player_unit, unit, go_id)
 
 	local damage, damage_type = source.damage, source.damage_type
 
+	-- Build 6.1: a pool's pulse, as _pulse_damage books it (liquid_area_damage_extension.lua:793): the player stands in
+	-- for the attacker, the pool's template is the damage source, its source the source attacker.
+	if source.kind == "pulse" then
+		if type(damage) ~= "number" then
+			return "no damage here"
+		elseif not HEALTH_ALIVE[player_unit] then
+			return "the player is dead"
+		end
+
+		local source_unit = source.source and ALIVE[source.source] and source.source or nil
+
+		pc.host.booking = true
+		DamageUtils.add_damage_network(player_unit, player_unit, damage, "torso", damage_type, nil, source.direction and source.direction:unbox() or Vector3(1, 0, 0), source.damage_source, nil, source_unit, nil, nil, nil, nil, nil, nil, nil, nil, 1)
+		pc.host.booking = false
+		pc.count("host_pulse_ticks")
+
+		return string.format("pulse of %.1f booked%s", damage, unit and "" or " (its pool has gone)")
+	end
+
 	if source.kind ~= "gas" then
 		damage, damage_type = burn_damage(source.template_name, player_unit, source.source, source.source_buffs)
+
+		-- A bile pool's ticks are times its own damage multiplier (buff_function_templates.lua:788).
+		if type(damage) == "number" and type(source.multiplier) == "number" then
+			damage = damage * source.multiplier
+		end
 	end
 
 	if type(damage) ~= "number" then
@@ -379,6 +419,11 @@ local AREA_KINDS = {
 	fire = true,
 	jet = true,
 	vortex = true,
+	-- Build 6.1 (BossAreas.lua): the troll's vomit, the stormfiend's beam, a pool stepped into or out of, a wave's hit.
+	vomit = true,
+	beam = true,
+	pool = true,
+	wave = true,
 }
 
 mod:network_register("pc_area", function (sender, version, kind, go_id, inside)
@@ -413,10 +458,20 @@ mod:network_register("pc_area", function (sender, version, kind, go_id, inside)
 		ok, outcome = pc.guard("host fire report", book_fire, player_unit, unit, inside)
 	elseif kind == "jet" then
 		ok, outcome = pc.guard("host jet report", book_jet, player_unit, unit)
-	else
+	elseif kind == "vortex" then
 		ok, outcome = pc.guard("host vortex catch", book_catch, player_unit, unit)
 
 		mod:network_send("pc_reaction_ack", sender, pc.VERSION, "catch", go_id, ok and outcome == "booked" and "applied" or "rejected")
+	elseif not pc.boss_areas then
+		ok, outcome = true, "not loaded"
+	elseif kind == "vomit" then
+		ok, outcome = pc.guard("host vomit report", pc.boss_areas.book_vomit, player_unit, unit)
+	elseif kind == "beam" then
+		ok, outcome = pc.guard("host beam report", pc.boss_areas.book_beam, player_unit, unit)
+	elseif kind == "pool" then
+		ok, outcome = pc.guard("host pool report", pc.boss_areas.book_pool, player_unit, unit, inside)
+	else
+		ok, outcome = pc.guard("host wave report", pc.boss_areas.book_wave, player_unit, unit)
 	end
 
 	pc.host.booking = false
@@ -511,7 +566,8 @@ function areas.jet_skips(unit)
 	return skip
 end
 
-local function without_skipped_hits(hits, skip)
+-- scope: a build 6.1 sweep's (areas.boss_sweep, BossAreas.lua), which notes the players it left out; nil for the jet's.
+local function without_skipped_hits(hits, skip, scope)
 	local kept = {}
 
 	for i = 1, #hits do
@@ -520,7 +576,11 @@ local function without_skipped_hits(hits, skip)
 		local unit = actor and Actor.unit(actor)
 
 		if unit and skip[unit] then
-			pc.count("host_jet_left_out")
+			pc.count(scope and scope.counter or "host_jet_left_out")
+
+			if scope then
+				scope.dropped[unit] = true
+			end
 		else
 			kept[#kept + 1] = hit
 		end
@@ -1557,14 +1617,29 @@ mod:hook_safe("BTWarpfireThrowerShootAction", "_aim_at_target", function (self, 
 end)
 
 -- Host: while jet_skip is set, a warpfire's sweep is running (bt_warpfire_thrower_shoot_action.lua:357), and its sweep
--- for characters' triggers (its 7th argument) leaves out the modded players whose own screens judge the jet. A mod:hook
--- on an engine function the whole game calls (the camera sweeps every frame), so every other call goes straight
+-- for characters' triggers (its 7th argument) leaves out the modded players whose own screens judge the jet. From build
+-- 6.1, while areas.boss_sweep is set (BossAreas.lua), the troll's vomit or the stormfiend's beam is running
+-- (bt_vomit_action.lua:262, bt_stormfiend_shoot_action.lua:604), and every sweep with its filter does the same. A
+-- mod:hook on an engine function the whole game calls (the camera sweeps every frame), so every other call goes straight
 -- through, and its own work runs through pc.guard.
+areas.boss_sweep = nil
+
 mod:hook(PhysicsWorld, "linear_sphere_sweep", function (func, ...)
 	local skip = jet_skip
+	local scope = nil
 
-	if not skip or select(7, ...) ~= "filter_character_trigger" then
-		return func(...)
+	if skip and select(7, ...) ~= "filter_character_trigger" then
+		skip = nil
+	end
+
+	if not skip then
+		scope = areas.boss_sweep
+
+		if not scope or select(7, ...) ~= scope.filter then
+			return func(...)
+		end
+
+		skip = scope.units
 	end
 
 	local hits = func(...)
@@ -1573,7 +1648,7 @@ mod:hook(PhysicsWorld, "linear_sphere_sweep", function (func, ...)
 		return hits
 	end
 
-	local ok, kept = pc.guard("host jet sweep", without_skipped_hits, hits, skip)
+	local ok, kept = pc.guard("host sweep filter", without_skipped_hits, hits, skip, scope)
 
 	if ok and kept then
 		return kept
@@ -1602,19 +1677,28 @@ local function release_own_burn(unit, buff)
 	end
 end
 
-local function hook_burn_update(functions, name, kind)
+-- The kinds whose ticks this file books and shows; every other kind in BURNS is BossAreas.lua's (build 6.1).
+local OWN_KINDS = {
+	fire = true,
+	jet = true,
+}
+
+local function hook_burn_update(functions, name)
 	if type(functions[name]) ~= "function" then
 		return
 	end
 
 	mod:hook(functions, name, function (func, unit, buff, params, world)
-		if type(buff) ~= "table" or not BURNS[buff.buff_template_name] then
+		local kind = type(buff) == "table" and BURNS[buff.buff_template_name]
+		local owner = kind and (OWN_KINDS[kind] and areas or pc.boss_areas)
+
+		if not owner then
 			return func(unit, buff, params, world)
 		end
 
 		if pc.broken then
-			-- A mod that has switched itself off leaves nothing of its own behind: this screen's own copy of a fire's
-			-- burning, which has no end time, goes at its next tick (removed at the buffs' next update,
+			-- A mod that has switched itself off leaves nothing of its own behind: this screen's own copy of a fire's or
+			-- a pool's buff, which has no end time, goes at its next tick (removed at the buffs' next update,
 			-- buff_extension.lua:737), and the host's comes again.
 			pcall(release_own_burn, unit, buff)
 
@@ -1622,7 +1706,7 @@ local function hook_burn_update(functions, name, kind)
 		end
 
 		if pc.is_server() then
-			local ok, skip = pc.guard("host burn tick", areas.host_burn_tick, kind, unit, buff)
+			local ok, skip = pc.guard("host burn tick", owner.host_burn_tick, kind, unit, buff)
 
 			if ok and skip then
 				return params.t + (buff.template.time_between_dot_damages or 0.75)
@@ -1633,7 +1717,7 @@ local function hook_burn_update(functions, name, kind)
 
 		local next_t = func(unit, buff, params, world)
 
-		pc.guard("client burn tick", areas.client_burn_tick, kind, unit, buff, params)
+		pc.guard("client burn tick", owner.client_burn_tick, kind, unit, buff, params)
 
 		return next_t
 	end)
@@ -1644,9 +1728,17 @@ do
 	local functions = templates and templates.functions
 
 	if type(functions) == "table" then
-		for name, kind in pairs(BURN_UPDATES) do
-			hook_burn_update(functions, name, kind)
+		for name in pairs(BURN_UPDATES) do
+			hook_burn_update(functions, name)
 		end
+	end
+end
+
+-- Build 6.1: BossAreas.lua's own copies of the pools' buffs, which have no end time either, are kept with this file's
+-- own copies of the fires' burnings, so the tick hook above takes them back too once the mod has switched itself off.
+function areas.own_burn(id, own)
+	if id then
+		own_burns[id] = own and true or nil
 	end
 end
 

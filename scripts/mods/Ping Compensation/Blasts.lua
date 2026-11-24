@@ -41,19 +41,16 @@ end
 
 -- Client --------------------------------------------------------------------------------------------------------
 
--- The host branch of DamageUtils.create_explosion (damage_utils.lua:1126 to :1470), without its side effects: the
--- blast's radius and power, the units it reaches (an overlap, then line-of-sight rays for blasts that want them),
--- nearest first, and for each enemy it damages, its distance, power level, hit zone and whether its shield blocked.
--- Returns the covered enemies among them and the blast's numbers, or nil for a blast this copy can't follow.
-local function find_targets(world, attacker, position, rotation, template, scale, attacker_power_level)
+-- The blast's radius and power, as the host branch of DamageUtils.create_explosion works them out (damage_utils.lua:1131
+-- to :1215), with the attacker's radius buffs. Nil for a blast this copy can't follow: weaves' winds change a blast in
+-- ways not copied here, and a cone scaled sideways with line of sight would make the game's own code fail (:1318).
+function blasts.numbers(attacker, template, scale, attacker_power_level)
 	local explosion_data = template.explosion
 
 	if type(explosion_data) ~= "table" then
 		return nil
 	end
 
-	-- Weaves' winds change a blast in ways not copied here. A cone scaled sideways with line of sight would make the
-	-- game's own code fail (damage_utils.lua:1318), so no player blast can use it.
 	if explosion_data.wind_mutator and Managers.weave:get_active_wind() or explosion_data.only_line_of_sight and explosion_data.explosion_right_scaling then
 		return nil
 	end
@@ -63,6 +60,12 @@ local function find_targets(world, attacker, position, rotation, template, scale
 	local fallback_difficulty = difficulty.fallback_difficulty
 	local radius = explosion_data.radius
 	local max_damage_radius = explosion_data.max_damage_radius or 0
+
+	-- A template that scales by difficulty keeps its radius by difficulty; the host's AreaDamageSystem.create_explosion
+	-- picks it on a copy (area_damage_system.lua:150), and the copy that comes in a message keeps the table.
+	if type(radius) == "table" then
+		radius = radius[difficulty_rank] or radius[fallback_difficulty]
+	end
 	local radius_min, radius_max = explosion_data.radius_min, explosion_data.radius_max
 
 	if radius_min and radius_max then
@@ -117,20 +120,63 @@ local function find_targets(world, attacker, position, rotation, template, scale
 		power_level_min = power_level_min and power_level_min * factor
 	end
 
-	local power_level_glance = power_settings.power_level_glance
-	local do_damage = power_level or power_level_min and power_level_max or false
-	local ignore_attacker_unit = explosion_data.ignore_attacker_unit
-	local collision_filter = explosion_data.collision_filter or "filter_explosion_overlap"
-	local only_line_of_sight = explosion_data.only_line_of_sight
-	local attacker_player = Managers.player:owner(attacker)
-	local difficulty_settings = difficulty:get_difficulty_settings()
-	local friendly_fire_allowed = attacker_player ~= nil and (explosion_data.allow_friendly_fire_override or DamageUtils.allow_friendly_fire_ranged(difficulty_settings, attacker_player))
+	return {
+		radius = radius,
+		max_damage_radius = max_damage_radius,
+		power_level = power_level,
+		power_level_min = power_level_min,
+		power_level_max = power_level_max,
+		power_level_glance = power_settings.power_level_glance,
+		do_damage = power_level or power_level_min and power_level_max or false,
+		collision_filter = explosion_data.collision_filter or "filter_explosion_overlap",
+		scale = scale,
+	}
+end
 
-	if buffs and buffs:has_buff_perk(NO_FRIENDLY_FIRE_PERK) then
-		friendly_fire_allowed = false
+-- Whether friendly fire lets this blast hurt its attacker's allies (damage_utils.lua:1218 to :1238): a player's by the
+-- difficulty's rules, an enemy's by its template's ai_friendly_fire (build 6.1), unless the attacker's perk forbids it or
+-- the template has no_friendly_fire.
+local function friendly_fire_enabled(attacker, explosion_data)
+	local attacker_player = Managers.player:owner(attacker)
+	local allowed
+
+	if attacker_player then
+		allowed = explosion_data.allow_friendly_fire_override or DamageUtils.allow_friendly_fire_ranged(Managers.state.difficulty:get_difficulty_settings(), attacker_player)
+	else
+		allowed = explosion_data.ai_friendly_fire
 	end
 
-	local friendly_fire_enabled = friendly_fire_allowed and not explosion_data.no_friendly_fire
+	local buffs = attacker and Unit.alive(attacker) and ScriptUnit.has_extension(attacker, "buff_system")
+
+	if buffs and buffs:has_buff_perk(NO_FRIENDLY_FIRE_PERK) then
+		allowed = false
+	end
+
+	return allowed and not explosion_data.no_friendly_fire or false
+end
+
+-- The host branch of DamageUtils.create_explosion (damage_utils.lua:1126 to :1470), without its side effects: the
+-- blast's radius and power, the units it reaches (an overlap, then line-of-sight rays for blasts that want them),
+-- nearest first, and for each enemy it damages, its distance, power level, hit zone and whether its shield blocked.
+-- Returns the covered enemies among them and the blast's numbers, or nil for a blast this copy can't follow.
+local function find_targets(world, attacker, position, rotation, template, scale, attacker_power_level)
+	local explosion_data = template.explosion
+	local numbers = blasts.numbers(attacker, template, scale, attacker_power_level)
+
+	if not numbers then
+		return nil
+	end
+
+	local radius = numbers.radius
+	local max_damage_radius = numbers.max_damage_radius
+	local power_level, power_level_min, power_level_max = numbers.power_level, numbers.power_level_min, numbers.power_level_max
+	local power_level_glance = numbers.power_level_glance
+	local do_damage = numbers.do_damage
+	local ignore_attacker_unit = explosion_data.ignore_attacker_unit
+	local collision_filter = numbers.collision_filter
+	local only_line_of_sight = explosion_data.only_line_of_sight
+	local attacker_player = Managers.player:owner(attacker)
+	local friendly_fire = friendly_fire_enabled(attacker, explosion_data)
 	local physics_world = World.physics_world(world)
 	local actors, num_actors = PhysicsWorld.immediate_overlap(physics_world, "shape", "sphere", "position", position, "size", radius, "collision_filter", collision_filter)
 	local forward_scaling = explosion_data.explosion_forward_scaling
@@ -224,7 +270,7 @@ local function find_targets(world, attacker, position, rotation, template, scale
 		local is_player = breed and breed.is_player or DamageUtils.is_player_unit(hit_unit)
 		local is_ai = breed ~= nil and not is_player
 		local is_ally = side_manager:is_ally(attacker, hit_unit)
-		local damage_unit = not is_ally or friendly_fire_enabled
+		local damage_unit = not is_ally or friendly_fire
 
 		if is_player then
 			if explosion_data.ignore_players then
@@ -282,6 +328,194 @@ local function find_targets(world, attacker, position, rotation, template, scale
 	end
 
 	return targets, radius, max_damage_radius, do_damage
+end
+
+-- Build 6.1 (EnemyBlasts.lua, D66): the host branch of DamageUtils.create_explosion for one player, without its side
+-- effects (damage_utils.lua:1126 to :1540). Whether the blast reaches them: by the game's own overlap where it finds this
+-- player's actors here (sees), passing over the near-miss capsule, with the cone, the forward scaling and the
+-- line-of-sight rays a blast may want, then the ignore and friendly fire rules; else by shape, their capsule as the blast
+-- measures it (calculate_aoe_size) within its radius. Then its numbers for them, from their distance: the power level
+-- by the falloff, the damage profile, the push (lerped by the distance as if they were the blast's first target: the
+-- original reuses one push speed for every target, :1455) and the catapult. Returns nil and why if it doesn't reach them.
+function blasts.player_target(world, attacker, position, rotation, template, scale, attacker_power_level, player, sees)
+	local explosion_data = template.explosion
+	local numbers = type(explosion_data) == "table" and blasts.numbers(attacker, template, scale or 1, attacker_power_level)
+
+	if not numbers then
+		return nil, "not followed here"
+	elseif explosion_data.ignore_players then
+		return nil, "it ignores players"
+	elseif Unit.get_data(player, "ignore_explosion_damage") or explosion_data.ignore_attacker_unit and player == attacker then
+		return nil, "it ignores this player"
+	end
+
+	local radius = numbers.radius
+	local blackboard = BLACKBOARDS[player]
+	local breed = blackboard and blackboard.breed or Unit.get_data(player, "breed")
+	local target_radius, target_height = DamageUtils.calculate_aoe_size(player, breed)
+	local unit_position = POSITION_LOOKUP[player] or Unit.local_position(player, 0)
+	local top = unit_position + Vector3(0, 0, math.max(target_height - target_radius * 0.5, target_height * 0.5))
+	local bottom = unit_position + Vector3(0, 0, math.min(target_radius * 0.5, target_height * 0.5))
+	local closest = Geometry.closest_point_on_line(position, bottom, top)
+	local hit_direction = closest - position
+	local hit_distance = math.max(Vector3.length(hit_direction) - target_radius, 0)
+	local physics_world = World.physics_world(world)
+	local method = sees and "overlap" or "shape"
+	local found = false
+
+	if sees then
+		local actors, num_actors = PhysicsWorld.immediate_overlap(physics_world, "shape", "sphere", "position", position, "size", radius, "collision_filter", numbers.collision_filter)
+
+		for i = 1, num_actors or 0 do
+			local actor = actors[i]
+
+			if actor and Actor.unit(actor) == player and DamageUtils.aoe_hit_zone(player, actor) ~= "afro" then
+				found = true
+
+				break
+			end
+		end
+	else
+		found = hit_distance <= radius
+	end
+
+	if not found then
+		return nil, method
+	end
+
+	-- The cone, the forward scaling and the line of sight, from the player's root 1 m up (:1274 to :1351).
+	local forward_scaling = explosion_data.explosion_forward_scaling
+	local cone = explosion_data.explosion_cone_angle and math.cos(explosion_data.explosion_cone_angle / 2)
+	local explosion_direction = (forward_scaling or explosion_data.explosion_right_scaling or cone) and Quaternion.forward(rotation)
+	local delta = Unit.world_position(player, 0) + Vector3.up() - position
+	local direction = Vector3.normalize(delta)
+
+	if cone and cone > Vector3.dot(direction, explosion_direction) then
+		return nil, "cone"
+	end
+
+	if not explosion_data.only_line_of_sight then
+		if forward_scaling then
+			local modified = lerp(radius, radius * forward_scaling, math.abs(Vector3.dot(direction, explosion_direction)))
+
+			if modified * modified < Vector3.length_squared(delta) then
+				return nil, "forward scaling"
+			end
+		end
+	else
+		-- As the game has it: in range when the scaled radius is within the distance (:1314).
+		if forward_scaling then
+			local modified = lerp(radius, radius * forward_scaling, math.abs(Vector3.dot(direction, explosion_direction)))
+
+			if modified * modified > Vector3.length_squared(delta) then
+				return nil, "forward scaling"
+			end
+		end
+
+		-- The rays find only dynamic actors (filter_explosion_overlap_no_static): anything without a breed before the
+		-- player shields them. By shape, the same rays with the player's own distance standing in for their actors.
+		PhysicsWorld.prepare_actors_for_raycast(physics_world, position, direction, 0.1)
+
+		local result = PhysicsWorld.immediate_raycast(physics_world, position, direction, radius, "all", "collision_filter", "filter_explosion_overlap_no_static")
+		local reached = not sees and Vector3.length(delta) <= radius
+		local distance = Vector3.length(delta)
+
+		for j = 1, type(result) == "table" and #result or 0 do
+			local hit = result[j]
+			local raycast_unit = Actor.unit(hit[4])
+
+			if raycast_unit == player then
+				reached = true
+
+				break
+			elseif not AiUtils.unit_breed(raycast_unit) then
+				if sees or (hit[2] or 0) < distance then
+					reached = false
+				end
+
+				break
+			end
+		end
+
+		if not reached then
+			return nil, "line of sight"
+		end
+	end
+
+	-- Allies only with friendly fire; enemies not in ghost mode (:1397 to :1407).
+	if Managers.state.side:is_ally(attacker, player) then
+		if not friendly_fire_enabled(attacker, explosion_data) then
+			return nil, "an ally's blast"
+		end
+	else
+		local ghost_mode = ScriptUnit.has_extension(player, "ghost_mode_system")
+
+		if ghost_mode and ghost_mode:is_in_ghost_mode() then
+			return nil, "ghost mode"
+		end
+	end
+
+	local max_damage_radius = numbers.max_damage_radius
+	local glancing = max_damage_radius < hit_distance
+	local scaled_power_level = numbers.power_level_min and numbers.power_level_max and lerp(numbers.power_level_min, numbers.power_level_max, numbers.scale) or nil
+	local distance_factor = 1
+
+	if glancing then
+		local range = radius - max_damage_radius
+
+		if range > 0 then
+			distance_factor = 1 - (hit_distance - max_damage_radius) / range
+
+			if explosion_data.exponential_falloff then
+				distance_factor = distance_factor * distance_factor
+			end
+		end
+	end
+
+	-- AreaDamageSystem._damage_unit (area_damage_system.lua:350 to :423): the damage profile, its _no_damage twin without
+	-- power, nothing at all for an immune breed (whose catapult still comes).
+	local immune_breeds = explosion_data.immune_breeds
+	local immune = breed and immune_breeds and (immune_breeds[breed.name] or immune_breeds.all) or false
+	local profile_name = glancing and explosion_data.damage_profile_glance or explosion_data.damage_profile or "default"
+
+	if not numbers.do_damage then
+		profile_name = profile_name .. "_no_damage"
+	end
+
+	local push_speed = explosion_data.player_push_speed
+	local normalized = Vector3.normalize(hit_direction)
+
+	if push_speed then
+		push_speed = math.auto_lerp(max_damage_radius, radius, push_speed, 1, math.clamp(hit_distance, max_damage_radius, radius))
+	end
+
+	return {
+		distance = hit_distance,
+		direction = normalized,
+		power_level = (glancing and numbers.power_level_glance or scaled_power_level or numbers.power_level or 0) * distance_factor,
+		profile_name = profile_name,
+		push_speed = push_speed,
+		immune = immune and true or false,
+		numbers = numbers,
+		method = method,
+	}
+end
+
+-- The catapult of a blast that reached this player (damage_utils.lua:1515 to :1538): its force along the hit's
+-- direction, with its upward force, times its blocked multiplier through a block. Nil for a blast that doesn't throw.
+function blasts.catapult_velocity(explosion_data, direction, blocked)
+	if not explosion_data.catapult_players or type(explosion_data.catapult_force) ~= "number" then
+		return nil
+	end
+
+	local multiplier = blocked and explosion_data.catapult_blocked_multiplier or 1
+	local velocity = explosion_data.catapult_force * multiplier * direction
+
+	if explosion_data.catapult_force_z then
+		Vector3.set_z(velocity, explosion_data.catapult_force_z * multiplier)
+	end
+
+	return velocity
 end
 
 local function send(message, ...)
@@ -723,12 +957,23 @@ local function hold_stagger(record)
 	end
 end
 
-mod:hook("AreaDamageSystem", "rpc_create_explosion", function (func, self, channel_id, attacker_unit_id, attacker_is_level_unit, position, rotation, explosion_template_name_id, ...)
-	if self.is_server and not pc.broken and not attacker_is_level_unit then
-		pc.guard("host blast", blasts.host_blast_arrived, channel_id, attacker_unit_id, position, explosion_template_name_id)
+-- Host: a client's blast arrives, before vanilla works it out. Client (build 6.1): every blast the host sends goes
+-- through here too (area_damage_system.lua:494), after vanilla has played its effects; an enemy blast is then judged on
+-- this screen for this player (EnemyBlasts.lua), with the message's own values.
+mod:hook("AreaDamageSystem", "rpc_create_explosion", function (func, self, channel_id, attacker_unit_id, attacker_is_level_unit, position, rotation, explosion_template_name_id, scale, damage_source_id, attacker_power_level, is_critical_strike, source_attacker_unit_id, ...)
+	if self.is_server then
+		if not pc.broken and not attacker_is_level_unit then
+			pc.guard("host blast", blasts.host_blast_arrived, channel_id, attacker_unit_id, position, explosion_template_name_id)
+		end
+
+		return func(self, channel_id, attacker_unit_id, attacker_is_level_unit, position, rotation, explosion_template_name_id, scale, damage_source_id, attacker_power_level, is_critical_strike, source_attacker_unit_id, ...)
 	end
 
-	return func(self, channel_id, attacker_unit_id, attacker_is_level_unit, position, rotation, explosion_template_name_id, ...)
+	func(self, channel_id, attacker_unit_id, attacker_is_level_unit, position, rotation, explosion_template_name_id, scale, damage_source_id, attacker_power_level, is_critical_strike, source_attacker_unit_id, ...)
+
+	if not pc.broken and pc.enemy_blasts then
+		pc.guard("client enemy blast", pc.enemy_blasts.client_blast, self.world, attacker_unit_id, attacker_is_level_unit, position, rotation, explosion_template_name_id, scale, damage_source_id, attacker_power_level, source_attacker_unit_id)
+	end
 end)
 
 -- This is a mod:hook, so everything except the original call runs through pc.guard.

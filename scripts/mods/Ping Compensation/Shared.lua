@@ -1,7 +1,7 @@
 local mod = get_mod("Ping Compensation")
 
 -- Host and client must run the same VERSION. Bump it whenever any message in CLAUDE.md's "Network messages" changes.
-local VERSION = 15
+local VERSION = 16
 
 -- Playtest builds write the debug log by default, so testers don't have to remember /pingcomp debug on. Set this to
 -- false for a public release: players who want the log can still switch it on, and their choice is remembered.
@@ -41,10 +41,13 @@ local pc = {
 		BTCrazyJumpAction = "pounce",
 	},
 	-- Family G (build 5.1, D52): the nodes whose shots a client judges on its own player, and the kind of shot. A
-	-- client's results go several to a message (pc_shots), at most this often.
+	-- client's results go several to a message (pc_shots), at most this often. Build 6.1: Deathrattler's gun, whose nodes
+	-- count only with the ratling gun setup (Shots.lua), so the stormfiend's beam is never taken for one.
 	SHOOTER_NODES = {
 		BTRatlingGunnerShootAction = "bullet",
 		BTFireProjectileAction = "arrow",
+		BTStormfiendShootAction = "gun",
+		BTStormfiendDualShootAction = "gun",
 	},
 	SHOT_FLUSH = 0.1,
 	-- Seconds a client waits for the host to confirm a vortex's catch it shows at once (D53) before it undoes it.

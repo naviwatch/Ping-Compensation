@@ -2515,6 +2515,11 @@ mod:hook("AnimationSystem", "rpc_anim_event", function (func, self, channel_id, 
 		pc.guard("client shooter animation", pc.shots.animation_changed, go_id, anim_id)
 	end
 
+	-- Build 6.1: a troll's vomit ends with its node (BossAreas.lua).
+	if pc.boss_areas and pc.boss_areas.has_vomits() then
+		pc.guard("client vomit animation", pc.boss_areas.animation_changed, go_id, anim_id)
+	end
+
 	return func(self, channel_id, anim_id, go_id)
 end)
 
@@ -2539,6 +2544,10 @@ mod:hook("AnimationSystem", "rpc_anim_event_variable_float", function (func, sel
 
 	if pc.shots and pc.shots.has_turning() then
 		pc.guard("client shooter animation", pc.shots.animation_changed, go_id, anim_id)
+	end
+
+	if pc.boss_areas and pc.boss_areas.has_vomits() then
+		pc.guard("client vomit animation", pc.boss_areas.animation_changed, go_id, anim_id)
 	end
 
 	return func(self, channel_id, anim_id, go_id, variable_id, variable_value)

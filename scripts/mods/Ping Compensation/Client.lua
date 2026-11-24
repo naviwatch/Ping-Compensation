@@ -2508,6 +2508,11 @@ function client.reaction_started(unit, reason)
 	if pc.areas then
 		pc.guard("client jet reaction", pc.areas.stop_turning, unit, reason)
 	end
+
+	-- Build 6.1: a troll's vomit and a stormfiend's beam are over here too.
+	if pc.boss_areas then
+		pc.guard("client boss area reaction", pc.boss_areas.stop_turning, unit, reason)
+	end
 end
 
 -- Family E1: the overlap attack the host chose, by its place in the action's attacks, negative in its running_attacks.
@@ -2767,6 +2772,13 @@ mod:network_register("pc_swing_begin", function (sender, version, id, attacker_g
 	if attack and attack.push_units_in_the_way then
 		pc.guard("client push aside", push_aside, swing, unit, target, attack.push_units_in_the_way)
 	end
+
+	-- Build 6.1 (D70 question 4): a lord's attack without an animation has hit inside the host's enter already (the
+	-- Drachenfels sorcerer's death explosion, bt_champion_attack_action.lua:82), so no damage frame will come here: it is
+	-- judged now, as its frame 1.
+	if kind == "champion" and attack_anim == "" then
+		pc.guard("client lord's attack at once", champion_damage_frame, swing, unit, target, t)
+	end
 end)
 
 mod:hook_safe("LocomotionSystem", "update", function (self, context, t)
@@ -2795,6 +2807,12 @@ mod:hook_safe("LocomotionSystem", "update", function (self, context, t)
 	-- Family G (D59): a ratling gunner's stream and an archer aimed at this player turn the shooter the same way (Shots.lua).
 	if pc.shots and pc.shots.has_turning() then
 		pc.guard("client shooters", pc.shots.after_locomotion, t, context.dt)
+	end
+
+	-- Build 6.1: a troll's vomit turns the troll on its target's screen, and its sweeps and a stormfiend's beam's follow
+	-- this screen's copies as the engine has just moved them (BossAreas.lua).
+	if pc.boss_areas and pc.boss_areas.active() then
+		pc.guard("client boss areas", pc.boss_areas.after_locomotion, t, context.dt)
 	end
 end)
 
@@ -2947,6 +2965,11 @@ function client.update(dt)
 			if pc.areas then
 				pcall(pc.areas.release_catches, "the mod switched itself off")
 			end
+
+			-- Build 6.1: this screen's own copies of the pools' buffs, which have no end time, and the host is told.
+			if pc.boss_areas then
+				pcall(pc.boss_areas.release_pools, local_player_unit())
+			end
 		end
 
 		return
@@ -2969,6 +2992,11 @@ function client.update(dt)
 
 	if pc.areas then
 		pc.guard("client areas upkeep", pc.areas.update, dt)
+	end
+
+	-- Build 6.1: the pools and the plague waves, from this player's live position.
+	if pc.boss_areas then
+		pc.guard("client boss areas upkeep", pc.boss_areas.update, dt)
 	end
 
 	if next(recently_cut) ~= nil then
@@ -3025,6 +3053,14 @@ function client.clear()
 
 	if pc.areas then
 		pc.areas.clear()
+	end
+
+	if pc.boss_areas then
+		pc.boss_areas.clear()
+	end
+
+	if pc.enemy_blasts then
+		pc.enemy_blasts.clear()
 	end
 end
 

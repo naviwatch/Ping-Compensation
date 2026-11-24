@@ -24,6 +24,9 @@ local host = {
 	overlap_skip = nil,
 	-- Family E, the jump slam: while its landing's catapult runs, { units, group }: those player units are left out.
 	jump_skip = nil,
+	-- Build 6.1, an enemy blast: while DamageUtils.create_explosion runs, { filter, units, dropped }: its one overlap with
+	-- that filter (its 9th argument) leaves those player units out (EnemyBlasts.lua).
+	blast_skip = nil,
 	booking = false, -- true while the host books what a client reported, so the damage-alone log leaves it out (D56)
 }
 
@@ -593,15 +596,21 @@ function host.announce_charge(unit, blackboard, t)
 	overlaps[unit] = announce_monster(unit, blackboard, "charge", nil, first_anim(blackboard.action.start_animation) or "charge_start", 0, t)
 end
 
+local enter_hits = {} -- lord unit -> { would = { [player unit] = verdict }, t } for the hit of an attack inside its enter
+
 -- Family E4, called after BTChampionAttackAction.enter (bt_champion_attack_action.lua:21), with the attack's first
--- animation. An attack without one hit inside enter, before anything could be announced (:82), so it stays the host's
--- (the Drachenfels sorcerer's death_explosion, an enemy blast for build 6.1, D66).
+-- animation. From build 6.1 (D70 question 4), an attack without one, which hit inside enter before anything could be
+-- announced (:82), the Drachenfels sorcerer's death_explosion: its hit left the modded players out (champion_enter_hit),
+-- and its swings go out with an empty animation, which tells their screens to judge it at once, as its frame 1.
 function host.announce_champion(unit, blackboard, t)
 	overlaps[unit] = nil
 
 	local action = blackboard.action
+	local enter_hit = enter_hits[unit]
 
-	if type(action) ~= "table" or blackboard.active_node ~= BTChampionAttackAction or blackboard.attack_finished or not blackboard.attack_rotation then
+	enter_hits[unit] = nil
+
+	if type(action) ~= "table" or blackboard.active_node ~= BTChampionAttackAction or not blackboard.attack_rotation then
 		return
 	end
 
@@ -609,7 +618,25 @@ function host.announce_champion(unit, blackboard, t)
 	local attack_anim = first_anim(type(sequence) == "table" and sequence.attack_anim or action.attack_anim)
 
 	if attack_anim then
-		overlaps[unit] = announce_monster(unit, blackboard, "champion", nil, attack_anim, 0, t)
+		if not blackboard.attack_finished then
+			overlaps[unit] = announce_monster(unit, blackboard, "champion", nil, attack_anim, 0, t)
+		end
+
+		return
+	elseif action.attack_sequence then
+		return
+	end
+
+	local group = announce_monster(unit, blackboard, "champion", nil, "", 0, t)
+
+	overlaps[unit] = group
+
+	for i = 1, group and #group.swings or 0 do
+		local swing = group.swings[i]
+
+		swing.frames = 1
+		swing.frame_t[1] = enter_hit and enter_hit.t or t
+		swing.would[1] = enter_hit and enter_hit.would[swing.target] or "miss"
 	end
 end
 
@@ -1010,6 +1037,50 @@ function host.champion_frame(unit, blackboard, action)
 	}
 end
 
+-- Build 6.1 (D70 question 4), called around BTChampionAttackAction._deal_damage for a hit before attack_rotation is set,
+-- which is the hit of an attack without an animation inside its enter (bt_champion_attack_action.lua:82, :89): it
+-- leaves out every fresh modded player the lord is an enemy of, if the announcement after enter can reach them, and
+-- notes what the host would have judged for each, until that announcement makes their swings. Returns the scope for
+-- enter_hit_filter, or nil.
+function host.champion_enter_hit(unit, blackboard, action)
+	local breed = blackboard.breed
+
+	if blackboard.active_node ~= BTChampionAttackAction or action.attack_anim or action.attack_sequence or not action.damage or not breed
+		or not action_set_name(action, breed) or not pc.network():unit_game_object_id(unit) then
+		return nil
+	end
+
+	local side_manager = Managers.state.side
+	local skip = nil
+
+	for _, player in pairs(Managers.player:human_players()) do
+		local peer = player.remote and not player.bot_player and player.peer_id
+		local player_unit = player.player_unit
+
+		if peer and peer_is_fresh(peer) and player_unit and Unit.alive(player_unit) and side_manager:is_enemy(unit, player_unit) then
+			skip = skip or {}
+			skip[player_unit] = true
+		end
+	end
+
+	if not skip then
+		return nil
+	end
+
+	local record = {
+		would = {},
+		t = pc.now(),
+	}
+
+	enter_hits[unit] = record
+
+	return {
+		units = skip,
+		record = record,
+		unit = unit,
+	}
+end
+
 -- Family E4: the actors a lord's attack reached, without those of the modded players whose own screens judge it, who
 -- are noted for host_would. A list of its own, since the original may pass one it reuses (:535).
 local function champion_filter(scope, hit_actors, actor_count)
@@ -1024,6 +1095,26 @@ local function champion_filter(scope, hit_actors, actor_count)
 
 			if swing and swing.would[scope.frame] == "miss" then
 				swing.would[scope.frame] = block_would(scope.unit, target)
+			end
+		elseif actor then
+			kept[#kept + 1] = actor
+		end
+	end
+
+	return kept, #kept
+end
+
+-- Build 6.1: the same for the hit inside enter, whose swings don't exist yet (champion_enter_hit).
+local function enter_hit_filter(scope, hit_actors, actor_count)
+	local kept = {}
+
+	for i = 1, actor_count do
+		local actor = hit_actors[i]
+		local target = actor and Actor.unit(actor)
+
+		if target and scope.units[target] then
+			if not scope.record.would[target] then
+				scope.record.would[target] = block_would(scope.unit, target)
 			end
 		elseif actor then
 			kept[#kept + 1] = actor
@@ -2894,17 +2985,29 @@ mod:hook("BTChargeAttackAction", "_check_overlap", function (func, self, unit, b
 end)
 
 -- Family E4: a lord's attack deals its damage to every player it reached but the modded players its swings went to
--- (host.champion_frame, champion_filter). Everything but the original runs through pc.guard.
+-- (host.champion_frame, champion_filter). From build 6.1, the hit of an attack inside its enter, before attack_rotation
+-- is set, leaves out every fresh modded player too (host.champion_enter_hit, enter_hit_filter), whose swings follow.
+-- Everything but the original runs through pc.guard.
 mod:hook("BTChampionAttackAction", "_deal_damage", function (func, self, unit, blackboard, action, self_pos, hit_actors, actor_count, is_animation_callback, ...)
-	if pc.broken or not overlaps[unit] or type(hit_actors) ~= "table" or type(actor_count) ~= "number" then
+	if pc.broken or not pc.is_server() or type(blackboard) ~= "table" or type(action) ~= "table" or type(hit_actors) ~= "table" or type(actor_count) ~= "number"
+		or not overlaps[unit] and blackboard.attack_rotation ~= nil then
 		return func(self, unit, blackboard, action, self_pos, hit_actors, actor_count, is_animation_callback, ...)
 	end
 
-	local ok, scope = pc.guard("host lord's attack frame", host.champion_frame, unit, blackboard, action)
+	local ok, scope, filter = true, nil, champion_filter
 	local kept, kept_count
 
+	if overlaps[unit] then
+		ok, scope = pc.guard("host lord's attack frame", host.champion_frame, unit, blackboard, action)
+	end
+
+	if ok and not scope and blackboard.attack_rotation == nil then
+		ok, scope = pc.guard("host lord's attack in enter", host.champion_enter_hit, unit, blackboard, action)
+		filter = enter_hit_filter
+	end
+
 	if ok and scope then
-		ok, kept, kept_count = pc.guard("host lord's attack filter", champion_filter, scope, hit_actors, actor_count)
+		ok, kept, kept_count = pc.guard("host lord's attack filter", filter, scope, hit_actors, actor_count)
 	end
 
 	if not ok or not scope then
@@ -3114,6 +3217,11 @@ mod:hook(PhysicsWorld, "immediate_overlap", function (func, ...)
 	elseif host.overlap_skip and select(13, ...) == host.overlap_skip.filter then
 		skip = host.overlap_skip.units
 		dropped = host.overlap_skip.dropped
+	elseif host.blast_skip and select(9, ...) == host.blast_skip.filter then
+		-- Build 6.1: an enemy blast's one overlap (damage_utils.lua:1240).
+		skip = host.blast_skip.units
+		dropped = host.blast_skip.dropped
+		host.blast_skip = nil
 	else
 		return func(...)
 	end
@@ -3199,12 +3307,70 @@ mod:hook_safe("PlayerUnitHealthExtension", "add_damage", function (self, attacke
 	pc.guard("host damage alone", host.damage_alone, self.unit, attacker_unit, damage_amount, damage_type, damage_source_name)
 end)
 
+-- T24 (D70 question 6): a monster walking into a player pushes them aside (AiUtils.push_intersecting_players with its
+-- displace_players_data, ai_utils.lua:1452, from ai_breed_snippets.lua and perception_utils.lua), which reaches a
+-- modded player a ping late. Until their own screens push them, the host counts and logs each such push on them: a
+-- player it displaced in this call who wasn't before (:1510). The waves' pushes leave modded players out
+-- (BossAreas.lua), so these are the monsters'.
+local push_logged = {} -- enemy unit -> when its last such push was logged
+
+local function monster_push_before(displaced_units)
+	local before = nil
+
+	for _, player in pairs(Managers.player:human_players()) do
+		local player_unit = player.player_unit
+
+		if player_unit and displaced_units[player_unit] == nil and host.client_judges(player_unit) then
+			before = before or {}
+			before[player_unit] = true
+		end
+	end
+
+	return before
+end
+
+local function monster_push_after(unit, displaced_units, before)
+	for player_unit in pairs(before) do
+		if displaced_units[player_unit] ~= nil then
+			local t = pc.now()
+			local breed = Unit.alive(unit) and Unit.get_data(unit, "breed")
+
+			pc.count("host_monster_pushes")
+
+			if not push_logged[unit] or t - push_logged[unit] > 1 then
+				push_logged[unit] = t
+
+				local peer = host.client_judges(player_unit)
+
+				pc.log("host monster push enemy=%s target=%s: pushed aside from the host's view, which reaches them a ping late (T24)", breed and breed.name or "unit", peer and player_name(peer) or "a player")
+			end
+		end
+	end
+end
+
+mod:hook("AiUtils", "push_intersecting_players", function (func, unit, source_unit, displaced_units, data, t, dt, hit_func, ...)
+	if pc.broken or next(peers) == nil or type(displaced_units) ~= "table" or not pc.is_server() then
+		return func(unit, source_unit, displaced_units, data, t, dt, hit_func, ...)
+	end
+
+	local ok, before = pc.guard("host monster push", monster_push_before, displaced_units)
+
+	if not ok or not before then
+		return func(unit, source_unit, displaced_units, data, t, dt, hit_func, ...)
+	end
+
+	func(unit, source_unit, displaced_units, data, t, dt, hit_func, ...)
+
+	pc.guard("host monster push", monster_push_after, unit, displaced_units, before)
+end)
+
 function host.update()
 	host.suppress = nil
 	host.box_skip = nil
 	host.leap_skip = nil
 	host.overlap_skip = nil
 	host.jump_skip = nil
+	host.blast_skip = nil
 	host.booking = false
 
 	-- A push aside whose original call failed leaves the side's list filtered; it comes back here.
@@ -3217,7 +3383,28 @@ function host.update()
 	pc.guard("host reactions update", pc.host_reactions.update)
 	pc.guard("host blasts update", pc.blasts.update)
 
+	-- Build 6.1.
+	if pc.boss_areas then
+		pc.guard("host boss areas update", pc.boss_areas.host_update)
+	end
+
+	if pc.enemy_blasts then
+		pc.guard("host enemy blasts update", pc.enemy_blasts.host_update)
+	end
+
 	local t = pc.now()
+
+	for unit, record in pairs(enter_hits) do
+		if t - record.t > 1 then
+			enter_hits[unit] = nil
+		end
+	end
+
+	for unit, logged_t in pairs(push_logged) do
+		if t - logged_t > 5 then
+			push_logged[unit] = nil
+		end
+	end
 
 	for id, swing in pairs(swings) do
 		if t > swing.expires then
@@ -3272,14 +3459,26 @@ function host.clear()
 	host.leap_skip = nil
 	host.overlap_skip = nil
 	host.jump_skip = nil
+	host.blast_skip = nil
 	host.booking = false
 	host.push_restore()
+
+	enter_hits = {}
+	push_logged = {}
 
 	pc.host_reactions.clear()
 	pc.blasts.clear()
 
 	if pc.areas then
 		pc.areas.host_clear()
+	end
+
+	if pc.boss_areas then
+		pc.boss_areas.host_clear()
+	end
+
+	if pc.enemy_blasts then
+		pc.enemy_blasts.host_clear()
 	end
 end
 

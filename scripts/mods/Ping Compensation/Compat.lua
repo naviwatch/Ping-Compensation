@@ -50,6 +50,10 @@ local JUDGED_NODES = {
 	BTChampionAttackAction = true,
 	BTJumpSlamImpactAction = true,
 	BTThrowWeaponAction = true,
+	BTVomitAction = true, -- build 6.1: the troll's vomit, the stormfiend's beam and Deathrattler's gun, the rings
+	BTStormfiendShootAction = true,
+	BTStormfiendDualShootAction = true,
+	BTChaosSorcererSummoningAction = true,
 }
 
 local BREED_FIELDS = {
@@ -64,6 +68,7 @@ local BREED_FIELDS = {
 	"boss_staggers",
 	"diff_stagger_resist",
 	"dodge_timer",
+	"far_vomit",
 	"hit_mass_counts",
 	"hitzone_armor_categories",
 	"hitzone_multiplier_types",
@@ -71,6 +76,7 @@ local BREED_FIELDS = {
 	"lord_damage_reduction",
 	"max_health",
 	"max_stagger_duration",
+	"near_vomit",
 	"no_random_stagger_duration",
 	"no_stagger_duration",
 	"player_dodged_cone",
@@ -103,6 +109,8 @@ local BREED_FIELDS = {
 -- the Chaos Wastes curse sets its sorcerer's health on the host only (mutator_curse_skulking_sorcerer.lua:36).
 local REACH_FIELDS = {
 	"dodge_timer",
+	"far_vomit", -- build 6.1: the pools a troll's vomit leaves (bt_vomit_action.lua:299)
+	"near_vomit",
 	"player_dodged_cone",
 	"player_dodged_radius",
 	"race",
@@ -143,6 +151,12 @@ local ACTION_NODES = {
 	BTJumpSlamImpactAction = true,
 	BTThrowWeaponAction = true,
 	BTTrollDownedAction = true,
+	-- Build 6.1: the troll's vomit, the stormfiend's beam and Deathrattler's gun, and the Drachenfels sorcerer's rings,
+	-- whose ring_sequence is fed by its fixed fields only, since the host's node writes its progress into it (:957).
+	BTVomitAction = true,
+	BTStormfiendShootAction = true,
+	BTStormfiendDualShootAction = true,
+	BTChaosSorcererSummoningAction = true,
 }
 
 -- The fields of those action tables that the client's maths reads. Only these are fingerprinted, so state the host's
@@ -159,6 +173,7 @@ local ACTION_FIELDS = {
 	"aoe_init_damage",
 	"attack_anim",
 	"attack_anims",
+	"attack_anims_data",
 	"attack_directions",
 	"attack_sequence",
 	"attack_time",
@@ -188,6 +203,7 @@ local ACTION_FIELDS = {
 	"collision_type",
 	"combo_attacks",
 	"damage",
+	"damage_profile_name",
 	"damage_type",
 	"difficulty_duration",
 	"direction",
@@ -198,6 +214,8 @@ local ACTION_FIELDS = {
 	"dodge_window_duration",
 	"dodge_window_start",
 	"fatigue_type",
+	"fire_rate_at_end",
+	"fire_rate_at_start",
 	"firing_time",
 	"fixed_hp_chunks",
 	"forward_offset",
@@ -219,6 +237,7 @@ local ACTION_FIELDS = {
 	"light_weight_projectile_template_name",
 	"lunge",
 	"max_distance_squared",
+	"max_fire_rate_at_percentage",
 	"max_impact_push_speed",
 	"max_player_push_speed",
 	"min_dodge_angle_squared",
@@ -228,6 +247,8 @@ local ACTION_FIELDS = {
 	"moving_stagger_minimum_destination_distance",
 	"moving_stagger_threshold",
 	"muzzle_node",
+	"muzzle_nodes",
+	"near_vomit_distance",
 	"no_block_stagger",
 	"offset_forward",
 	"offset_right",
@@ -240,6 +261,7 @@ local ACTION_FIELDS = {
 	"player_dodged_radius",
 	"player_push_speed",
 	"player_push_speed_blocked",
+	"power_level",
 	"projectile_gravity",
 	"projectile_speed",
 	"push",
@@ -250,6 +272,7 @@ local ACTION_FIELDS = {
 	"radius",
 	"range",
 	"reset_attack_animations",
+	"ring_info",
 	"rotation_time",
 	"rotation_time_step",
 	"running_attacks",
@@ -276,7 +299,93 @@ local ACTION_FIELDS = {
 	"wall_collision_anim",
 	"wave_speed",
 	"weapon_reach",
+	"weapon_setup",
 	"width",
+}
+
+-- Build 6.1: the fixed fields of a ring of the Drachenfels sorcerer (breed_chaos_exalted_sorcerer_drachenfels.lua:871).
+local RING_FIELDS = {
+	"catapult_direction",
+	"catapult_strength",
+	"delay",
+	"position",
+	"premination",
+}
+
+-- Build 6.1: what a client's copy of a pool reads from its template (BossAreas.lua; liquid_area_damage_extension.lua:26
+-- to :106).
+local POOL_FIELDS = {
+	"above",
+	"apply_buff_to_player",
+	"below",
+	"buff_condition_function",
+	"buff_template_name",
+	"buff_template_type",
+	"cell_size",
+	"damage_type",
+	"delay",
+	"difficulty_direct_damage",
+	"do_direct_damage_player",
+	"immune_breeds",
+	"max_liquid",
+}
+
+-- Build 6.1: what a client's copy of a wave reads from its template (BossAreas.lua; damage_wave_extension.lua:61 to :117).
+local WAVE_FIELDS = {
+	"apply_impact_buff_to_player",
+	"buff_wave_impact_name",
+	"buff_wave_impact_type",
+	"player_push_data",
+}
+
+-- Build 6.1: what a client's copy of an enemy blast reads from its template (Blasts.lua, player_target; damage_utils.lua
+-- :1131 to :1538, area_damage_system.lua:347 to :449).
+local EXPLOSION_FIELDS = {
+	"ai_friendly_fire",
+	"allow_friendly_fire_override",
+	"attacker_power_level_offset",
+	"catapult_blocked_multiplier",
+	"catapult_force",
+	"catapult_force_z",
+	"catapult_players",
+	"collision_filter",
+	"damage_profile",
+	"damage_profile_glance",
+	"difficulty_power_level",
+	"explosion_cone_angle",
+	"explosion_forward_scaling",
+	"explosion_right_scaling",
+	"exponential_falloff",
+	"fatigue_type",
+	"ignore_attacker_unit",
+	"ignore_players",
+	"immune_breeds",
+	"max_damage_radius",
+	"max_damage_radius_max",
+	"max_damage_radius_min",
+	"no_friendly_fire",
+	"only_line_of_sight",
+	"player_push_speed",
+	"power_level",
+	"power_level_glance",
+	"power_level_max",
+	"power_level_min",
+	"radius",
+	"radius_max",
+	"radius_min",
+	"scale_power_level",
+	"use_attacker_power_level",
+}
+
+-- Build 6.1: the bosses' areas' buffs, which the client starts and ticks itself (BossAreas.lua, D58).
+local BOSS_BUFFS = {
+	"bile_troll_vomit_face_base",
+	"bile_troll_vomit_ground_base",
+	"bile_troll_vomit_ground_downed",
+	"stormfiend_warpfire_face_base",
+	"stormfiend_warpfire_ground_base",
+	"plague_wave_face_base",
+	"vermintide_face_base",
 }
 
 local SECTIONS = {
@@ -394,6 +503,19 @@ local function feed(out, value, depth)
 		out[#out + 1] = "}"
 	else
 		out[#out + 1] = "-"
+	end
+end
+
+-- The listed fields of a table that it has, each with its name, in the list's order.
+local function feed_fields(out, value, fields)
+	for i = 1, #fields do
+		local field_value = value[fields[i]]
+
+		if field_value ~= nil then
+			out[#out + 1] = fields[i]
+
+			feed(out, field_value, 0)
+		end
 	end
 end
 
@@ -521,14 +643,59 @@ local function feed_breed_actions(out, entry)
 
 		out[#out + 1] = list[j].name
 
-		for k = 1, #ACTION_FIELDS do
-			local value = action[ACTION_FIELDS[k]]
+		feed_fields(out, action, ACTION_FIELDS)
 
-			if value ~= nil then
-				out[#out + 1] = ACTION_FIELDS[k]
+		-- Build 6.1: the rings' own data, without what the host's node writes into it as the spell runs.
+		if type(action.ring_sequence) == "table" then
+			out[#out + 1] = "ring_sequence"
 
-				feed(out, value, 0)
+			for k = 1, #action.ring_sequence do
+				if type(action.ring_sequence[k]) == "table" then
+					feed_fields(out, action.ring_sequence[k], RING_FIELDS)
+				end
 			end
+		end
+	end
+end
+
+-- Build 6.1: each template of a table, by name, with only the fields judging reads.
+local function feed_templates(out, templates, fields)
+	if type(templates) ~= "table" then
+		return
+	end
+
+	local names = sorted_keys(templates)
+
+	for i = 1, #names do
+		local template = templates[names[i]]
+
+		if type(template) == "table" then
+			out[#out + 1] = tostring(names[i])
+
+			feed_fields(out, template, fields)
+		end
+	end
+end
+
+-- Build 6.1: every explosion template's blast fields that a client's copy of an enemy blast reads (Blasts.lua,
+-- player_target), and whether it is a grenade's, whose radius the attacker's grenade buffs raise.
+local function feed_explosions(out)
+	local templates = rawget(_G, "ExplosionTemplates")
+
+	if type(templates) ~= "table" then
+		return
+	end
+
+	local names = sorted_keys(templates)
+
+	for i = 1, #names do
+		local template = templates[names[i]]
+
+		if type(template) == "table" and type(template.explosion) == "table" then
+			out[#out + 1] = tostring(names[i])
+
+			feed(out, template.is_grenade, 0)
+			feed_fields(out, template.explosion, EXPLOSION_FIELDS)
 		end
 	end
 end
@@ -555,14 +722,27 @@ local SECTION_FEEDERS = {
 		feed(out, rawget(_G, "VortexTemplates"), 0)
 		feed(out, blobs and blobs.templates, 0)
 
-		-- D58: the burnings the client ticks itself, from its own copy of their buffs (Areas.lua).
+		-- D58: the burnings the client ticks itself, from its own copy of their buffs (Areas.lua), and from build 6.1 the
+		-- bosses' areas' buffs (BossAreas.lua).
 		local buffs = rawget(_G, "BuffTemplates")
 
 		if type(buffs) == "table" then
 			feed(out, buffs.warpfire_thrower_ground_base, 0)
 			feed(out, buffs.warpfire_thrower_face_base, 0)
 			feed(out, buffs.warpfire_thrower_face_base_mutator, 0)
+
+			for i = 1, #BOSS_BUFFS do
+				feed(out, buffs[BOSS_BUFFS[i]], 0)
+			end
 		end
+
+		-- Build 6.1: the pools', the waves' and the blasts' own data (BossAreas.lua, EnemyBlasts.lua).
+		local pools = rawget(_G, "LiquidAreaDamageTemplates")
+		local waves = rawget(_G, "DamageWaveTemplates")
+
+		feed_templates(out, pools and pools.templates, POOL_FIELDS)
+		feed_templates(out, waves and waves.templates, WAVE_FIELDS)
+		feed_explosions(out)
 	end,
 	difficulty = function (out)
 		feed(out, DifficultySettings, 0)

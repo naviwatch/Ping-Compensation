@@ -20,6 +20,7 @@ pc.hit_results = hit_results
 
 local MATCH_WINDOW = 2 -- seconds a shown hit waits for the host's damage message
 local PUSH_WINDOW = 1.5 -- the same for a knockback
+local COPIES_WINDOW = 2 -- the same for the other machines' pushes of a face buff, which come a round trip later (D71)
 local RELEASE_DELAY = 0.15 -- the host's HP numbers can trail its damage message by a frame or two
 local SPEED_TOLERANCE = 0.15
 local STATUS_WINDOW = 2 -- seconds a catapult or knock-down shown here waits for the host's copy (D62)
@@ -28,7 +29,7 @@ local STATUS_WINDOW = 2 -- seconds a catapult or knock-down shown here waits for
 local CATAPULT_TOLERANCE = 0.3
 
 local pending_hits = {} -- { go_id, source, t } for hits shown here, oldest first
-local pending_pushes = {} -- { speed, limit, t } for knockbacks applied here
+local pending_pushes = {} -- { speed, limit, t, window, face } for knockbacks applied here, and face buffs' late pushes
 local pending_catapults = {} -- { speed, t } for catapults shown here
 local pending_knock_downs = {} -- { t } for knock-downs shown here
 local estimate = {
@@ -220,6 +221,27 @@ local function push(target, speed, limit, direction, t)
 	end
 
 	push_velocity(target, speed * direction, limit, t)
+end
+
+-- D71: a face buff (the troll's vomit's, a plague wave's, the grey seer's) pushes the player from every human machine
+-- that applies it (apply_vomit_in_face, buff_function_templates.lua:1219): this screen's own copy has pushed them
+-- (BossAreas.lua), and every other machine's push reaches them later as a push message, which is dropped: count of them,
+-- at the buff's push speed. Whatever /pingcomp predict says, since this screen's own copy of the buff pushed them anyway.
+function hit_results.expect_pushes(speed, count)
+	local t = pc.now()
+
+	for _ = 1, count do
+		pending_pushes[#pending_pushes + 1] = {
+			speed = speed,
+			t = t,
+			window = COPIES_WINDOW,
+			face = true,
+		}
+	end
+
+	if count > 0 then
+		pc.count("client_face_pushes_expected", count)
+	end
 end
 
 -- D62: the player's own catapulted state, now, as the host's StatusUtils.set_catapulted_network would start it a ping
@@ -531,7 +553,9 @@ end
 
 -- Called by Client.lua for a lord's attack (family E4) judged "hit" or "blocked" on this player: what
 -- BTChampionAttackAction._deal_damage (bt_champion_attack_action.lua:767) does to them, at once. Through a block the
--- blocked push and the blocked damage, else the damage; then the catapult with the attack's shove_speed, through a
+-- blocked push and the blocked damage, else the damage and, from build 6.1, its push: AiUtils.damage_target pushes the
+-- player away from the lord at the attack's player_push_speed unless they are disabled (ai_utils.lua:408 to :417), which
+-- the Drachenfels sorcerer's death explosion is made of (D70). Then the catapult with the attack's shove_speed, through a
 -- block too, unless the player is knocked down or dead (_catapult_player, :872). from: where the attack hit from (the
 -- lord, or the start of a lunge's box).
 function hit_results.champion(swing, unit, target, result, from)
@@ -557,6 +581,12 @@ function hit_results.champion(swing, unit, target, result, from)
 		end
 	else
 		amount = show_damage(swing, unit, target, nil, direction, t)
+
+		if action.player_push_speed then
+			push_velocity(target, action.player_push_speed * Vector3.normalize(position(target) - position(unit)), action.max_player_push_speed, t)
+
+			moved = "push"
+		end
 	end
 
 	-- No lord's attack in the 6.13 data scales its throw by its own speed (impact_shove_multiplier, :777); one that did
@@ -648,41 +678,38 @@ function hit_results.shove(swing, unit, target, rotation)
 	pc.log("client swing=%d shove shown at once: estimate=%.1f push=%s", swing.id, amount, tostring(action.impact_push_speed))
 end
 
--- Called by Shots.lua for an enemy's bullet or arrow judged "hit" on this player (family G): the feedback and HP
--- estimate that the host's damage message would show. action_data is the shot's own (power level and damage profile,
--- bt_ratling_gunner_shoot_action.lua:601, bt_fire_projectile_action.lua:316). The push is the shot's business, since
--- the host doesn't send one for a shot this screen judged. Returns the estimate.
-function hit_results.shot(shooter, shooter_go_id, breed, target, action_data, zone, direction)
-	if not showing() then
-		return 0
-	end
-
+-- The feedback and HP estimate a damage profile's hit at a power level would show on this player, as the host's damage
+-- message would (DamageUtils.calculate_damage, then the host's own adjustments): a shot's (family G), and from build 6.1
+-- an enemy blast's and a ring's. attacker: the unit the host books it from, whose network id (attacker_go_id) its message
+-- carries; boost: the hit's boost curve multiplier. Returns the estimate.
+local function show_profile_hit(attacker, attacker_go_id, source_name, race, target, profile, power_level, zone, direction, boost)
 	local health = ScriptUnit.has_extension(target, "health_system")
-	local profile = DamageProfileTemplates[action_data.damage_profile]
 
-	if not health or not profile then
+	if not health or type(profile) ~= "table" or type(power_level) ~= "number" then
 		return 0
 	end
 
 	local target_settings = profile.targets and profile.targets[1] or profile.default_target
 	local boost_curve = target_settings and BoostCurves[target_settings.boost_curve_type]
-	local _, boost = ActionUtils.get_ranged_boost(shooter)
-	local amount = DamageUtils.calculate_damage(DamageOutput, target, shooter, zone, action_data.power_level, boost_curve, boost, false, profile, 1, nil, breed.name)
+	local amount = DamageUtils.calculate_damage(DamageOutput, target, attacker, zone, power_level, boost_curve, boost or 0, false, profile, 1, nil, source_name)
 
 	if type(amount) ~= "number" then
 		return 0
 	end
 
-	amount = adjusted_damage(amount, target, breed.race)
+	local damage_type = DamageUtils.get_damage_type(profile, 1) or "cutting"
+
+	amount = adjusted_damage(amount, target, race, damage_type)
 
 	if amount > 0 then
 		local t = pc.now()
+		local shown_attacker = attacker and Unit.alive(attacker) and attacker or target
 
-		health:add_damage(shooter, amount, zone, DamageUtils.get_damage_type(profile, 1) or "cutting", position(target), direction, breed.name, nil, shooter, "light", false, false, false, 1, "n/a", 1, 1)
+		health:add_damage(shown_attacker, amount, zone, damage_type, position(target), direction, source_name, nil, shown_attacker, "light", false, false, false, 1, "n/a", 1, 1)
 
 		pending_hits[#pending_hits + 1] = {
-			go_id = shooter_go_id,
-			source = breed.name,
+			go_id = attacker_go_id,
+			source = source_name,
 			t = t,
 		}
 
@@ -692,6 +719,62 @@ function hit_results.shot(shooter, shooter_go_id, breed, target, action_data, zo
 	end
 
 	return amount
+end
+
+-- Called by Shots.lua for an enemy's bullet or arrow judged "hit" on this player (family G): the feedback and HP
+-- estimate that the host's damage message would show. action_data is the shot's own (power level and damage profile,
+-- bt_ratling_gunner_shoot_action.lua:601, bt_fire_projectile_action.lua:316). The push is the shot's business, since
+-- the host doesn't send one for a shot this screen judged. Returns the estimate.
+function hit_results.shot(shooter, shooter_go_id, breed, target, action_data, zone, direction)
+	if not showing() then
+		return 0
+	end
+
+	local _, boost = ActionUtils.get_ranged_boost(shooter)
+
+	return show_profile_hit(shooter, shooter_go_id, breed.name, breed.race, target, DamageProfileTemplates[action_data.damage_profile], action_data.power_level, zone, direction, boost)
+end
+
+-- Called by EnemyBlasts.lua for an enemy blast that reached this player on this screen (build 6.1, D66): what the blast's
+-- per-target code does to them, at once. The damage profile's hit at the falloff's power level
+-- (AreaDamageSystem._damage_unit, area_damage_system.lua:437), the push away from the blast unless they are disabled
+-- (:449), and the catapult (D62, damage_utils.lua:1538). blast: { attacker, go_id, source_name, race, profile,
+-- power_level, direction, push_speed, catapult }. Returns the estimate and what moved them, for the log.
+function hit_results.blast(target, blast)
+	if not showing() then
+		return 0, "nothing (predict off)"
+	end
+
+	local t = pc.now()
+	local amount = show_profile_hit(blast.attacker, blast.go_id, blast.source_name, blast.race, target, blast.profile, blast.power_level, "torso", blast.direction, 0)
+	local moved = "none"
+
+	if type(blast.push_speed) == "number" and blast.push_speed > 0 then
+		push_velocity(target, blast.direction * blast.push_speed, nil, t)
+
+		moved = "push"
+	end
+
+	if blast.catapult and hit_results.catapult(target, blast.catapult, t) then
+		moved = "catapult"
+	end
+
+	return amount, moved
+end
+
+-- Called by EnemyBlasts.lua for a ring of the Drachenfels sorcerer that caught this player on this screen (build 6.1):
+-- what update_boss_rings does to them (bt_chaos_sorcerer_summoning_action.lua:947 to :951), at once: the action's damage
+-- profile at its power level, then the catapult towards or away from the ring's centre (D62). ring: { attacker, go_id,
+-- race, profile, power_level, catapult }. Returns the estimate and whether it threw them.
+function hit_results.ring(target, ring)
+	if not showing() then
+		return 0, false
+	end
+
+	local amount = show_profile_hit(ring.attacker, ring.go_id, "undefined", ring.race, target, ring.profile, ring.power_level, "torso", Vector3.up(), 0)
+	local thrown = ring.catapult ~= nil and hit_results.catapult(target, ring.catapult, pc.now())
+
+	return amount, thrown
 end
 
 -- Called by Areas.lua for damage an area or a burning does to this player, judged on this screen (family H, D58): a gas
@@ -817,9 +900,13 @@ function hit_results.push_message(game_object_id, velocity, upper_limit)
 		local record = pending_pushes[i]
 		local same_limit = upper_limit == nil and record.limit == nil or upper_limit ~= nil and record.limit ~= nil and math.abs(upper_limit - record.limit) < 0.01
 
-		if t - record.t <= PUSH_WINDOW and same_limit and math.abs(speed - record.speed) <= record.speed * SPEED_TOLERANCE + 0.05 then
+		if t - record.t <= (record.window or PUSH_WINDOW) and same_limit and math.abs(speed - record.speed) <= record.speed * SPEED_TOLERANCE + 0.05 then
 			table.remove(pending_pushes, i)
-			pc.count("client_push_message_dropped")
+			pc.count(record.face and "client_face_push_dropped" or "client_push_message_dropped")
+
+			if record.face then
+				pc.log("client: another machine's push of a face buff dropped, %.3fs later (D71)", t - record.t)
+			end
 
 			return true
 		end
@@ -905,8 +992,17 @@ function hit_results.update()
 		pc.count("client_hit_never_booked")
 	end
 
-	while pending_pushes[1] and t - pending_pushes[1].t > PUSH_WINDOW do
-		table.remove(pending_pushes, 1)
+	-- The face buffs' late pushes wait longer than a knockback's copy (COPIES_WINDOW), so each goes by its own window.
+	for i = #pending_pushes, 1, -1 do
+		local record = pending_pushes[i]
+
+		if t - record.t > (record.window or PUSH_WINDOW) then
+			table.remove(pending_pushes, i)
+
+			if record.face then
+				pc.count("client_face_push_never_came")
+			end
+		end
 	end
 
 	expire(pending_catapults, t)

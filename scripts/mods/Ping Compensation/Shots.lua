@@ -18,6 +18,10 @@ local pc = mod.pc
 -- the host's own rule, so a high ping doesn't make them easier to outrun (D10's facing, extended to aim). There the
 -- shooter's body turns by its node's own rule too (D59): the ratling gunner's while its stream is aimed there, the
 -- archer's while it aims and shoots, which the host announces (pc_aim, kind arrow).
+--   * Build 6.1: Deathrattler's gun (BTStormfiendShootAction and BTStormfiendDualShootAction with the ratling gun setup,
+--     breed_skaven_stormfiend_boss.lua:901 and :1131). The host owns each bullet, as an archer's arrow, and every client
+--     follows every copy of them, judged as an arrow is. On its target's screen a shoot's bullets are aimed again as
+--     they arrive, by the host's rule (D70 question 3); the rage intro's spray aims at nobody and flies as it came.
 
 local shots = {}
 
@@ -34,6 +38,10 @@ local MAX_ARROW_TIME = 6 -- seconds an arrow is followed at most
 local AIM_MEMORY = 10 -- seconds a stream's aim waits for the stream itself
 local VOLLEY_WAIT = 4 -- seconds an archer in a volley may wait past its aim for the others (bt_fire_projectile_action.lua:72 to :116)
 local ARCHER_FACING_DOT = 0.70710678 -- math.inverse_sqrt_2: an archer turns only while its target is over 45 degrees off (:188)
+local GUN_FILTER = "filter_enemy_player_ray_projectile" -- Deathrattler's bullets (bt_stormfiend_shoot_action.lua:733)
+local GUN_MUZZLE_BACK = 1.25 -- metres behind the muzzle each bullet starts (_fire_from_position_direction, :699)
+local GUN_AIM_MEMORY = 6 -- seconds a gun's aim at this player is kept, past its 3.5 s of firing
+local TWO_PI = math.pi * 2
 
 local shooters = {} -- breed name -> { kind, action } from its behaviour tree, or false
 
@@ -52,7 +60,11 @@ local function shooter_of(breed)
 
 	local found = false
 	local node = pc.find_node(pc.tree_of(breed), function (candidate)
-		return pc.SHOOTER_NODES[candidate[1]] ~= nil and type(candidate.action_data) == "table"
+		local kind = pc.SHOOTER_NODES[candidate[1]]
+
+		-- A stormfiend's node is a gun only with the ratling gun setup; its default is the warpfire's beam
+		-- (bt_stormfiend_shoot_action.lua:222), which BossAreas.lua judges.
+		return kind ~= nil and type(candidate.action_data) == "table" and (kind ~= "gun" or candidate.action_data.weapon_setup == "ratling_gun")
 	end)
 
 	if node then
@@ -71,6 +83,50 @@ shots.shooter_of = shooter_of
 
 local function template_of(shooter)
 	return shooter and LightWeightProjectiles[shooter.action.light_weight_projectile_template_name] or nil
+end
+
+local gun_actions = {} -- breed name -> action name -> { action, template, intro } for its gun's actions, or false
+
+-- Build 6.1: the gun action of this name in the breed's own tree, with the ratling gun setup, its bullets' template
+-- (stormfiend_boss or stormfiend_boss_dual_intro, light_weight_projectiles.lua:44 and :83), and whether it is the rage
+-- intro's two-armed spray (BTStormfiendDualShootAction), which aims at nobody (bt_stormfiend_dual_shoot_action.lua:219).
+local function gun_action(breed, action_name)
+	if not breed or type(action_name) ~= "string" then
+		return nil
+	end
+
+	local by_name = gun_actions[breed.name]
+
+	if not by_name then
+		by_name = {}
+		gun_actions[breed.name] = by_name
+	end
+
+	local cached = by_name[action_name]
+
+	if cached ~= nil then
+		return cached or nil
+	end
+
+	local node = pc.find_node(pc.tree_of(breed), function (candidate)
+		local action = candidate.action_data
+
+		return pc.SHOOTER_NODES[candidate[1]] == "gun" and type(action) == "table" and action.name == action_name and action.weapon_setup == "ratling_gun"
+	end)
+	local template = node and LightWeightProjectiles[node.action_data.light_weight_projectile_template_name]
+	local found = false
+
+	if template then
+		found = {
+			action = node.action_data,
+			template = template,
+			intro = node[1] == "BTStormfiendDualShootAction",
+		}
+	end
+
+	by_name[action_name] = found
+
+	return found or nil
 end
 
 local function power_level_of(template)
@@ -212,6 +268,24 @@ function shots.announce_aim(unit, blackboard)
 	pc.log("host archer go=%d aiming at %s", go_id, pc.host.player_name(peer))
 end
 
+-- Build 6.1: Deathrattler's shoot opens fire (BTStormfiendShootAction.initiate_firing_ratling_gun,
+-- bt_stormfiend_shoot_action.lua:758) at a modded player, whose own screen aims its bullets from now on.
+function shots.announce_gun(blackboard)
+	local unit = blackboard.unit
+	local target = blackboard.attacking_target
+	local peer = unit and target and Unit.alive(target) and pc.host.client_judges(target)
+	local go_id = peer and pc.network():unit_game_object_id(unit)
+	local target_go_id = go_id and pc.network():unit_game_object_id(target)
+
+	if not target_go_id then
+		return
+	end
+
+	mod:network_send("pc_aim", peer, pc.VERSION, go_id, "gun", "", target_go_id, true)
+	pc.count("host_guns_aimed")
+	pc.log("host gun go=%d aimed at %s", go_id, pc.host.player_name(peer))
+end
+
 -- Family G: the archer's aim before its spread, as _fire_projectile is about to work it out (bt_fire_projectile_action.lua:275).
 function shots.arrow_base(node, unit, blackboard, dt)
 	local action = blackboard.action
@@ -291,11 +365,18 @@ function shots.announce_arrow(unit, blackboard, capture)
 end
 
 -- Books one shot a client reported. A hit books what vanilla's projectile hit would have (damage_utils.lua:3279);
--- the player's own screen already pushed them, and a block reached the host as vanilla's own message.
-local function book_shot(target, kind, shooter_go_id, result, zone, breed_name)
+-- the player's own screen already pushed them, and a block reached the host as vanilla's own message. A gun's bullet
+-- (build 6.1) is booked with the template of the action its report names.
+local function book_shot(target, kind, shooter_go_id, result, zone, breed_name, action_name)
 	local breed = Breeds[breed_name]
 	local shooter = shooter_of(breed)
 	local template = template_of(shooter)
+
+	if kind == "gun" then
+		local gun = gun_action(breed, action_name)
+
+		template = gun and gun.template
+	end
 
 	if not template or shooter.kind ~= kind then
 		return "unknown shooter"
@@ -359,6 +440,12 @@ mod:network_register("pc_shots", function (sender, version, list)
 
 	for entry in string.gmatch(list, "[^;]+") do
 		local kind, go_id, result, zone, breed_name = string.match(entry, "^([ab]),(%d+),([hk]),([%w_]+),([%w_]+)$")
+		local action_name = nil
+
+		-- Build 6.1: a gun's entry ends with the action that fired it.
+		if not kind then
+			kind, go_id, result, zone, breed_name, action_name = string.match(entry, "^(g),(%d+),([hk]),([%w_]+),([%w_]+),([%w_]+)$")
+		end
 
 		if not kind then
 			pc.count("host_rejected")
@@ -366,16 +453,16 @@ mod:network_register("pc_shots", function (sender, version, list)
 		elseif not fresh then
 			pc.count("host_shot_ignored_stale")
 		else
-			kind = kind == "a" and "arrow" or "bullet"
+			kind = kind == "a" and "arrow" or kind == "g" and "gun" or "bullet"
 			result = result == "k" and "blocked" or "hit"
 
-			local ok, outcome = pc.guard("host shot booking", book_shot, target, kind, tonumber(go_id), result, zone, breed_name)
+			local ok, outcome = pc.guard("host shot booking", book_shot, target, kind, tonumber(go_id), result, zone, breed_name, action_name)
 
 			pc.host.booking = false
 			pc.count("host_shots")
 			pc.count("host_shot_" .. kind)
 
-			pc.log("host shot=%s from=%s go=%s target=%s answer=%s zone=%s outcome=%s ping=%s", kind, breed_name, go_id, pc.host.player_name(sender), result, zone, ok and tostring(outcome) or "error", type(ping) == "number" and string.format("%.0fms", ping * 1000) or "n/a")
+			pc.log("host shot=%s from=%s%s go=%s target=%s answer=%s zone=%s outcome=%s ping=%s", kind, breed_name, action_name and "/" .. action_name or "", go_id, pc.host.player_name(sender), result, zone, ok and tostring(outcome) or "error", type(ping) == "number" and string.format("%.0fms", ping * 1000) or "n/a")
 		end
 	end
 end)
@@ -384,18 +471,33 @@ end)
 
 local aims = {} -- gunner network id -> { node, seen, check_t, obscured, last_seen, rotation, point, body, ... } while its stream is aimed at this player
 local turns = {} -- archer network id -> { t, ends_t, turn_speed, rotation, ... } while it aims at this player (D59)
-local arrows = {} -- arrow id -> what this screen knows of it, while it follows the arrow's copy
+local arrows = {} -- arrow or bullet id -> what this screen knows of it, while it follows the copy (a gun's bullets too, build 6.1)
 local pending = {} -- arrow id -> an announcement whose copy hasn't arrived yet
-local removed = {} -- arrow id -> when this screen removed its copy before the host's own removal of it arrived
+local removed = {} -- arrow or bullet id -> when this screen removed its copy before the host's own removal of it arrived
+local gun_aims = {} -- gun network id -> { point, t, bullets } while a shoot is aimed at this player (build 6.1)
 local queued = {} -- shots judged here, waiting to go to the host
 local flush_at = 0
+local last_dt = 0 -- the last frame's length, for a gun's aim at each bullet that arrives
 
 local function judging()
 	return not pc.broken and not pc.is_server() and pc.host_fresh()
 end
 
-local function queue(kind, go_id, result, zone, breed_name)
-	queued[#queued + 1] = string.format("%s,%d,%s,%s,%s", kind == "arrow" and "a" or "b", go_id, result == "blocked" and "k" or "h", zone, breed_name)
+local SHOT_LETTERS = {
+	arrow = "a",
+	bullet = "b",
+	gun = "g",
+}
+
+-- action_name: a gun's (build 6.1), whose entry ends with it.
+local function queue(kind, go_id, result, zone, breed_name, action_name)
+	local entry = string.format("%s,%d,%s,%s,%s", SHOT_LETTERS[kind] or "b", go_id, result == "blocked" and "k" or "h", zone, breed_name)
+
+	if kind == "gun" then
+		entry = entry .. "," .. tostring(action_name)
+	end
+
+	queued[#queued + 1] = entry
 end
 
 -- Several shots to a message, at most every pc.SHOT_FLUSH seconds: a stream fires up to 25 bullets a second.
@@ -461,8 +563,8 @@ end
 
 -- A shot that reached this player's body on this screen: the push, the ranged block from this player's own state
 -- (which plays the block here and tells the host with vanilla's own message, damage_utils.lua:2809), then the hit's
--- feedback at once and the report.
-local function judge_shot(kind, owner, target, zone, direction, action_data, arrow_id)
+-- feedback at once and the report. action_name: a gun's bullet's (build 6.1).
+local function judge_shot(kind, owner, target, zone, direction, action_data, arrow_id, action_name)
 	local breed = Unit.get_data(owner, "breed")
 	local go_id = Managers.state.unit_storage:go_id(owner)
 
@@ -477,7 +579,7 @@ local function judge_shot(kind, owner, target, zone, direction, action_data, arr
 
 	local blocked = not pc.unblockable(owner) and DamageUtils.check_ranged_block(owner, target, fatigue_type) == true
 
-	queue(kind, go_id, blocked and "blocked" or "hit", zone, breed.name)
+	queue(kind, go_id, blocked and "blocked" or "hit", zone, breed.name, action_name)
 	pc.count("client_shot_" .. kind)
 	pc.count(blocked and "client_shot_blocked" or "client_shot_hit")
 
@@ -489,8 +591,10 @@ local function judge_shot(kind, owner, target, zone, direction, action_data, arr
 		estimate = ok and amount or 0
 	end
 
-	pc.log("client shot=%s from=%s go=%d verdict=%s zone=%s estimate=%.1f aimed=%s%s", kind, breed.name, go_id, blocked and "blocked" or "hit", zone, estimate,
-		tostring(kind == "bullet" and aims[go_id] ~= nil or kind == "arrow" and arrow_id ~= nil and arrows[arrow_id] ~= nil and arrows[arrow_id].aimed == true), arrow_id and string.format(" arrow=%d", arrow_id) or "")
+	local followed = arrow_id ~= nil and arrows[arrow_id] or nil
+
+	pc.log("client shot=%s from=%s go=%d verdict=%s zone=%s estimate=%.1f aimed=%s%s%s", kind, breed.name, go_id, blocked and "blocked" or "hit", zone, estimate,
+		tostring(kind == "bullet" and aims[go_id] ~= nil or followed ~= nil and followed.aimed == true), arrow_id and string.format(" %s=%d", kind == "gun" and "bullet" or "arrow", arrow_id) or "", action_name and " action=" .. action_name or "")
 end
 
 -- A bullet of this client's own copy of a stream hit something this frame (physics_cb_light_weight_projectile_hit).
@@ -919,30 +1023,33 @@ local function projectile_system()
 	return Managers.state.entity:system("projectile_system")
 end
 
--- This client's copy of the host's arrow, and the list it sits in.
-local function find_copy(system, id, projectile)
+-- This client's copy of the host's arrow or bullet, and the list it sits in. index: where it was last, which is tried
+-- first, since a gun keeps dozens of bullets in the air (build 6.1).
+local function find_copy(system, id, projectile, index)
 	local data = system._light_weight.husk_list[pc.host_peer()]
 
 	if not data then
 		return nil
 	end
 
-	for index = 1, data.current_index do
-		local candidate = data.projectiles[index]
+	if projectile and index and data.projectiles[index] == projectile then
+		return projectile, data, index
+	end
+
+	for i = 1, data.current_index do
+		local candidate = data.projectiles[i]
 
 		if candidate and (candidate == projectile or projectile == nil and candidate.identifier == id) then
-			return candidate, data, index
+			return candidate, data, i
 		end
 	end
 
 	return nil
 end
 
--- The shot's own data, which a client's copy of an arrow doesn't carry: as _fire_projectile builds it
--- (bt_fire_projectile_action.lua:316).
-local function arrow_action_data(shooter, direction)
-	local template = template_of(shooter)
-
+-- The shot's own data, which a client's copy of an arrow or a gun's bullet doesn't carry: as _fire_projectile and
+-- _shoot_ratling_gun build it from the template (bt_fire_projectile_action.lua:316, bt_stormfiend_shoot_action.lua:736).
+local function shot_action_data(template, direction)
 	if not template then
 		return nil
 	end
@@ -952,6 +1059,127 @@ local function arrow_action_data(shooter, direction)
 		damage_profile = template.damage_profile,
 		player_push_velocity = Vector3Box(Vector3.normalize(direction) * (template.impact_push_speed or 0)),
 	}
+end
+
+local function arrow_action_data(shooter, direction)
+	return shot_action_data(template_of(shooter), direction)
+end
+
+local function node_spine(target)
+	return Unit.world_position(target, Unit.has_node(target, "j_spine") and Unit.node(target, "j_spine") or 0)
+end
+
+-- Build 6.1, on the target's screen: a shoot's bullet aimed again as its copy arrives, by the host's rule
+-- (BTStormfiendShootAction._fire_from_position_direction and _shoot_ratling_gun, bt_stormfiend_shoot_action.lua:684 and
+-- :720). The aim point, which starts at this player's feet as the gun opens fire, eases towards their live j_spine by
+-- min(dt * 6, 1) for each bullet; the bullet flies from 1.25 m behind the muzzle towards it, with this screen's own
+-- random spread from the template. The muzzle is worked out from the copy, which the host fired from 1.25 m behind its own.
+local function aim_bullet(record, projectile, aim, target, template)
+	local muzzle = projectile.position:unbox() + projectile.direction:unbox() * GUN_MUZZLE_BACK
+	local point = Vector3.lerp(aim.point:unbox(), node_spine(target), math.min(last_dt * 6, 1))
+
+	aim.point:store(point)
+
+	local wanted = point - muzzle
+
+	if Vector3.length_squared(wanted) < 0.0001 then
+		return
+	end
+
+	local direction = Vector3.normalize(wanted)
+	local look = Quaternion.look(direction, Vector3.up())
+	local pitch = Quaternion(Vector3.right(), math.random() * (template.spread or 0))
+	local roll = Quaternion(Vector3.forward(), math.random() * TWO_PI)
+	local spread = Quaternion.forward(Quaternion.multiply(Quaternion.multiply(look, roll), pitch))
+	local start = muzzle - direction * GUN_MUZZLE_BACK
+
+	projectile.position:store(start)
+	projectile.direction:store(spread)
+	projectile.rotation:store(Quaternion.look(spread, Vector3.up()))
+	record.last:store(start)
+	record.aimed = true
+	aim.bullets = aim.bullets + 1
+
+	pc.count("client_gun_bullets_aimed")
+end
+
+-- Build 6.1: a copy of Deathrattler's bullet arrives (rpc_client_spawn_light_weight_projectile, projectile_system.lua:1237).
+-- Every one is followed, as an arrow is, with the action that fired it, read from his synced bt_action_name
+-- (ai_system.lua:913); on his target's screen a shoot's is aimed again.
+function shots.gun_copy(system, owner_go_id, id)
+	if not judging() then
+		return
+	end
+
+	local owner = Managers.state.unit_storage:unit(owner_go_id)
+	local breed = owner and Unit.alive(owner) and Unit.get_data(owner, "breed")
+	local shooter = shooter_of(breed)
+	local target = pc.local_player_unit()
+
+	if not shooter or shooter.kind ~= "gun" or not target then
+		return
+	end
+
+	local game = pc.network():game()
+	local ok, action_id = false, nil
+
+	if game then
+		ok, action_id = pcall(GameSession.game_object_field, game, owner_go_id, "bt_action_name")
+	end
+
+	local action_name = ok and type(action_id) == "number" and rawget(NetworkLookup.bt_action_names, action_id) or nil
+	local gun = gun_action(breed, action_name) or gun_action(breed, shooter.action.name)
+	local projectile, _, index = find_copy(system, id)
+
+	if not gun or not projectile then
+		return
+	end
+
+	local template = gun.template
+	local record = {
+		id = id,
+		go_id = owner_go_id,
+		kind = "gun",
+		action_name = gun.action.name,
+		template = template,
+		shooter = shooter,
+		filter = GUN_FILTER,
+		max_t = (template.projectile_max_range or 50) / math.max(template.projectile_speed or 80, 1) + 0.5,
+		projectile = projectile,
+		index = index,
+		last = Vector3Box(projectile.position:unbox()),
+		aimed = false,
+		t = pc.now(),
+	}
+
+	arrows[id] = record
+
+	pc.count("client_gun_bullets")
+
+	local aim = gun_aims[owner_go_id]
+
+	if aim and not gun.intro then
+		aim_bullet(record, projectile, aim, target, template)
+	end
+end
+
+-- Build 6.1 (pc_aim, kind gun): Deathrattler's shoot opens fire at this player, its aim point at their feet
+-- (initiate_firing_ratling_gun, bt_stormfiend_shoot_action.lua:766).
+function shots.gun_aimed(go_id)
+	local target = pc.local_player_unit()
+
+	if not target or not judging() then
+		return
+	end
+
+	gun_aims[go_id] = {
+		point = Vector3Box(POSITION_LOOKUP[target]),
+		t = pc.now(),
+		bullets = 0,
+	}
+
+	pc.count("client_gun_aims")
+	pc.log("client gun go=%d aimed at this player", go_id)
 end
 
 local function attach(system, record, projectile)
@@ -1035,7 +1263,7 @@ end
 local function finish_arrow(system, record, why)
 	arrows[record.id] = nil
 
-	local projectile, data, index = find_copy(system, record.id, record.projectile)
+	local projectile, data, index = find_copy(system, record.id, record.projectile, record.index)
 
 	-- The host's removal of the copy waited for this screen (rpc_client_despawn_light_weight_projectile below), and an
 	-- arrow that hit something here disappears where it hit.
@@ -1062,10 +1290,12 @@ function shots.follow(system)
 	local physics_world = World.get_data(system.world, "physics_world")
 
 	for _, record in pairs(arrows) do
-		local projectile = find_copy(system, record.id, record.projectile)
+		local projectile, _, index = find_copy(system, record.id, record.projectile, record.index)
 		local owner = Managers.state.unit_storage:unit(record.go_id)
 
-		if not projectile or not target or not judging() or t - record.t > MAX_ARROW_TIME or not owner or not Unit.alive(owner) then
+		record.index = index
+
+		if not projectile or not target or not judging() or t - record.t > (record.max_t or MAX_ARROW_TIME) or not owner or not Unit.alive(owner) then
 			finish_arrow(system, record, "lost")
 		else
 			local from = record.last:unbox()
@@ -1075,7 +1305,7 @@ function shots.follow(system)
 
 			if length > 0.001 then
 				local direction = offset / length
-				local hits = PhysicsWorld.immediate_raycast(physics_world, from, direction, length, "all", "types", "both", "collision_filter", HIT_FILTER)
+				local hits = PhysicsWorld.immediate_raycast(physics_world, from, direction, length, "all", "types", "both", "collision_filter", record.filter or HIT_FILTER)
 
 				record.last:store(to)
 
@@ -1085,10 +1315,11 @@ function shots.follow(system)
 					local verdict, zone = first_stop(hits, owner, target)
 
 					if verdict == "player" then
-						local action_data = arrow_action_data(record.shooter or shooter_of(Unit.get_data(owner, "breed")), direction)
+						local kind = record.kind or "arrow"
+						local action_data = kind == "gun" and shot_action_data(record.template, direction) or arrow_action_data(record.shooter or shooter_of(Unit.get_data(owner, "breed")), direction)
 
 						if action_data then
-							judge_shot("arrow", owner, target, zone, direction, action_data, record.id)
+							judge_shot(kind, owner, target, zone, direction, action_data, record.id, record.action_name)
 						end
 
 						finish_arrow(system, record, "hit")
@@ -1123,7 +1354,17 @@ function shots.update(dt)
 
 	local t = pc.now()
 
+	last_dt = type(dt) == "number" and dt or 0
+
 	flush(t)
+
+	for go_id, aim in pairs(gun_aims) do
+		if t - aim.t > GUN_AIM_MEMORY then
+			gun_aims[go_id] = nil
+
+			pc.log("client gun go=%d aim over: %d bullets aimed here at this player", go_id, aim.bullets)
+		end
+	end
 
 	-- The aims and the turning run after LocomotionSystem.update (shots.after_locomotion).
 	for id, record in pairs(pending) do
@@ -1147,6 +1388,7 @@ function shots.clear()
 	arrows = {}
 	pending = {}
 	removed = {}
+	gun_aims = {}
 	queued = {}
 	flush_at = 0
 end
@@ -1183,6 +1425,11 @@ mod:network_register("pc_aim", function (sender, version, go_id, kind, node_name
 		pc.guard("client archer aim", shots.archer_aimed, go_id)
 	elseif kind == "jet" and pc.areas and type(target_go_id) == "number" then
 		pc.guard("client jet aim", pc.areas.jet_aimed, go_id, target_go_id, aimed == true)
+	elseif kind == "vomit" and pc.boss_areas and type(target_go_id) == "number" then
+		-- Build 6.1: a troll's vomit, to every modded player (BossAreas.lua).
+		pc.guard("client vomit aim", pc.boss_areas.vomit_aimed, go_id, target_go_id, aimed == true)
+	elseif kind == "gun" then
+		pc.guard("client gun aim", shots.gun_aimed, go_id)
 	end
 end)
 
@@ -1234,8 +1481,17 @@ mod:hook_safe("ProjectileSystem", "rpc_clients_continuous_shoot_stop", function 
 end)
 
 mod:hook_safe("ProjectileSystem", "rpc_client_spawn_light_weight_projectile", function (self, channel_id, damage_source_id, owner_unit_id, position, direction, speed, gravity, flat_speed, effect_id, owner_is_level_unit, owner_peer_id, id)
-	if not pc.broken and next(pending) ~= nil then
+	if pc.broken or self.is_server then
+		return
+	end
+
+	if next(pending) ~= nil then
 		pc.guard("client arrow copy", shots.copy_spawned, self, id)
+	end
+
+	-- Build 6.1: every copy of a gun's bullet is followed (shots.gun_copy).
+	if not owner_is_level_unit then
+		pc.guard("client gun copy", shots.gun_copy, self, owner_unit_id, id)
 	end
 end)
 
@@ -1273,6 +1529,16 @@ mod:hook_safe("BTRatlingGunnerShootAction", "_start_shooting", function (self, b
 	end
 
 	pc.guard("host stream aim", shots.announce_stream, unit, data)
+end)
+
+-- Host: Deathrattler's shoot opens fire (bt_stormfiend_shoot_action.lua:758); a modded target's own screen aims its
+-- bullets (build 6.1).
+mod:hook_safe("BTStormfiendShootAction", "initiate_firing_ratling_gun", function (self, blackboard)
+	if pc.broken or not pc.is_server() or not pc.in_game() or type(blackboard) ~= "table" then
+		return
+	end
+
+	pc.guard("host gun aim", shots.announce_gun, blackboard)
 end)
 
 -- Host: an archer starts aiming (bt_fire_projectile_action.lua:24); a modded target's own screen turns it (D59).
