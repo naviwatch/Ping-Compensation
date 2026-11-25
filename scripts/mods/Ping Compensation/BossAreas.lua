@@ -41,7 +41,7 @@ local PLAYER_POOL_ARMOR = 4 -- what _update_collision_detection files a player u
 local POOL_REPORT_INTERVAL = 1 -- seconds between this screen's reports that its player is still in a pool with a buff
 local GRID_TOLERANCE = 0.1 -- metres between the rebuilt grid's cell and the host's blob before the grid counts as off
 local WAVE_DISPLACED = 0.1 -- seconds a wave leaves a player it pushed alone (AiUtils.push_intersecting_players, ai_utils.lua:1510)
-local SENT_MEMORY = 10 -- seconds the host remembers which players a vomit went to, for their face buff's ticks
+local SENT_MEMORY = 10 -- seconds the host remembers which players a vomit went to, for its sweep
 local PLAYER_MIDDLE = 0.9 -- metres above a player's feet, for the check of what the game's sweeps find here
 -- D71 (option (c), Lance, 2026-11-24): how many times a face buff (the vomit's, a plague wave's, the grey seer's) pushes
 -- this player at once. 1: only by this screen's own copy of the buff, whose apply pushes (apply_vomit_in_face,
@@ -180,6 +180,9 @@ end
 -- Host ---------------------------------------------------------------------------------------------------------------
 
 local vomits_sent = {} -- troll unit -> { players = { [player unit] = peer }, t, logged } for its latest vomit
+-- The face buffs the host gave from a player's own screen's report (book_vomit), by the buff itself, with that player's
+-- peer: only their ticks are that screen's to report. Weak keys, since a buff's table goes when the buff does.
+local booked_faces = setmetatable({}, { __mode = "k" })
 
 -- A troll starts its vomit (BTVomitAction.enter, bt_vomit_action.lua:19): every modded player is told, aimed for its
 -- target, whose own screen turns the troll. Every modded player's own screen judges the vomit for them from now on, as
@@ -302,6 +305,13 @@ function boss_areas.book_vomit(player_unit, troll)
 	Managers.state.entity:system("buff_system"):add_buff(player_unit, VOMIT_FACE_BUFF, troll)
 	pc.host.booking = false
 
+	-- BuffSystem.add_buff gives it at once (buff_system.lua:291), so this is the host's copy of it.
+	local given = buffs:get_buff_type(VOMIT_FACE_TYPE)
+
+	if given then
+		booked_faces[given] = pc.host.client_judges(player_unit)
+	end
+
 	local blackboard = BLACKBOARDS[troll]
 
 	if blackboard then
@@ -343,7 +353,8 @@ end
 -- The pool this player's screen saw them step into or out of, booked as _update_collision_detection would have
 -- (liquid_area_damage_extension.lua:660 to :691): in, in_liquid, the template's hit_player_function once and the buff as
 -- _add_buff_helper_function gives it (server-controlled and recorded, so the pool's destroy takes it back, :352), the
--- player among its colliding units; out, all of it undone. Their own screen judges the pool from now on (the hook below).
+-- player among its colliding units; out, all of it undone, or the in_liquid status alone if that is all that is left.
+-- Their own screen judges the pool from now on (the hook below).
 function boss_areas.book_pool(player_unit, pool, inside)
 	local extension = pool and Unit.alive(pool) and ScriptUnit.has_extension(pool, "area_damage_system")
 
@@ -409,6 +420,11 @@ function boss_areas.book_pool(player_unit, pool, inside)
 		outcome = "stepped out"
 
 		pc.count("host_pool_left")
+	elseif status.in_liquid_unit == pool then
+		-- Only the status was left; their screen tells the host again while it sees it (update_pool).
+		StatusUtils.set_in_liquid_network(player_unit, false)
+
+		outcome = "its in_liquid cleared"
 	end
 
 	pc.host.booking = false
@@ -444,8 +460,9 @@ function boss_areas.book_wave(player_unit, wave)
 end
 
 -- The host's own tick of a modded player's copy of these buffs deals no damage: their own screen ticks it and reports it
--- (D58). The vomit's only if that vomit was announced to them, since otherwise the host's own sweep gave it and their
--- screen knows nothing of it, as the jet's (Areas.lua).
+-- (D58). The vomit's only if the host gave it from their own screen's report (book_vomit), told by the buff itself: one
+-- the host's own sweep gave, to a player the vomit wasn't announced to, their screen knows nothing of, as the jet's
+-- (Areas.lua), and a troll's later vomit doesn't change which is which.
 function boss_areas.host_burn_tick(kind, unit, buff)
 	local peer = pc.host.client_judges(unit)
 
@@ -453,14 +470,10 @@ function boss_areas.host_burn_tick(kind, unit, buff)
 		return false
 	end
 
-	if kind == "vomit" then
-		local record = buff.attacker_unit and vomits_sent[buff.attacker_unit]
+	if kind == "vomit" and booked_faces[buff] ~= peer then
+		pc.count("host_burn_ticks_own_sweep")
 
-		if not record or record.players[unit] ~= peer then
-			pc.count("host_burn_ticks_own_sweep")
-
-			return false
-		end
+		return false
 	end
 
 	pc.count("host_burn_ticks_left_to_client")
@@ -566,6 +579,7 @@ function boss_areas.host_clear()
 
 	vomits_sent = {}
 	sweeps_noted = {}
+	booked_faces = setmetatable({}, { __mode = "k" })
 end
 
 -- Client -------------------------------------------------------------------------------------------------------------
@@ -1106,6 +1120,9 @@ function boss_areas.pool_spawned(extension, unit, init_data)
 	end
 
 	local t = pc.now()
+	-- The template's own numbers, as the host's pool has them: it takes a damage table and a size of its own only from
+	-- PlayerProjectileUnitExtension.spawn_liquid_area (player_projectile_unit_extension.lua:1447), which nothing calls in
+	-- the 6.13 data. A pool that did would be logged as off the grid, and its pulses' estimates would be off.
 	local difficulty = Managers.state.difficulty:get_difficulty()
 	local damage_table = type(template.difficulty_direct_damage) == "table" and template.difficulty_direct_damage[difficulty]
 
@@ -1272,7 +1289,8 @@ end
 -- stepping into a filled cell is reported, with this screen's own copy of the buff where the pool has one; stepping out
 -- ends it and is reported. A buff from this pool that the host gave before this screen judged counts as this pool's.
 -- While inside, a buff the condition refused before (the face buff ran out) starts once it allows it, and the host
--- hears again, every POOL_REPORT_INTERVAL, so its copy follows.
+-- hears again, every POOL_REPORT_INTERVAL, so its copy follows. Outside, while the host's in_liquid still names this
+-- pool, it hears again too.
 local function update_pool(own, unit, pool, t)
 	local template = pool.template
 	local breed = Unit.get_data(own, "breed")
@@ -1295,6 +1313,7 @@ local function update_pool(own, unit, pool, t)
 		pc.log("client pool go=%s template=%s inside=true buff=%s", tostring(go_id), tostring(pool.template_name), adopted and "the host's" or started and "this screen's own" or pool.buff_pool and "refused for now" or "none (pulses)")
 	elseif not inside and pool.inside then
 		pool.inside = false
+		pool.out_report_t = t + POOL_REPORT_INTERVAL
 
 		end_pool_buff(own, pool)
 		report("pool", go_id, false)
@@ -1307,6 +1326,20 @@ local function update_pool(own, unit, pool, t)
 			pool.report_t = t + POOL_REPORT_INTERVAL
 
 			report("pool", go_id, true)
+		end
+	elseif not inside then
+		-- The host still has this player in this pool (its in_liquid, which reaches every client) while this screen has
+		-- them outside: its own test put them in before this client judged, and nothing else would take them out, since
+		-- that test leaves them out now and this screen reports only what changes here. Told again, at most every
+		-- POOL_REPORT_INTERVAL.
+		local status = ScriptUnit.has_extension(own, "status_system")
+
+		if status and status.in_liquid_unit == unit and t > (pool.out_report_t or 0) then
+			pool.out_report_t = t + POOL_REPORT_INTERVAL
+
+			report("pool", go_id, false)
+			pc.count("client_pool_out_again")
+			pc.log("client pool go=%s: the host still has you inside, so it is told you are out", tostring(go_id))
 		end
 	end
 
@@ -1342,7 +1375,8 @@ boss_areas.release_pools = release_pools
 
 -- A wave starts to roll here (DamageWaveHuskExtension.set_running_wave, damage_wave_husk_extension.lua:145): one whose
 -- template pushes players is tested against this player while its copy runs, which covers the host's running and
--- arrived states, since the host sends arrived as the wave starts to linger (damage_wave_extension.lua:494).
+-- arrived states, since the host sends arrived as the wave starts to linger (damage_wave_extension.lua:494). Its copy is
+-- running then, or impact once the wave has hit anyone (:451).
 function boss_areas.wave_started(extension, unit)
 	local template = extension.template
 
@@ -1373,7 +1407,10 @@ local function update_wave(own, unit, wave, t)
 	local extension = wave.extension
 	local data = extension.template.player_push_data
 
-	if extension.state ~= "running" then
+	-- Its copy runs while its state is running, or impact, which every copy takes whenever the wave hits anyone
+	-- (on_hit_by_wave, damage_wave_extension.lua:451) while the host's wave runs on and still pushes; arrived is the
+	-- host's linger.
+	if extension.state ~= "running" and extension.state ~= "impact" then
 		return
 	end
 

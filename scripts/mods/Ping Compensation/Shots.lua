@@ -1073,7 +1073,12 @@ end
 -- (BTStormfiendShootAction._fire_from_position_direction and _shoot_ratling_gun, bt_stormfiend_shoot_action.lua:684 and
 -- :720). The aim point, which starts at this player's feet as the gun opens fire, eases towards their live j_spine by
 -- min(dt * 6, 1) for each bullet; the bullet flies from 1.25 m behind the muzzle towards it, with this screen's own
--- random spread from the template. The muzzle is worked out from the copy, which the host fired from 1.25 m behind its own.
+-- random spread from the template. The muzzle is worked out from the copy, which the host fired from 1.25 m behind its own
+-- along its aim before the spread (:699, :727). The copy's direction has the spread in it, so the muzzle found is off by
+-- at most 1.25 m times the template's spread (4.5 degrees for stormfiend_boss, light_weight_projectiles.lua:51: under
+-- 10 cm). Aimed again at the same point, the bullet's line only tilts about that point, so at this player nothing
+-- changes, and near Deathrattler it moves under 10 cm. His copy's own muzzle would be worse, since it trails the host's
+-- while he moves or turns.
 local function aim_bullet(record, projectile, aim, target, template)
 	local muzzle = projectile.position:unbox() + projectile.direction:unbox() * GUN_MUZZLE_BACK
 	local point = Vector3.lerp(aim.point:unbox(), node_spine(target), math.min(last_dt * 6, 1))
