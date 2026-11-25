@@ -3364,6 +3364,10 @@ mod:hook("AiUtils", "push_intersecting_players", function (func, unit, source_un
 	pc.guard("host monster push", monster_push_after, unit, displaced_units, before)
 end)
 
+-- Every frame, from mod.update, before the game's frame (Ping Compensation.lua): the safety nets for a host test whose
+-- original call failed, which must put a side's list back before the game rebuilds its frame tables
+-- (SideManager.update_frame_tables, state_ingame.lua:809), and the upkeep that reads no position. The upkeep that runs
+-- the game's own code goes after the game's pre_update (host.after_positions).
 function host.update()
 	host.suppress = nil
 	host.box_skip = nil
@@ -3380,16 +3384,9 @@ function host.update()
 		return
 	end
 
-	pc.guard("host reactions update", pc.host_reactions.update)
-	pc.guard("host blasts update", pc.blasts.update)
-
-	-- Build 6.1.
+	-- Build 6.1: its tests' scope and the side lists they filter, then its memory.
 	if pc.boss_areas then
 		pc.guard("host boss areas update", pc.boss_areas.host_update)
-	end
-
-	if pc.enemy_blasts then
-		pc.guard("host enemy blasts update", pc.enemy_blasts.host_update)
 	end
 
 	local t = pc.now()
@@ -3443,6 +3440,24 @@ function host.update()
 				overlaps[swing.attacker] = nil
 			end
 		end
+	end
+end
+
+-- Every frame, after the game's StateIngame.pre_update (Ping Compensation.lua), once POSITION_LOOKUP is fresh: the
+-- upkeep that runs the game's own code, which can read positions (DamageUtils.stagger_ai does, damage_utils.lua:3623):
+-- the kills and troll downs clients decided, the staggers held for a blast's list and the enemy blasts that went to no
+-- client.
+function host.after_positions()
+	if not pc.is_server() or not pc.in_game() then
+		return
+	end
+
+	pc.guard("host reactions update", pc.host_reactions.update)
+	pc.guard("host blasts update", pc.blasts.update)
+
+	-- Build 6.1.
+	if pc.enemy_blasts then
+		pc.guard("host enemy blasts update", pc.enemy_blasts.host_update)
 	end
 end
 

@@ -130,7 +130,11 @@ function enemy_blasts.noted(scope, world, attacker, position, rotation, template
 		local result = pc.blasts.player_target(world, attacker, position, rotation, template, scale, attacker_power_level, player_unit, true)
 
 		if result then
-			record.would[player_unit] = result
+			-- Kept for later frames, so its direction is boxed: a plain Vector3 goes stale at the end of its frame.
+			record.would[player_unit] = {
+				distance = result.distance,
+				direction = Vector3Box(result.direction),
+			}
 			reached = reached + 1
 		end
 	end
@@ -326,7 +330,7 @@ function enemy_blasts.hit_reported(peer, player_unit, template_name, position, r
 
 		if would then
 			record.booked[player_unit] = true
-			outcome = "from the host's view: " .. book_blast(nil, player_unit, record, would.distance, would.direction, false)
+			outcome = "from the host's view: " .. book_blast(nil, player_unit, record, would.distance, would.direction:unbox(), false)
 
 			pc.count("host_enemy_blast_unjudged_booked")
 		else
@@ -358,7 +362,7 @@ function enemy_blasts.host_update()
 				if Unit.alive(player_unit) and not record.booked[player_unit] then
 					record.booked[player_unit] = true
 
-					local ok, outcome = pc.guard("host enemy blast unsent", book_blast, nil, player_unit, record, would.distance, would.direction, false)
+					local ok, outcome = pc.guard("host enemy blast unsent", book_blast, nil, player_unit, record, would.distance, would.direction:unbox(), false)
 
 					pc.count("host_enemy_blast_unsent")
 					pc.log("host enemy blast template=%s went to no client: booked from the host's view, %s", record.template_name, ok and tostring(outcome) or "error")

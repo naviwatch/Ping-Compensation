@@ -524,14 +524,17 @@ mod.on_disabled = function ()
 	clear()
 end
 
--- VMF calls this every frame, even while the mod is disabled.
+-- VMF calls this every frame, even while the mod is disabled. It runs first in the game's frame (Boot.game_update,
+-- boot.lua:751), before StateIngame.pre_update refreshes POSITION_LOOKUP (state_ingame.lua:808): until then every
+-- position in it is last frame's, which the engine has already made stale, and any sum with one fails, in this mod's
+-- code or in the game's code it calls (the build 6.1 playtest: the client's pool test, BossAreas.lua). So only work that
+-- reads no position runs here; the rest runs after pre_update (below).
 mod.update = function (dt)
 	if not mod:is_enabled() then
 		return
 	end
 
 	pc.host.update()
-	pc.client.update(dt)
 	pc.version.update(dt)
 	pc.guard("difficulty mods", pc.compat.update, dt)
 
@@ -543,6 +546,21 @@ mod.update = function (dt)
 		hosted_last = pc.is_server()
 	end
 end
+
+-- Every frame in a level, after the game's own StateIngame.pre_update (state_ingame.lua:804): POSITION_LOOKUP is fresh,
+-- this frame's messages have arrived, and the systems haven't updated yet. The client's upkeep tests its player's
+-- position against the pools, waves, fires and vortices, and starts buffs whose apply reads positions (the plague
+-- wave's face buff, buff_function_templates.lua:1058); the host's finishes the kills and downs clients decided, the
+-- staggers held for a blast's list (DamageUtils.stagger_ai reads positions, damage_utils.lua:3623) and the enemy blasts
+-- no client judged.
+mod:hook_safe("StateIngame", "pre_update", function (self, dt)
+	if not mod:is_enabled() then
+		return
+	end
+
+	pc.host.after_positions()
+	pc.client.update(dt)
+end)
 
 -- A fallback for players who don't type /pingcomp stats or /pingcomp timings: the same lines go to the console log,
 -- not the chat, when a mission or the keep ends and when the game closes. The commands still work as before. A game
